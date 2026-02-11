@@ -27,10 +27,12 @@ use crate::crypto::Level;
 pub struct DerivedKeys {
     /// The encryption level these keys apply to.
     pub level: Level,
-    /// Send (client) traffic secret — 32 bytes for SHA-256.
-    pub send_secret: [u8; 32],
-    /// Receive (server) traffic secret — 32 bytes for SHA-256.
-    pub recv_secret: [u8; 32],
+    /// Send traffic secret — up to 48 bytes (32 for SHA-256, 48 for SHA-384).
+    pub send_secret: [u8; 48],
+    /// Receive traffic secret — up to 48 bytes (32 for SHA-256, 48 for SHA-384).
+    pub recv_secret: [u8; 48],
+    /// Actual length of the secrets in bytes (32 for SHA-256, 48 for SHA-384).
+    pub secret_len: usize,
 }
 
 /// The TLS session interface used by QUIC.

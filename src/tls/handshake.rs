@@ -71,6 +71,9 @@ pub struct TlsEngine<C: CryptoProvider> {
     private_key: x25519_dalek::StaticSecret,
     public_key: x25519_dalek::PublicKey,
 
+    // ClientHello random (stored so write_handshake doesn't need RNG parameter)
+    client_random: [u8; 32],
+
     // Negotiated cipher suite
     cipher_suite: Option<CipherSuite>,
 
@@ -119,7 +122,8 @@ where
     /// Create a new client-side TLS engine.
     ///
     /// `secret_bytes` should be 32 random bytes for the X25519 private key.
-    pub fn new_client(config: TlsConfig, secret_bytes: [u8; 32]) -> Self {
+    /// `random` should be 32 random bytes for the ClientHello random field.
+    pub fn new_client(config: TlsConfig, secret_bytes: [u8; 32], random: [u8; 32]) -> Self {
         let private_key = x25519_dalek::StaticSecret::from(secret_bytes);
         let public_key = x25519_dalek::PublicKey::from(&private_key);
 
@@ -131,6 +135,7 @@ where
             state: HandshakeState::Start,
             private_key,
             public_key,
+            client_random: random,
             cipher_suite: None,
             key_schedule,
             client_handshake_secret: [0u8; 32],
@@ -235,10 +240,15 @@ where
         )?;
 
         // Emit handshake-level keys for QUIC
+        let mut send_secret = [0u8; 48];
+        let mut recv_secret = [0u8; 48];
+        send_secret[..32].copy_from_slice(&self.client_handshake_secret);
+        recv_secret[..32].copy_from_slice(&self.server_handshake_secret);
         self.pending_keys = Some(DerivedKeys {
             level: Level::Handshake,
-            send_secret: self.client_handshake_secret,
-            recv_secret: self.server_handshake_secret,
+            send_secret,
+            recv_secret,
+            secret_len: 32,
         });
 
         self.state = HandshakeState::WaitEncryptedExtensions;
@@ -341,10 +351,15 @@ where
         )?;
 
         // Emit application-level keys
+        let mut send_secret = [0u8; 48];
+        let mut recv_secret = [0u8; 48];
+        send_secret[..32].copy_from_slice(&self.client_app_secret);
+        recv_secret[..32].copy_from_slice(&self.server_app_secret);
         self.pending_keys = Some(DerivedKeys {
             level: Level::Application,
-            send_secret: self.client_app_secret,
-            recv_secret: self.server_app_secret,
+            send_secret,
+            recv_secret,
+            secret_len: 32,
         });
 
         // Build client Finished
@@ -381,9 +396,24 @@ where
 {
     type Error = Error;
 
-    fn read_handshake(&mut self, _level: Level, data: &[u8]) -> Result<(), Error> {
+    fn read_handshake(&mut self, level: Level, data: &[u8]) -> Result<(), Error> {
         if self.role != Role::Client {
             return Err(Error::InvalidState);
+        }
+
+        // Validate encryption level matches expected state.
+        let expected_level = match self.state {
+            HandshakeState::WaitServerHello => Level::Initial,
+            HandshakeState::WaitEncryptedExtensions
+            | HandshakeState::WaitCertificate
+            | HandshakeState::WaitCertificateVerify
+            | HandshakeState::WaitFinished => Level::Handshake,
+            _ => return Err(Error::InvalidState),
+        };
+        if level != expected_level {
+            return Err(Error::Transport(
+                crate::error::TransportError::ProtocolViolation,
+            ));
         }
 
         // Multiple TLS messages may be concatenated in a single CRYPTO frame.
@@ -447,10 +477,7 @@ where
 
         match self.state {
             HandshakeState::Start => {
-                // Generate ClientHello with a deterministic random for now.
-                // In production, this should come from a proper RNG.
-                let random = [0u8; 32];
-                self.build_client_hello(&random)?;
+                self.build_client_hello(&self.client_random.clone())?;
             }
             HandshakeState::SendFinished => {
                 // Client Finished was already built in process_server_finished.
@@ -538,7 +565,7 @@ mod tests {
         };
 
         let secret = [0x42u8; 32];
-        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, secret);
+        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, secret, [0u8; 32]);
 
         let mut buf = [0u8; 2048];
         let (len, level) = engine.write_handshake(&mut buf).unwrap();
@@ -572,7 +599,7 @@ mod tests {
         };
 
         let secret = [0x42u8; 32];
-        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, secret);
+        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, secret, [0u8; 32]);
 
         // Send ClientHello first
         let mut buf = [0u8; 2048];
@@ -603,7 +630,7 @@ mod tests {
         };
 
         let client_secret_bytes = [0x42u8; 32];
-        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, client_secret_bytes);
+        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, client_secret_bytes, [0u8; 32]);
 
         // Step 1: Write ClientHello
         let mut buf = [0u8; 2048];
