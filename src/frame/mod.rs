@@ -198,7 +198,7 @@ fn write_varint(val: u64, buf: &mut [u8], pos: &mut usize) -> Result<(), Error> 
 
 /// Read exactly `len` bytes from `buf[pos..]`, advancing `pos`.
 fn read_bytes<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], Error> {
-    if buf.len() - *pos < len {
+    if *pos > buf.len() || buf.len() - *pos < len {
         return Err(frame_encoding_error());
     }
     let slice = &buf[*pos..*pos + len];
@@ -208,7 +208,7 @@ fn read_bytes<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]
 
 /// Write `data` into `buf[pos..]`, advancing `pos`.
 fn write_bytes(data: &[u8], buf: &mut [u8], pos: &mut usize) -> Result<(), Error> {
-    if buf.len() - *pos < data.len() {
+    if *pos > buf.len() || buf.len() - *pos < data.len() {
         return Err(Error::BufferTooSmall {
             needed: *pos + data.len(),
         });

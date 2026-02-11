@@ -163,25 +163,107 @@ pub struct StreamRecvBuf {
     pub len: usize,
     pub read_offset: usize,
     pub fin_received: bool,
+    /// The next expected stream offset (byte position in the stream).
+    pub next_offset: u64,
 }
 
 // ---------------------------------------------------------------------------
 // Received PN tracker for ACK generation
 // ---------------------------------------------------------------------------
 
-/// Simple tracker of received packet numbers per space.
+/// Tracker of received packet number ranges per space for correct ACK generation.
+///
+/// Stores up to 32 non-overlapping, non-adjacent `(start, end)` inclusive
+/// ranges, sorted in ascending order. When a new PN is recorded the tracker
+/// extends or merges existing ranges. If the vec is full the lowest (oldest)
+/// range is dropped.
 pub struct RecvPnTracker {
-    /// Largest received PN.
-    pub largest: Option<u64>,
-    /// Count of packets received (for simple ACK generation).
-    pub count: u64,
+    /// Non-overlapping, non-adjacent, ascending-sorted inclusive ranges.
+    pub ranges: heapless::Vec<(u64, u64), 32>,
 }
 
 impl RecvPnTracker {
     pub fn new() -> Self {
         Self {
-            largest: None,
-            count: 0,
+            ranges: heapless::Vec::new(),
+        }
+    }
+
+    /// The largest received PN, or `None` if nothing has been received.
+    pub fn largest(&self) -> Option<u64> {
+        self.ranges.last().map(|&(_, end)| end)
+    }
+
+    /// Record reception of packet number `pn`.
+    pub fn record(&mut self, pn: u64) {
+        // Find which range to extend / insert at.
+        // Ranges are sorted ascending by start.
+
+        // Check if pn is already contained in an existing range.
+        // Also find potential ranges to extend.
+        let mut merge_left: Option<usize> = None;
+        let mut merge_right: Option<usize> = None;
+
+        for (i, &(start, end)) in self.ranges.iter().enumerate() {
+            if pn >= start && pn <= end {
+                // Already tracked.
+                return;
+            }
+            // Can extend this range's upper end by 1?
+            if pn == end + 1 {
+                merge_left = Some(i);
+            }
+            // Can extend this range's lower end by 1?
+            if pn + 1 == start {
+                merge_right = Some(i);
+            }
+        }
+
+        match (merge_left, merge_right) {
+            (Some(li), Some(ri)) => {
+                // pn bridges two adjacent ranges -- merge them.
+                let new_start = self.ranges[li].0;
+                let new_end = self.ranges[ri].1;
+                // Remove the higher-index first to keep the lower index valid.
+                let (first_rm, second_rm) = if li < ri { (ri, li) } else { (li, ri) };
+                self.ranges.remove(first_rm);
+                self.ranges.remove(second_rm);
+                // Insert merged range at the correct position.
+                self.insert_range(new_start, new_end);
+            }
+            (Some(li), None) => {
+                // Extend upper bound of range at li.
+                self.ranges[li].1 = pn;
+            }
+            (None, Some(ri)) => {
+                // Extend lower bound of range at ri.
+                self.ranges[ri].0 = pn;
+            }
+            (None, None) => {
+                // New standalone range.
+                if self.ranges.is_full() {
+                    // Drop the lowest (oldest) range.
+                    self.ranges.remove(0);
+                }
+                self.insert_range(pn, pn);
+            }
+        }
+    }
+
+    /// Insert a `(start, end)` range maintaining ascending order by `start`.
+    fn insert_range(&mut self, start: u64, end: u64) {
+        let pos = self
+            .ranges
+            .iter()
+            .position(|&(s, _)| s > start)
+            .unwrap_or(self.ranges.len());
+        // heapless::Vec doesn't have `insert`, so we push and rotate.
+        let _ = self.ranges.push((start, end));
+        // Shift elements right from pos to len-2 to make room.
+        let len = self.ranges.len();
+        if pos < len - 1 {
+            // Rotate the tail so the newly pushed element ends up at `pos`.
+            self.ranges[pos..].rotate_right(1);
         }
     }
 }
@@ -592,11 +674,17 @@ where
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Store received stream data in a receive buffer.
+    /// Store received stream data in a receive buffer, respecting the offset.
+    ///
+    /// - If `offset` equals the expected next offset, data is appended.
+    /// - If `offset` is less than expected (duplicate/overlap), already-received
+    ///   bytes are skipped and only the new tail (if any) is appended.
+    /// - If `offset` is greater than expected (gap), the frame is dropped
+    ///   because we do not buffer out-of-order data; QUIC will retransmit.
     pub(crate) fn store_stream_data(
         &mut self,
         stream_id: u64,
-        _offset: u64,
+        offset: u64,
         data: &[u8],
         fin: bool,
     ) {
@@ -629,12 +717,37 @@ where
                     len: 0,
                     read_offset: 0,
                     fin_received: false,
+                    next_offset: 0,
                 });
             }
             if let Some(ref mut buf) = self.stream_recv_bufs[idx] {
-                let copy_len = data.len().min(1024 - buf.len);
-                buf.data[buf.len..buf.len + copy_len].copy_from_slice(&data[..copy_len]);
+                let frame_end = offset + data.len() as u64;
+
+                if offset > buf.next_offset {
+                    // Gap: we cannot place this data yet. Drop the frame;
+                    // QUIC will retransmit the missing data first.
+                    // Still record FIN if the frame carried it (edge case:
+                    // FIN on an empty retransmit at the expected offset later).
+                    return;
+                }
+
+                // offset <= buf.next_offset: possibly overlapping.
+                if frame_end <= buf.next_offset {
+                    // Entirely duplicate data we already have. Nothing to copy.
+                    // But if FIN was set, record it.
+                    if fin {
+                        buf.fin_received = true;
+                    }
+                    return;
+                }
+
+                // We need to skip the bytes we already have.
+                let skip = (buf.next_offset - offset) as usize;
+                let new_data = &data[skip..];
+                let copy_len = new_data.len().min(1024 - buf.len);
+                buf.data[buf.len..buf.len + copy_len].copy_from_slice(&new_data[..copy_len]);
                 buf.len += copy_len;
+                buf.next_offset += copy_len as u64;
                 if fin {
                     buf.fin_received = true;
                 }
@@ -655,13 +768,7 @@ where
     /// Track a received packet number for ACK generation.
     pub(crate) fn track_received_pn(&mut self, level: Level, pn: u64) {
         let idx = level_index(level);
-        let tracker = &mut self.recv_pn_tracker[idx];
-        match tracker.largest {
-            None => tracker.largest = Some(pn),
-            Some(prev) if pn > prev => tracker.largest = Some(pn),
-            _ => {}
-        }
-        tracker.count += 1;
+        self.recv_pn_tracker[idx].record(pn);
     }
 }
 
@@ -851,8 +958,11 @@ mod tests {
         conn.track_received_pn(Level::Initial, 1);
         conn.track_received_pn(Level::Initial, 5);
 
-        assert_eq!(conn.recv_pn_tracker[0].largest, Some(5));
-        assert_eq!(conn.recv_pn_tracker[0].count, 3);
+        assert_eq!(conn.recv_pn_tracker[0].largest(), Some(5));
+        // Should have two ranges: [0,1] and [5,5]
+        assert_eq!(conn.recv_pn_tracker[0].ranges.len(), 2);
+        assert_eq!(conn.recv_pn_tracker[0].ranges[0], (0, 1));
+        assert_eq!(conn.recv_pn_tracker[0].ranges[1], (5, 5));
     }
 
     // =========================================================================
@@ -1352,6 +1462,220 @@ mod tests {
             assert_eq!(len, 5);
             assert_eq!(&recv_buf[..len], b"final");
             assert!(fin);
+        }
+    }
+
+    // =========================================================================
+    // M9 — RecvPnTracker range-based ACK generation tests
+    // =========================================================================
+
+    mod recv_pn_tracker_tests {
+        use super::*;
+
+        #[test]
+        fn single_pn_produces_single_range() {
+            let mut t = RecvPnTracker::new();
+            t.record(5);
+            assert_eq!(t.ranges.as_slice(), &[(5, 5)]);
+            assert_eq!(t.largest(), Some(5));
+        }
+
+        #[test]
+        fn contiguous_pns_merge_into_one_range() {
+            let mut t = RecvPnTracker::new();
+            t.record(0);
+            t.record(1);
+            t.record(2);
+            t.record(3);
+            assert_eq!(t.ranges.as_slice(), &[(0, 3)]);
+        }
+
+        #[test]
+        fn non_contiguous_pns_produce_multiple_ranges() {
+            let mut t = RecvPnTracker::new();
+            // Receive 0, 1, 5, 6, 10
+            t.record(0);
+            t.record(1);
+            t.record(5);
+            t.record(6);
+            t.record(10);
+            assert_eq!(t.ranges.as_slice(), &[(0, 1), (5, 6), (10, 10)]);
+        }
+
+        #[test]
+        fn filling_gap_merges_ranges() {
+            let mut t = RecvPnTracker::new();
+            t.record(0);
+            t.record(2);
+            assert_eq!(t.ranges.as_slice(), &[(0, 0), (2, 2)]);
+            // Now fill the gap
+            t.record(1);
+            assert_eq!(t.ranges.as_slice(), &[(0, 2)]);
+        }
+
+        #[test]
+        fn out_of_order_pns_correctly_tracked() {
+            let mut t = RecvPnTracker::new();
+            t.record(5);
+            t.record(3);
+            t.record(1);
+            t.record(4);
+            t.record(2);
+            // Should all merge into one range
+            assert_eq!(t.ranges.as_slice(), &[(1, 5)]);
+        }
+
+        #[test]
+        fn duplicate_pn_is_idempotent() {
+            let mut t = RecvPnTracker::new();
+            t.record(3);
+            t.record(3);
+            t.record(3);
+            assert_eq!(t.ranges.as_slice(), &[(3, 3)]);
+        }
+
+        #[test]
+        fn full_tracker_drops_lowest_range() {
+            let mut t = RecvPnTracker::new();
+            // Fill all 32 slots with non-contiguous ranges: 0, 100, 200, ...
+            for i in 0..32 {
+                t.record(i * 100);
+            }
+            assert_eq!(t.ranges.len(), 32);
+            assert_eq!(t.ranges[0], (0, 0));
+
+            // Adding one more should drop the lowest (0, 0)
+            t.record(5000);
+            assert_eq!(t.ranges.len(), 32);
+            assert_eq!(t.ranges[0], (100, 100));
+            assert_eq!(t.ranges[31], (5000, 5000));
+        }
+
+        #[test]
+        fn largest_returns_none_when_empty() {
+            let t = RecvPnTracker::new();
+            assert_eq!(t.largest(), None);
+        }
+
+        #[test]
+        fn extend_lower_bound() {
+            let mut t = RecvPnTracker::new();
+            t.record(5);
+            t.record(4);
+            assert_eq!(t.ranges.as_slice(), &[(4, 5)]);
+        }
+    }
+
+    // =========================================================================
+    // M4 — Stream data offset handling tests
+    // =========================================================================
+
+    mod stream_offset_tests {
+        use super::*;
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        fn make_test_client() -> Connection<crate::crypto::rustcrypto::Aes128GcmProvider> {
+            use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+            struct TestRng(u8);
+            impl Rng for TestRng {
+                fn fill(&mut self, buf: &mut [u8]) {
+                    for b in buf.iter_mut() {
+                        *b = self.0;
+                        self.0 = self.0.wrapping_add(1);
+                    }
+                }
+            }
+
+            let mut rng = TestRng(0x10);
+            Connection::client(
+                Aes128GcmProvider,
+                "test.local",
+                &[b"h3"],
+                TransportParams::default_params(),
+                &mut rng,
+            )
+            .unwrap()
+        }
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        #[test]
+        fn in_order_data_appended() {
+            let mut conn = make_test_client();
+            let sid = 4u64; // arbitrary stream id
+            conn.store_stream_data(sid, 0, b"hello", false);
+            let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
+            assert_eq!(&buf.data[..buf.len], b"hello");
+            assert_eq!(buf.next_offset, 5);
+        }
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        #[test]
+        fn gap_drops_frame() {
+            let mut conn = make_test_client();
+            let sid = 4u64;
+            // First send offset 0 with 5 bytes
+            conn.store_stream_data(sid, 0, b"hello", false);
+            // Then send offset 10 (gap) -- should be dropped
+            conn.store_stream_data(sid, 10, b"world", false);
+            let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
+            assert_eq!(&buf.data[..buf.len], b"hello");
+            assert_eq!(buf.next_offset, 5);
+        }
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        #[test]
+        fn duplicate_data_skipped() {
+            let mut conn = make_test_client();
+            let sid = 4u64;
+            conn.store_stream_data(sid, 0, b"hello", false);
+            // Retransmit same data
+            conn.store_stream_data(sid, 0, b"hello", false);
+            let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
+            // Should not double-append
+            assert_eq!(&buf.data[..buf.len], b"hello");
+            assert_eq!(buf.next_offset, 5);
+        }
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        #[test]
+        fn partial_overlap_appends_new_tail() {
+            let mut conn = make_test_client();
+            let sid = 4u64;
+            conn.store_stream_data(sid, 0, b"hel", false);
+            assert_eq!(conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap().next_offset, 3);
+            // Overlap: offset 1 with "ello" -- first 2 bytes overlap, last 2 are new
+            conn.store_stream_data(sid, 1, b"ello", false);
+            let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
+            assert_eq!(&buf.data[..buf.len], b"hello");
+            assert_eq!(buf.next_offset, 5);
+        }
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        #[test]
+        fn sequential_in_order_frames() {
+            let mut conn = make_test_client();
+            let sid = 4u64;
+            conn.store_stream_data(sid, 0, b"hel", false);
+            conn.store_stream_data(sid, 3, b"lo ", false);
+            conn.store_stream_data(sid, 6, b"world", true);
+            let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
+            assert_eq!(&buf.data[..buf.len], b"hello world");
+            assert_eq!(buf.next_offset, 11);
+            assert!(buf.fin_received);
+        }
+
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        #[test]
+        fn fin_on_duplicate_is_recorded() {
+            let mut conn = make_test_client();
+            let sid = 4u64;
+            conn.store_stream_data(sid, 0, b"done", false);
+            // Retransmit with FIN
+            conn.store_stream_data(sid, 0, b"done", true);
+            let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
+            assert_eq!(&buf.data[..buf.len], b"done");
+            assert!(buf.fin_received);
         }
     }
 }

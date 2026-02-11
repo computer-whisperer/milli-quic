@@ -251,17 +251,69 @@ where
     }
 
     /// Build an ACK frame for the given level.
+    ///
+    /// Generates correct ACK ranges from the received packet number tracker.
+    /// The QUIC ACK frame encodes ranges from highest to lowest:
+    ///   - `largest_ack` = the highest received PN
+    ///   - `first_ack_range` = `largest_ack - <start of highest range>`
+    ///   - then for each subsequent range (descending): a gap/range pair
+    ///     where `gap = <end of prev range> - <end of this range> - 2`
+    ///     and `ack_range = <end of this range> - <start of this range>`
     fn build_ack_frame(&self, level: Level, buf: &mut [u8]) -> Option<usize> {
         let idx = level_index(level);
-        let largest = self.largest_recv_pn[idx]?;
+        let tracker = &self.recv_pn_tracker[idx];
 
-        // Simple ACK: acknowledge everything from 0 to largest_recv_pn
-        // (This is a simplification; a full implementation would track ranges.)
+        if tracker.ranges.is_empty() {
+            return None;
+        }
+
+        // Ranges are sorted ascending. Work from the highest range down.
+        let range_count = tracker.ranges.len();
+        let (highest_start, highest_end) = tracker.ranges[range_count - 1];
+
+        let largest_ack = highest_end;
+        let first_ack_range = highest_end - highest_start;
+
+        // Build the raw ACK range bytes (gap, ack_range varint pairs) for
+        // all ranges below the highest, from next-highest down to lowest.
+        let mut range_buf = [0u8; 512];
+        let mut range_pos = 0;
+
+        if range_count > 1 {
+            // prev_smallest tracks the smallest PN in the previous (higher) range.
+            let mut prev_smallest = highest_start;
+
+            for i in (0..range_count - 1).rev() {
+                let (r_start, r_end) = tracker.ranges[i];
+
+                // gap = prev_smallest - r_end - 2
+                // (the gap field counts how many PNs are missing *between*
+                // the two ranges, minus 1 as per RFC 9000 Section 19.3.1)
+                let gap = prev_smallest - r_end - 2;
+                let ack_range = r_end - r_start;
+
+                if let Ok(n) = crate::varint::encode_varint(gap, &mut range_buf[range_pos..]) {
+                    range_pos += n;
+                } else {
+                    break; // buffer full, stop adding ranges
+                }
+                if let Ok(n) =
+                    crate::varint::encode_varint(ack_range, &mut range_buf[range_pos..])
+                {
+                    range_pos += n;
+                } else {
+                    break;
+                }
+
+                prev_smallest = r_start;
+            }
+        }
+
         let ack = Frame::Ack(AckFrame {
-            largest_ack: largest,
+            largest_ack,
             ack_delay: 0,
-            first_ack_range: largest, // ack all from 0 to largest
-            ack_ranges: &[],
+            first_ack_range,
+            ack_ranges: &range_buf[..range_pos],
             ecn: None,
         });
 

@@ -31,9 +31,9 @@ pub fn parse_long_header(buf: &[u8]) -> Result<(PacketHeader<'_>, usize), Error>
 
     let dcid_len = buf[5] as usize;
     let mut pos = 6;
-    if pos + dcid_len >= buf.len() {
+    if pos + dcid_len > buf.len() {
         return Err(Error::BufferTooSmall {
-            needed: pos + dcid_len + 1,
+            needed: pos + dcid_len,
         });
     }
     let dcid = &buf[pos..pos + dcid_len];
@@ -105,9 +105,9 @@ pub fn parse_initial_header(buf: &[u8]) -> Result<(InitialHeader<'_>, usize), Er
 
     let dcid_len = buf[5] as usize;
     let mut pos = 6;
-    if pos + dcid_len >= buf.len() {
+    if pos + dcid_len > buf.len() {
         return Err(Error::BufferTooSmall {
-            needed: pos + dcid_len + 1,
+            needed: pos + dcid_len,
         });
     }
     let dcid = &buf[pos..pos + dcid_len];
@@ -171,9 +171,9 @@ pub fn parse_handshake_header(buf: &[u8]) -> Result<(HandshakeHeader<'_>, usize)
 
     let dcid_len = buf[5] as usize;
     let mut pos = 6;
-    if pos + dcid_len >= buf.len() {
+    if pos + dcid_len > buf.len() {
         return Err(Error::BufferTooSmall {
-            needed: pos + dcid_len + 1,
+            needed: pos + dcid_len,
         });
     }
     let dcid = &buf[pos..pos + dcid_len];

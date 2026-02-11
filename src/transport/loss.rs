@@ -125,7 +125,7 @@ impl LossDetector {
         level: Level,
         tracker: &SentPacketTracker<N>,
         now: Instant,
-    ) -> (heapless::Vec<u64, 32>, Option<Instant>) {
+    ) -> (heapless::Vec<u64, 64>, Option<Instant>) {
         let idx = space_index(level);
         let largest_acked = match self.largest_acked[idx] {
             Some(la) => la,
@@ -138,7 +138,7 @@ impl LossDetector {
 
         let lost_send_time = now.saturating_sub(loss_delay);
 
-        let mut lost_pns: heapless::Vec<u64, 32> = heapless::Vec::new();
+        let mut lost_pns: heapless::Vec<u64, 64> = heapless::Vec::new();
         let mut loss_time: Option<Instant> = None;
 
         // Check all packets below largest_acked in this space.
@@ -150,13 +150,18 @@ impl LossDetector {
 
             // PN threshold: declared lost if largest_acked - pn >= PACKET_THRESHOLD.
             if largest_acked >= pkt.pn + PACKET_THRESHOLD {
-                let _ = lost_pns.push(pkt.pn);
+                if lost_pns.push(pkt.pn).is_err() {
+                    // Capacity full — remaining losses will be caught on next detection cycle.
+                    break;
+                }
                 continue;
             }
 
             // Time threshold: declared lost if sent more than loss_delay ago.
             if pkt.time_sent <= lost_send_time {
-                let _ = lost_pns.push(pkt.pn);
+                if lost_pns.push(pkt.pn).is_err() {
+                    break;
+                }
                 continue;
             }
 

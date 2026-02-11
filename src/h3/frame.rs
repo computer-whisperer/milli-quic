@@ -10,7 +10,7 @@
 //! }
 //! ```
 
-use crate::error::{Error, H3Error, TransportError};
+use crate::error::{Error, H3Error};
 use crate::varint::{decode_varint, encode_varint, varint_len};
 
 use super::{
@@ -44,6 +44,8 @@ pub enum H3Frame<'a> {
     GoAway(u64),
     /// MAX_PUSH_ID frame (type 0x0d).
     MaxPushId(u64),
+    /// Unknown or reserved frame type — callers should ignore this per RFC 9114 §7.2.8.
+    Unknown(u64),
 }
 
 /// PUSH_PROMISE frame payload.
@@ -117,10 +119,9 @@ pub fn decode_h3_frame(buf: &[u8]) -> Result<(H3Frame<'_>, usize), Error> {
             H3Frame::MaxPushId(push_id)
         }
         // Unknown or reserved frame types: skip over them per RFC 9114 §7.2.8.
-        // We report this as FrameError so the caller knows it's unrecognized.
-        _ => {
-            return Err(Error::Transport(TransportError::FrameEncodingError));
-        }
+        // "Implementations MUST discard frames [...] that have unknown or unsupported types."
+        // H3 frames are TLV, so we can safely skip by consuming type + length + payload.
+        _ => H3Frame::Unknown(frame_type),
     };
 
     Ok((frame, total_consumed))
@@ -138,6 +139,7 @@ pub fn encode_h3_frame(frame: &H3Frame<'_>, buf: &mut [u8]) -> Result<usize, Err
         H3Frame::PushPromise(pp) => encode_push_promise_frame(pp, buf),
         H3Frame::GoAway(stream_id) => encode_varint_payload_frame(H3_FRAME_GOAWAY, *stream_id, buf),
         H3Frame::MaxPushId(push_id) => encode_varint_payload_frame(H3_FRAME_MAX_PUSH_ID, *push_id, buf),
+        H3Frame::Unknown(_) => Ok(0), // Unknown frames are receive-only, nothing to encode
     }
 }
 
@@ -617,24 +619,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn reserved_priority_frame_type_rejected() {
+    fn reserved_priority_frame_type_skipped() {
         // Frame type 0x02 was PRIORITY in draft specs, removed in RFC 9114.
-        // It should be treated as an unknown frame type.
+        // Per RFC 9114 §7.2.8, unknown frame types are skipped.
         let mut buf = [0u8; 16];
         let mut off = 0;
         off += encode_varint(0x02, &mut buf[off..]).unwrap(); // reserved type
         off += encode_varint(0, &mut buf[off..]).unwrap(); // length=0
 
-        let err = decode_h3_frame(&buf[..off]).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Transport(TransportError::FrameEncodingError)
-        ));
+        let (frame, consumed) = decode_h3_frame(&buf[..off]).unwrap();
+        assert!(matches!(frame, H3Frame::Unknown(0x02)));
+        assert_eq!(consumed, off);
     }
 
     #[test]
-    fn unknown_frame_type_rejected() {
-        // Arbitrary unknown frame type 0x21.
+    fn unknown_frame_type_skipped_with_payload() {
+        // Arbitrary unknown frame type 0x21 with 3-byte payload.
+        // Per RFC 9114 §7.2.8, unknown types are skipped (consumed).
         let mut buf = [0u8; 16];
         let mut off = 0;
         off += encode_varint(0x21, &mut buf[off..]).unwrap();
@@ -644,11 +645,9 @@ mod tests {
         buf[off + 2] = 0x03;
         off += 3;
 
-        let err = decode_h3_frame(&buf[..off]).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Transport(TransportError::FrameEncodingError)
-        ));
+        let (frame, consumed) = decode_h3_frame(&buf[..off]).unwrap();
+        assert!(matches!(frame, H3Frame::Unknown(0x21)));
+        assert_eq!(consumed, off);
     }
 
     // -----------------------------------------------------------------------
