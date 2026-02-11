@@ -32,6 +32,18 @@ pub struct EncryptedExtensionsData {
     pub transport_params: Option<TransportParams>,
 }
 
+/// Parsed extensions from ClientHello.
+pub struct ClientHelloExtensions {
+    /// Client's X25519 public key from key_share.
+    pub key_share: Option<[u8; 32]>,
+    /// Supported versions list (true if TLS 1.3 is included).
+    pub supports_tls13: bool,
+    /// ALPN protocols offered by the client.
+    pub alpn_protocols: heapless::Vec<heapless::Vec<u8, 16>, 4>,
+    /// Client's QUIC transport parameters.
+    pub transport_params: Option<TransportParams>,
+}
+
 /// Write a 2-byte big-endian value.
 fn put_u16(buf: &mut [u8], off: &mut usize, val: u16) -> Result<(), Error> {
     if buf.len() < *off + 2 {
@@ -278,6 +290,181 @@ pub fn parse_encrypted_extensions_data(data: &[u8]) -> Result<EncryptedExtension
     Ok(result)
 }
 
+/// Parse ClientHello extensions.
+pub fn parse_client_hello_extensions(data: &[u8]) -> Result<ClientHelloExtensions, Error> {
+    let mut result = ClientHelloExtensions {
+        key_share: None,
+        supports_tls13: false,
+        alpn_protocols: heapless::Vec::new(),
+        transport_params: None,
+    };
+
+    let mut off = 0;
+    while off + 4 <= data.len() {
+        let ext_type = get_u16(data, &mut off)?;
+        let ext_len = get_u16(data, &mut off)? as usize;
+
+        if off + ext_len > data.len() {
+            return Err(Error::Tls);
+        }
+        let ext_data = &data[off..off + ext_len];
+        off += ext_len;
+
+        match ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                // ClientHello: list_length(1) + versions
+                if ext_data.is_empty() {
+                    return Err(Error::Tls);
+                }
+                let list_len = ext_data[0] as usize;
+                if 1 + list_len > ext_data.len() {
+                    return Err(Error::Tls);
+                }
+                let mut voff = 1;
+                while voff + 1 < 1 + list_len {
+                    let ver = u16::from_be_bytes([ext_data[voff], ext_data[voff + 1]]);
+                    if ver == 0x0304 {
+                        result.supports_tls13 = true;
+                    }
+                    voff += 2;
+                }
+            }
+            EXT_KEY_SHARE => {
+                // ClientHello key_share: client_shares_length(2) + KeyShareEntry list
+                if ext_data.len() < 2 {
+                    return Err(Error::Tls);
+                }
+                let shares_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                if 2 + shares_len > ext_data.len() {
+                    return Err(Error::Tls);
+                }
+                let mut soff = 2;
+                while soff + 4 <= 2 + shares_len {
+                    let group = u16::from_be_bytes([ext_data[soff], ext_data[soff + 1]]);
+                    let key_len = u16::from_be_bytes([ext_data[soff + 2], ext_data[soff + 3]]) as usize;
+                    soff += 4;
+                    if soff + key_len > 2 + shares_len {
+                        return Err(Error::Tls);
+                    }
+                    if group == GROUP_X25519 && key_len == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&ext_data[soff..soff + 32]);
+                        result.key_share = Some(key);
+                    }
+                    soff += key_len;
+                }
+            }
+            EXT_ALPN => {
+                // protocol_name_list: length(2) + entries
+                if ext_data.len() < 2 {
+                    return Err(Error::Tls);
+                }
+                let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                if 2 + list_len > ext_data.len() {
+                    return Err(Error::Tls);
+                }
+                let mut aoff = 2;
+                while aoff < 2 + list_len {
+                    let proto_len = ext_data[aoff] as usize;
+                    aoff += 1;
+                    if aoff + proto_len > 2 + list_len {
+                        return Err(Error::Tls);
+                    }
+                    let mut proto = heapless::Vec::new();
+                    for &b in &ext_data[aoff..aoff + proto_len] {
+                        proto.push(b).map_err(|_| Error::Tls)?;
+                    }
+                    result.alpn_protocols.push(proto).map_err(|_| Error::Tls)?;
+                    aoff += proto_len;
+                }
+            }
+            EXT_QUIC_TRANSPORT_PARAMS => {
+                result.transport_params = Some(TransportParams::decode(ext_data)?);
+            }
+            _ => {
+                // Ignore unknown extensions (SNI, signature_algorithms, etc.)
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Encode ServerHello extensions.
+///
+/// Includes: supported_versions (TLS 1.3) and key_share (X25519).
+pub fn encode_server_hello_extensions(
+    public_key: &[u8; 32],
+    buf: &mut [u8],
+) -> Result<usize, Error> {
+    let mut off = 0;
+
+    // --- supported_versions ---
+    // ServerHello: just the selected version (2 bytes), no list length byte
+    put_u16(buf, &mut off, EXT_SUPPORTED_VERSIONS)?;
+    put_u16(buf, &mut off, 2)?; // extension data length
+    put_u16(buf, &mut off, 0x0304)?; // TLS 1.3
+
+    // --- key_share ---
+    // ServerHello KeyShareEntry: group(2) + key_length(2) + key(32) = 36
+    let entry_len = 2 + 2 + 32;
+    put_u16(buf, &mut off, EXT_KEY_SHARE)?;
+    put_u16(buf, &mut off, entry_len as u16)?;
+    put_u16(buf, &mut off, GROUP_X25519)?;
+    put_u16(buf, &mut off, 32)?;
+    if buf.len() < off + 32 {
+        return Err(Error::BufferTooSmall { needed: off + 32 });
+    }
+    buf[off..off + 32].copy_from_slice(public_key);
+    off += 32;
+
+    Ok(off)
+}
+
+/// Encode EncryptedExtensions data for the server.
+///
+/// Includes: ALPN (selected protocol) and QUIC transport parameters.
+pub fn encode_encrypted_extensions_data(
+    selected_alpn: &[u8],
+    transport_params: &TransportParams,
+    buf: &mut [u8],
+) -> Result<usize, Error> {
+    let mut off = 0;
+
+    // --- ALPN ---
+    if !selected_alpn.is_empty() {
+        // Server sends exactly one protocol
+        let list_len = 1 + selected_alpn.len();
+        put_u16(buf, &mut off, EXT_ALPN)?;
+        put_u16(buf, &mut off, (2 + list_len) as u16)?; // extension data length
+        put_u16(buf, &mut off, list_len as u16)?; // list length
+        if buf.len() < off + 1 + selected_alpn.len() {
+            return Err(Error::BufferTooSmall {
+                needed: off + 1 + selected_alpn.len(),
+            });
+        }
+        buf[off] = selected_alpn.len() as u8;
+        off += 1;
+        buf[off..off + selected_alpn.len()].copy_from_slice(selected_alpn);
+        off += selected_alpn.len();
+    }
+
+    // --- QUIC transport parameters ---
+    let mut tp_buf = [0u8; 256];
+    let tp_len = transport_params.encode(&mut tp_buf)?;
+    put_u16(buf, &mut off, EXT_QUIC_TRANSPORT_PARAMS)?;
+    put_u16(buf, &mut off, tp_len as u16)?;
+    if buf.len() < off + tp_len {
+        return Err(Error::BufferTooSmall {
+            needed: off + tp_len,
+        });
+    }
+    buf[off..off + tp_len].copy_from_slice(&tp_buf[..tp_len]);
+    off += tp_len;
+
+    Ok(off)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +606,51 @@ mod tests {
             assert_ne!(ext_type, EXT_SERVER_NAME, "SNI should not be present");
             off += ext_len;
         }
+    }
+
+    #[test]
+    fn parse_client_hello_extensions_basic() {
+        let params = TransportParams::default_params();
+        let public_key = [0x42u8; 32];
+        let mut buf = [0u8; 1024];
+        let len = encode_client_hello_extensions(
+            "example.com",
+            &public_key,
+            &[b"h3", b"hq-29"],
+            &params,
+            &mut buf,
+        )
+        .unwrap();
+
+        let parsed = parse_client_hello_extensions(&buf[..len]).unwrap();
+        assert!(parsed.supports_tls13);
+        assert_eq!(parsed.key_share.unwrap(), public_key);
+        assert_eq!(parsed.alpn_protocols.len(), 2);
+        assert_eq!(parsed.alpn_protocols[0].as_slice(), b"h3");
+        assert_eq!(parsed.alpn_protocols[1].as_slice(), b"hq-29");
+        assert!(parsed.transport_params.is_some());
+        assert_eq!(parsed.transport_params.unwrap(), params);
+    }
+
+    #[test]
+    fn encode_parse_server_hello_extensions_roundtrip() {
+        let public_key = [0xBB; 32];
+        let mut buf = [0u8; 256];
+        let len = encode_server_hello_extensions(&public_key, &mut buf).unwrap();
+
+        let parsed = parse_server_hello_extensions(&buf[..len]).unwrap();
+        assert_eq!(parsed.selected_version, 0x0304);
+        assert_eq!(parsed.key_share.unwrap(), public_key);
+    }
+
+    #[test]
+    fn encode_parse_encrypted_extensions_data_roundtrip() {
+        let params = TransportParams::default_params();
+        let mut buf = [0u8; 512];
+        let len = encode_encrypted_extensions_data(b"h3", &params, &mut buf).unwrap();
+
+        let parsed = parse_encrypted_extensions_data(&buf[..len]).unwrap();
+        assert_eq!(parsed.alpn.as_ref().unwrap().as_slice(), b"h3");
+        assert_eq!(parsed.transport_params.unwrap(), params);
     }
 }

@@ -5,17 +5,26 @@
 //! Start -> WaitServerHello -> WaitEncryptedExtensions -> WaitCertificate ->
 //! WaitCertificateVerify -> WaitFinished -> SendFinished -> Complete
 //! ```
+//!
+//! Server-side state machine:
+//! ```text
+//! WaitClientHello -> SendServerFlight(Initial) -> SendServerFlight(Handshake) ->
+//! WaitClientFinished -> Complete
+//! ```
 
 use crate::crypto::{CryptoProvider, Level};
 use crate::error::Error;
 use crate::tls::extensions::{
-    encode_client_hello_extensions, parse_encrypted_extensions_data, parse_server_hello_extensions,
+    encode_client_hello_extensions, encode_encrypted_extensions_data,
+    encode_server_hello_extensions, parse_client_hello_extensions,
+    parse_encrypted_extensions_data, parse_server_hello_extensions,
 };
 use crate::tls::key_schedule_tls::{compute_finished_verify_data, TlsKeySchedule};
 use crate::tls::messages::{
-    self, CipherSuite, HandshakeType, encode_client_hello, encode_finished, parse_certificate,
-    parse_certificate_verify, parse_encrypted_extensions, parse_finished, parse_server_hello,
-    read_handshake_header,
+    self, CipherSuite, HandshakeType, encode_certificate, encode_certificate_verify,
+    encode_client_hello, encode_encrypted_extensions, encode_finished, encode_server_hello,
+    iter_cipher_suites, parse_certificate, parse_certificate_verify, parse_client_hello,
+    parse_encrypted_extensions, parse_finished, parse_server_hello, read_handshake_header,
 };
 use crate::tls::transcript::TranscriptHash;
 use crate::tls::transport_params::TransportParams;
@@ -28,9 +37,10 @@ pub enum Role {
     Server,
 }
 
-/// Client-side handshake states.
+/// Handshake states for both client and server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandshakeState {
+    // --- Client states ---
     /// Initial state — ClientHello needs to be written.
     Start,
     /// ClientHello has been sent, waiting for ServerHello.
@@ -45,11 +55,23 @@ enum HandshakeState {
     WaitFinished,
     /// Need to send client Finished.
     SendFinished,
+
+    // --- Server states ---
+    /// Server waiting for ClientHello.
+    WaitClientHello,
+    /// Server has built ServerHello (Initial level) — waiting to flush it.
+    SendServerFlightInitial,
+    /// Server has built EE+Cert+CV+Finished (Handshake level) — waiting to flush.
+    SendServerFlightHandshake,
+    /// Server waiting for client Finished.
+    WaitClientFinished,
+
+    // --- Shared ---
     /// Handshake is complete.
     Complete,
 }
 
-/// Configuration for creating a TLS engine.
+/// Configuration for creating a client-side TLS engine.
 pub struct TlsConfig {
     /// Server name for SNI.
     pub server_name: heapless::String<64>,
@@ -62,6 +84,21 @@ pub struct TlsConfig {
     pub pinned_certs: &'static [&'static [u8]],
 }
 
+/// Configuration for creating a server-side TLS engine.
+pub struct ServerTlsConfig {
+    /// DER-encoded server certificate.
+    pub cert_der: &'static [u8],
+    /// DER-encoded private key (for CertificateVerify signing).
+    /// For the initial implementation, we'll skip actual signing and
+    /// just include a placeholder signature. Real signing requires
+    /// an Ed25519/ECDSA library.
+    pub private_key_der: &'static [u8],
+    /// ALPN protocols the server supports.
+    pub alpn_protocols: &'static [&'static [u8]],
+    /// Our QUIC transport parameters.
+    pub transport_params: TransportParams,
+}
+
 /// TLS 1.3 handshake engine for QUIC, generic over the crypto provider.
 pub struct TlsEngine<C: CryptoProvider> {
     role: Role,
@@ -71,7 +108,7 @@ pub struct TlsEngine<C: CryptoProvider> {
     private_key: x25519_dalek::StaticSecret,
     public_key: x25519_dalek::PublicKey,
 
-    // ClientHello random (stored so write_handshake doesn't need RNG parameter)
+    // Random bytes (ClientHello random for client, ServerHello random for server)
     client_random: [u8; 32],
 
     // Negotiated cipher suite
@@ -91,6 +128,10 @@ pub struct TlsEngine<C: CryptoProvider> {
     pending_write: heapless::Vec<u8, 2048>,
     pending_level: Level,
 
+    // Second output buffer for the server's handshake-level flight
+    // (ServerHello goes at Initial, everything else at Handshake)
+    pending_write_hs: heapless::Vec<u8, 2048>,
+
     // Keys ready to be picked up by QUIC
     pending_keys: Option<DerivedKeys>,
 
@@ -103,11 +144,18 @@ pub struct TlsEngine<C: CryptoProvider> {
     // Negotiated ALPN
     negotiated_alpn: Option<heapless::Vec<u8, 16>>,
 
-    // Certificate verification
+    // Certificate verification (client-side)
     pinned_certs: &'static [&'static [u8]],
 
-    // Server certificate data (stored for verification)
+    // Server certificate data (stored for verification by client, or as config for server)
     server_cert_data: heapless::Vec<u8, 2048>,
+
+    // Server certificate DER (static reference, for server role)
+    server_cert_der: &'static [u8],
+    // Server private key DER (static reference, for server role)
+    // TODO: Used when real Ed25519 signing is implemented for CertificateVerify.
+    #[allow(dead_code)]
+    server_private_key_der: &'static [u8],
 
     // Handshake complete flag
     complete: bool,
@@ -145,6 +193,7 @@ where
             transcript: TranscriptHash::new(),
             pending_write: heapless::Vec::new(),
             pending_level: Level::Initial,
+            pending_write_hs: heapless::Vec::new(),
             pending_keys: None,
             server_name: config.server_name,
             alpn_protocols: config.alpn_protocols,
@@ -153,10 +202,58 @@ where
             negotiated_alpn: None,
             pinned_certs: config.pinned_certs,
             server_cert_data: heapless::Vec::new(),
+            server_cert_der: &[],
+            server_private_key_der: &[],
             complete: false,
             _crypto: core::marker::PhantomData,
         }
     }
+
+    /// Create a new server-side TLS engine.
+    ///
+    /// `secret_bytes` should be 32 random bytes for the X25519 private key.
+    /// `random` should be 32 random bytes for the ServerHello random field.
+    pub fn new_server(config: ServerTlsConfig, secret_bytes: [u8; 32], random: [u8; 32]) -> Self {
+        let private_key = x25519_dalek::StaticSecret::from(secret_bytes);
+        let public_key = x25519_dalek::PublicKey::from(&private_key);
+
+        let hkdf = C::Hkdf::default();
+        let key_schedule = TlsKeySchedule::new(&hkdf);
+
+        Self {
+            role: Role::Server,
+            state: HandshakeState::WaitClientHello,
+            private_key,
+            public_key,
+            client_random: random, // For the server, this stores the ServerHello random
+            cipher_suite: None,
+            key_schedule,
+            client_handshake_secret: [0u8; 32],
+            server_handshake_secret: [0u8; 32],
+            client_app_secret: [0u8; 32],
+            server_app_secret: [0u8; 32],
+            transcript: TranscriptHash::new(),
+            pending_write: heapless::Vec::new(),
+            pending_level: Level::Initial,
+            pending_write_hs: heapless::Vec::new(),
+            pending_keys: None,
+            server_name: heapless::String::new(),
+            alpn_protocols: config.alpn_protocols,
+            transport_params: config.transport_params,
+            peer_transport_params: None,
+            negotiated_alpn: None,
+            pinned_certs: &[],
+            server_cert_data: heapless::Vec::new(),
+            server_cert_der: config.cert_der,
+            server_private_key_der: config.private_key_der,
+            complete: false,
+            _crypto: core::marker::PhantomData,
+        }
+    }
+
+    // =========================================================================
+    // Client-side methods
+    // =========================================================================
 
     /// Build and buffer the ClientHello message.
     fn build_client_hello(&mut self, random: &[u8; 32]) -> Result<(), Error> {
@@ -201,7 +298,7 @@ where
         Ok(())
     }
 
-    /// Process a ServerHello message.
+    /// Process a ServerHello message (client side).
     fn process_server_hello(&mut self, msg_body: &[u8]) -> Result<(), Error> {
         let sh = parse_server_hello(msg_body)?;
 
@@ -255,7 +352,7 @@ where
         Ok(())
     }
 
-    /// Process an EncryptedExtensions message.
+    /// Process an EncryptedExtensions message (client side).
     fn process_encrypted_extensions(&mut self, msg_body: &[u8]) -> Result<(), Error> {
         let ext_data = parse_encrypted_extensions(msg_body)?;
         let parsed = parse_encrypted_extensions_data(ext_data)?;
@@ -267,7 +364,7 @@ where
         Ok(())
     }
 
-    /// Process a Certificate message.
+    /// Process a Certificate message (client side).
     fn process_certificate(&mut self, msg_body: &[u8]) -> Result<(), Error> {
         let cert = parse_certificate(msg_body)?;
 
@@ -286,7 +383,7 @@ where
         Ok(())
     }
 
-    /// Process a CertificateVerify message.
+    /// Process a CertificateVerify message (client side).
     fn process_certificate_verify(&mut self, msg_body: &[u8]) -> Result<(), Error> {
         let _cv = parse_certificate_verify(msg_body)?;
 
@@ -311,7 +408,7 @@ where
         Ok(())
     }
 
-    /// Process a server Finished message.
+    /// Process a server Finished message (client side).
     fn process_server_finished(
         &mut self,
         msg_body: &[u8],
@@ -388,19 +485,267 @@ where
         self.state = HandshakeState::SendFinished;
         Ok(())
     }
-}
 
-impl<C: CryptoProvider> TlsSession for TlsEngine<C>
-where
-    C::Hkdf: Default,
-{
-    type Error = Error;
+    // =========================================================================
+    // Server-side methods
+    // =========================================================================
 
-    fn read_handshake(&mut self, level: Level, data: &[u8]) -> Result<(), Error> {
-        if self.role != Role::Client {
-            return Err(Error::InvalidState);
+    /// Process a ClientHello message and build the entire server flight.
+    ///
+    /// After this method completes:
+    /// - `pending_write` contains the ServerHello (Initial level)
+    /// - `pending_write_hs` contains EE+Cert+CV+Finished (Handshake level)
+    /// - `pending_keys` contains the handshake-level keys
+    fn process_client_hello(&mut self, msg_body: &[u8]) -> Result<(), Error> {
+        let ch = parse_client_hello(msg_body)?;
+
+        // Parse extensions
+        let ext = parse_client_hello_extensions(ch.extensions)?;
+
+        // Must support TLS 1.3
+        if !ext.supports_tls13 {
+            return Err(Error::Tls);
         }
 
+        // Must have key_share (X25519)
+        let client_public_bytes = ext.key_share.ok_or(Error::Tls)?;
+
+        // Select cipher suite: find the first one we support that the client offers
+        let mut selected_suite: Option<CipherSuite> = None;
+        for cs_u16 in iter_cipher_suites(ch.cipher_suites) {
+            if let Some(cs) = CipherSuite::from_u16(cs_u16) {
+                selected_suite = Some(cs);
+                break;
+            }
+        }
+        let selected_suite = selected_suite.ok_or(Error::Tls)?;
+        self.cipher_suite = Some(selected_suite);
+
+        // ALPN negotiation: select the first protocol the client offers that we support
+        let mut selected_alpn: Option<heapless::Vec<u8, 16>> = None;
+        for client_proto in &ext.alpn_protocols {
+            for &server_proto in self.alpn_protocols {
+                if client_proto.as_slice() == server_proto {
+                    selected_alpn = Some(client_proto.clone());
+                    break;
+                }
+            }
+            if selected_alpn.is_some() {
+                break;
+            }
+        }
+
+        // Store peer transport params
+        self.peer_transport_params = ext.transport_params;
+
+        // Store negotiated ALPN
+        self.negotiated_alpn = selected_alpn.clone();
+
+        // --- Build ServerHello ---
+        let server_random = self.client_random; // We stored the server random in client_random field
+
+        // Encode ServerHello extensions
+        let mut sh_ext_buf = [0u8; 128];
+        let sh_ext_len =
+            encode_server_hello_extensions(self.public_key.as_bytes(), &mut sh_ext_buf)?;
+
+        let mut sh_buf = [0u8; 512];
+        let sh_len = encode_server_hello(
+            &server_random,
+            ch.session_id, // echo the client's session ID
+            selected_suite,
+            &sh_ext_buf[..sh_ext_len],
+            &mut sh_buf,
+        )?;
+
+        // Add ServerHello to transcript (ClientHello was already added by the caller)
+        self.transcript.update(&sh_buf[..sh_len]);
+
+        // --- Perform X25519 DH ---
+        let client_pk = x25519_dalek::PublicKey::from(client_public_bytes);
+        let shared_secret = self.private_key.diffie_hellman(&client_pk);
+
+        // Derive handshake secrets
+        let hkdf = C::Hkdf::default();
+        self.key_schedule
+            .derive_handshake_secret(&hkdf, shared_secret.as_bytes())?;
+
+        // Get transcript hash at ClientHello..ServerHello
+        let transcript_hash = self.transcript.current_hash();
+
+        // Derive handshake traffic secrets
+        self.key_schedule.derive_handshake_traffic_secrets(
+            &hkdf,
+            &transcript_hash,
+            &mut self.client_handshake_secret,
+            &mut self.server_handshake_secret,
+        )?;
+
+        // Emit handshake-level keys for QUIC
+        // For the server: send = server_handshake, recv = client_handshake
+        let mut send_secret = [0u8; 48];
+        let mut recv_secret = [0u8; 48];
+        send_secret[..32].copy_from_slice(&self.server_handshake_secret);
+        recv_secret[..32].copy_from_slice(&self.client_handshake_secret);
+        self.pending_keys = Some(DerivedKeys {
+            level: Level::Handshake,
+            send_secret,
+            recv_secret,
+            secret_len: 32,
+        });
+
+        // --- Build Handshake-level messages (EE + Cert + CV + Finished) ---
+        let mut hs_buf = [0u8; 2048];
+        let mut hs_off = 0;
+
+        // EncryptedExtensions
+        let alpn_bytes = selected_alpn
+            .as_ref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let mut ee_ext_buf = [0u8; 512];
+        let ee_ext_len = encode_encrypted_extensions_data(
+            alpn_bytes,
+            &self.transport_params,
+            &mut ee_ext_buf,
+        )?;
+        let mut ee_msg_buf = [0u8; 1024];
+        let ee_len = encode_encrypted_extensions(&ee_ext_buf[..ee_ext_len], &mut ee_msg_buf)?;
+        self.transcript.update(&ee_msg_buf[..ee_len]);
+        hs_buf[hs_off..hs_off + ee_len].copy_from_slice(&ee_msg_buf[..ee_len]);
+        hs_off += ee_len;
+
+        // Certificate
+        let mut cert_msg_buf = [0u8; 2048];
+        let cert_len = encode_certificate(self.server_cert_der, &mut cert_msg_buf)?;
+        self.transcript.update(&cert_msg_buf[..cert_len]);
+        if hs_off + cert_len > hs_buf.len() {
+            return Err(Error::BufferTooSmall {
+                needed: hs_off + cert_len,
+            });
+        }
+        hs_buf[hs_off..hs_off + cert_len].copy_from_slice(&cert_msg_buf[..cert_len]);
+        hs_off += cert_len;
+
+        // CertificateVerify — placeholder signature
+        // Use Ed25519 algorithm (0x0807) with a 64-byte placeholder signature.
+        let placeholder_sig = [0xAA; 64];
+        let mut cv_msg_buf = [0u8; 256];
+        let cv_len = encode_certificate_verify(0x0807, &placeholder_sig, &mut cv_msg_buf)?;
+        self.transcript.update(&cv_msg_buf[..cv_len]);
+        if hs_off + cv_len > hs_buf.len() {
+            return Err(Error::BufferTooSmall {
+                needed: hs_off + cv_len,
+            });
+        }
+        hs_buf[hs_off..hs_off + cv_len].copy_from_slice(&cv_msg_buf[..cv_len]);
+        hs_off += cv_len;
+
+        // Server Finished
+        let mut server_finished_key = [0u8; 32];
+        TlsKeySchedule::derive_finished_key(
+            &hkdf,
+            &self.server_handshake_secret,
+            &mut server_finished_key,
+        )?;
+        let transcript_before_fin = self.transcript.current_hash();
+        let server_verify =
+            compute_finished_verify_data(&hkdf, &server_finished_key, &transcript_before_fin)?;
+        let mut fin_msg_buf = [0u8; 36];
+        let fin_len = encode_finished(&server_verify, &mut fin_msg_buf)?;
+        self.transcript.update(&fin_msg_buf[..fin_len]);
+        if hs_off + fin_len > hs_buf.len() {
+            return Err(Error::BufferTooSmall {
+                needed: hs_off + fin_len,
+            });
+        }
+        hs_buf[hs_off..hs_off + fin_len].copy_from_slice(&fin_msg_buf[..fin_len]);
+        hs_off += fin_len;
+
+        // Buffer the ServerHello at Initial level
+        self.pending_write.clear();
+        self.pending_write
+            .extend_from_slice(&sh_buf[..sh_len])
+            .map_err(|_| Error::BufferTooSmall { needed: sh_len })?;
+        self.pending_level = Level::Initial;
+
+        // Buffer the Handshake-level flight
+        self.pending_write_hs.clear();
+        self.pending_write_hs
+            .extend_from_slice(&hs_buf[..hs_off])
+            .map_err(|_| Error::BufferTooSmall { needed: hs_off })?;
+
+        self.state = HandshakeState::SendServerFlightInitial;
+        Ok(())
+    }
+
+    /// Process a client Finished message (server side).
+    fn process_client_finished(
+        &mut self,
+        msg_body: &[u8],
+        transcript_before_finished: &[u8; 32],
+    ) -> Result<(), Error> {
+        let verify_data = parse_finished(msg_body)?;
+
+        // Verify the client's Finished MAC
+        let hkdf = C::Hkdf::default();
+        let mut client_finished_key = [0u8; 32];
+        TlsKeySchedule::derive_finished_key(
+            &hkdf,
+            &self.client_handshake_secret,
+            &mut client_finished_key,
+        )?;
+
+        let expected =
+            compute_finished_verify_data(&hkdf, &client_finished_key, transcript_before_finished)?;
+
+        // Constant-time comparison
+        if !ct_eq(&expected, verify_data) {
+            return Err(Error::Tls);
+        }
+
+        // Derive application secrets.
+        // For the server, the transcript hash for app secrets is computed after
+        // the server's Finished (which is already in the transcript), but BEFORE
+        // the client's Finished. The TLS 1.3 spec says app secrets use the
+        // transcript up to and including the server Finished.
+        //
+        // However, we already computed through server Finished in process_client_hello.
+        // The transcript_before_finished here is the hash just before the client's Finished
+        // was added, which includes everything through the server's Finished — that is
+        // the correct hash for deriving app secrets.
+
+        self.key_schedule.derive_master_secret(&hkdf)?;
+        self.key_schedule.derive_app_traffic_secrets(
+            &hkdf,
+            transcript_before_finished,
+            &mut self.client_app_secret,
+            &mut self.server_app_secret,
+        )?;
+
+        // Emit application-level keys
+        // For the server: send = server_app, recv = client_app
+        let mut send_secret = [0u8; 48];
+        let mut recv_secret = [0u8; 48];
+        send_secret[..32].copy_from_slice(&self.server_app_secret);
+        recv_secret[..32].copy_from_slice(&self.client_app_secret);
+        self.pending_keys = Some(DerivedKeys {
+            level: Level::Application,
+            send_secret,
+            recv_secret,
+            secret_len: 32,
+        });
+
+        self.state = HandshakeState::Complete;
+        self.complete = true;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Read/write dispatch
+    // =========================================================================
+
+    fn read_client(&mut self, level: Level, data: &[u8]) -> Result<(), Error> {
         // Validate encryption level matches expected state.
         let expected_level = match self.state {
             HandshakeState::WaitServerHello => Level::Initial,
@@ -430,8 +775,7 @@ where
             let full_msg = &remaining[..msg_len];
             let msg_body = &remaining[4..msg_len];
 
-            let msg_type =
-                HandshakeType::from_u8(msg_type_byte).ok_or(Error::Tls)?;
+            let msg_type = HandshakeType::from_u8(msg_type_byte).ok_or(Error::Tls)?;
 
             match (self.state, msg_type) {
                 (HandshakeState::WaitServerHello, HandshakeType::ServerHello) => {
@@ -448,8 +792,6 @@ where
                     self.process_certificate(msg_body)?;
                 }
                 (HandshakeState::WaitCertificateVerify, HandshakeType::CertificateVerify) => {
-                    // Get transcript hash before adding CertificateVerify
-                    // (needed for CertificateVerify signature verification)
                     self.transcript.update(full_msg);
                     self.process_certificate_verify(msg_body)?;
                 }
@@ -470,11 +812,57 @@ where
         Ok(())
     }
 
-    fn write_handshake(&mut self, buf: &mut [u8]) -> Result<(usize, Level), Error> {
-        if self.role != Role::Client {
-            return Err(Error::InvalidState);
+    fn read_server(&mut self, level: Level, data: &[u8]) -> Result<(), Error> {
+        // Validate encryption level matches expected state.
+        let expected_level = match self.state {
+            HandshakeState::WaitClientHello => Level::Initial,
+            HandshakeState::WaitClientFinished => Level::Handshake,
+            _ => return Err(Error::InvalidState),
+        };
+        if level != expected_level {
+            return Err(Error::Transport(
+                crate::error::TransportError::ProtocolViolation,
+            ));
         }
 
+        let mut off = 0;
+        while off < data.len() {
+            let remaining = &data[off..];
+            let (msg_type_byte, body_len) = read_handshake_header(remaining)?;
+            let msg_len = 4 + body_len;
+
+            if remaining.len() < msg_len {
+                return Err(Error::Tls);
+            }
+
+            let full_msg = &remaining[..msg_len];
+            let msg_body = &remaining[4..msg_len];
+
+            let msg_type = HandshakeType::from_u8(msg_type_byte).ok_or(Error::Tls)?;
+
+            match (self.state, msg_type) {
+                (HandshakeState::WaitClientHello, HandshakeType::ClientHello) => {
+                    // Add ClientHello to transcript before processing
+                    self.transcript.update(full_msg);
+                    self.process_client_hello(msg_body)?;
+                }
+                (HandshakeState::WaitClientFinished, HandshakeType::Finished) => {
+                    let transcript_before = self.transcript.current_hash();
+                    self.transcript.update(full_msg);
+                    self.process_client_finished(msg_body, &transcript_before)?;
+                }
+                _ => {
+                    return Err(Error::Tls);
+                }
+            }
+
+            off += msg_len;
+        }
+
+        Ok(())
+    }
+
+    fn write_client(&mut self, buf: &mut [u8]) -> Result<(usize, Level), Error> {
         match self.state {
             HandshakeState::Start => {
                 self.build_client_hello(&self.client_random.clone())?;
@@ -505,6 +893,70 @@ where
         }
 
         Ok((len, level))
+    }
+
+    fn write_server(&mut self, buf: &mut [u8]) -> Result<(usize, Level), Error> {
+        match self.state {
+            HandshakeState::SendServerFlightInitial => {
+                // Flush the ServerHello at Initial level
+                if self.pending_write.is_empty() {
+                    return Ok((0, Level::Initial));
+                }
+                let len = self.pending_write.len();
+                if buf.len() < len {
+                    return Err(Error::BufferTooSmall { needed: len });
+                }
+                buf[..len].copy_from_slice(&self.pending_write);
+                self.pending_write.clear();
+
+                // Move to the next state for the handshake-level flight
+                self.state = HandshakeState::SendServerFlightHandshake;
+
+                Ok((len, Level::Initial))
+            }
+            HandshakeState::SendServerFlightHandshake => {
+                // Flush EE+Cert+CV+Finished at Handshake level
+                if self.pending_write_hs.is_empty() {
+                    return Ok((0, Level::Handshake));
+                }
+                let len = self.pending_write_hs.len();
+                if buf.len() < len {
+                    return Err(Error::BufferTooSmall { needed: len });
+                }
+                buf[..len].copy_from_slice(&self.pending_write_hs);
+                self.pending_write_hs.clear();
+
+                // Now wait for the client's Finished
+                self.state = HandshakeState::WaitClientFinished;
+
+                Ok((len, Level::Handshake))
+            }
+            _ => {
+                // Nothing to write
+                Ok((0, Level::Initial))
+            }
+        }
+    }
+}
+
+impl<C: CryptoProvider> TlsSession for TlsEngine<C>
+where
+    C::Hkdf: Default,
+{
+    type Error = Error;
+
+    fn read_handshake(&mut self, level: Level, data: &[u8]) -> Result<(), Error> {
+        match self.role {
+            Role::Client => self.read_client(level, data),
+            Role::Server => self.read_server(level, data),
+        }
+    }
+
+    fn write_handshake(&mut self, buf: &mut [u8]) -> Result<(usize, Level), Error> {
+        match self.role {
+            Role::Client => self.write_client(buf),
+            Role::Server => self.write_server(buf),
+        }
     }
 
     fn derived_keys(&mut self) -> Option<DerivedKeys> {
@@ -962,5 +1414,451 @@ mod tests {
         out[4..4 + body_len].copy_from_slice(&body[..body_len]);
 
         4 + body_len
+    }
+
+    // =========================================================================
+    // Server-side tests
+    // =========================================================================
+
+    /// Fake DER cert for tests.
+    const FAKE_CERT_DER: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+    const FAKE_KEY_DER: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn make_server_config() -> ServerTlsConfig {
+        ServerTlsConfig {
+            cert_der: FAKE_CERT_DER,
+            private_key_der: FAKE_KEY_DER,
+            alpn_protocols: &[b"h3"],
+            transport_params: TransportParams::default_params(),
+        }
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn make_client_config() -> TlsConfig {
+        TlsConfig {
+            server_name: heapless::String::try_from("test.local").unwrap(),
+            alpn_protocols: &[b"h3"],
+            transport_params: TransportParams::default_params(),
+            pinned_certs: &[],
+        }
+    }
+
+    /// Test: Server generates ServerHello from ClientHello.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn server_generates_server_hello_from_client_hello() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+
+        // Client writes ClientHello
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, ch_level) = client.write_handshake(&mut ch_buf).unwrap();
+        assert!(ch_len > 0);
+        assert_eq!(ch_level, Level::Initial);
+
+        // Server reads ClientHello
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+
+        server
+            .read_handshake(Level::Initial, &ch_buf[..ch_len])
+            .unwrap();
+
+        // Server should have handshake keys
+        let keys = server.derived_keys().unwrap();
+        assert_eq!(keys.level, Level::Handshake);
+
+        // Server writes ServerHello (Initial level)
+        let mut sh_buf = [0u8; 2048];
+        let (sh_len, sh_level) = server.write_handshake(&mut sh_buf).unwrap();
+        assert!(sh_len > 0);
+        assert_eq!(sh_level, Level::Initial);
+
+        // Verify it's a ServerHello
+        let (msg_type, _body_len) = read_handshake_header(&sh_buf[..sh_len]).unwrap();
+        assert_eq!(msg_type, HandshakeType::ServerHello as u8);
+
+        // Server writes the handshake-level flight
+        let mut hs_buf = [0u8; 2048];
+        let (hs_len, hs_level) = server.write_handshake(&mut hs_buf).unwrap();
+        assert!(hs_len > 0);
+        assert_eq!(hs_level, Level::Handshake);
+
+        // The handshake-level data should contain multiple messages:
+        // EncryptedExtensions, Certificate, CertificateVerify, Finished
+        let mut off = 0;
+        let mut msg_types = heapless::Vec::<u8, 8>::new();
+        while off < hs_len {
+            let (msg_type, body_len) = read_handshake_header(&hs_buf[off..]).unwrap();
+            msg_types.push(msg_type).unwrap();
+            off += 4 + body_len;
+        }
+        assert_eq!(msg_types.len(), 4);
+        assert_eq!(msg_types[0], HandshakeType::EncryptedExtensions as u8);
+        assert_eq!(msg_types[1], HandshakeType::Certificate as u8);
+        assert_eq!(msg_types[2], HandshakeType::CertificateVerify as u8);
+        assert_eq!(msg_types[3], HandshakeType::Finished as u8);
+    }
+
+    /// Test: Full client-server handshake driven to completion.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn full_client_server_handshake() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+
+        // Step 1: Client writes ClientHello
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, ch_level) = client.write_handshake(&mut ch_buf).unwrap();
+        assert!(ch_len > 0);
+        assert_eq!(ch_level, Level::Initial);
+
+        // Step 2: Server reads ClientHello
+        server
+            .read_handshake(Level::Initial, &ch_buf[..ch_len])
+            .unwrap();
+
+        // Server should have handshake keys now
+        let server_hs_keys = server.derived_keys().unwrap();
+        assert_eq!(server_hs_keys.level, Level::Handshake);
+
+        // Step 3: Server writes ServerHello (Initial level)
+        let mut sh_buf = [0u8; 2048];
+        let (sh_len, sh_level) = server.write_handshake(&mut sh_buf).unwrap();
+        assert!(sh_len > 0);
+        assert_eq!(sh_level, Level::Initial);
+
+        // Step 4: Client reads ServerHello
+        client
+            .read_handshake(Level::Initial, &sh_buf[..sh_len])
+            .unwrap();
+
+        // Client should have handshake keys now
+        let client_hs_keys = client.derived_keys().unwrap();
+        assert_eq!(client_hs_keys.level, Level::Handshake);
+
+        // Step 5: Server writes EncryptedExtensions+Certificate+CertificateVerify+Finished
+        let mut hs_buf = [0u8; 2048];
+        let (hs_len, hs_level) = server.write_handshake(&mut hs_buf).unwrap();
+        assert!(hs_len > 0);
+        assert_eq!(hs_level, Level::Handshake);
+
+        // Step 6: Client reads the handshake-level flight
+        client
+            .read_handshake(Level::Handshake, &hs_buf[..hs_len])
+            .unwrap();
+
+        // Client should have application keys now
+        let client_app_keys = client.derived_keys().unwrap();
+        assert_eq!(client_app_keys.level, Level::Application);
+
+        // Step 7: Client writes its Finished
+        let mut cfin_buf = [0u8; 256];
+        let (cfin_len, cfin_level) = client.write_handshake(&mut cfin_buf).unwrap();
+        assert!(cfin_len > 0);
+        assert_eq!(cfin_level, Level::Handshake);
+        assert!(client.is_complete());
+
+        // Step 8: Server reads client Finished
+        server
+            .read_handshake(Level::Handshake, &cfin_buf[..cfin_len])
+            .unwrap();
+
+        // Server should have application keys now
+        let server_app_keys = server.derived_keys().unwrap();
+        assert_eq!(server_app_keys.level, Level::Application);
+
+        // Both engines should be complete
+        assert!(client.is_complete());
+        assert!(server.is_complete());
+
+        // Verify that the application secrets match (client send = server recv, etc.)
+        assert_eq!(
+            &client_app_keys.send_secret[..client_app_keys.secret_len],
+            &server_app_keys.recv_secret[..server_app_keys.secret_len],
+            "client send secret should match server recv secret"
+        );
+        assert_eq!(
+            &client_app_keys.recv_secret[..client_app_keys.secret_len],
+            &server_app_keys.send_secret[..server_app_keys.secret_len],
+            "client recv secret should match server send secret"
+        );
+
+        // Also verify handshake secrets matched
+        assert_eq!(
+            &client_hs_keys.send_secret[..client_hs_keys.secret_len],
+            &server_hs_keys.recv_secret[..server_hs_keys.secret_len],
+            "client HS send secret should match server HS recv secret"
+        );
+        assert_eq!(
+            &client_hs_keys.recv_secret[..client_hs_keys.secret_len],
+            &server_hs_keys.send_secret[..server_hs_keys.secret_len],
+            "client HS recv secret should match server HS send secret"
+        );
+    }
+
+    /// Test: ALPN negotiation between client and server.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn alpn_negotiation() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        // Client offers h3 and hq-29, server supports h3
+        let client_config = TlsConfig {
+            server_name: heapless::String::try_from("test.local").unwrap(),
+            alpn_protocols: &[b"hq-29", b"h3"],
+            transport_params: TransportParams::default_params(),
+            pinned_certs: &[],
+        };
+        let server_config = ServerTlsConfig {
+            cert_der: FAKE_CERT_DER,
+            private_key_der: FAKE_KEY_DER,
+            alpn_protocols: &[b"h3"],
+            transport_params: TransportParams::default_params(),
+        };
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(client_config, [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(server_config, [0xAA; 32], [0xBB; 32]);
+
+        // Run handshake
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, _) = client.write_handshake(&mut ch_buf).unwrap();
+        server
+            .read_handshake(Level::Initial, &ch_buf[..ch_len])
+            .unwrap();
+        let _ = server.derived_keys();
+
+        let mut sh_buf = [0u8; 2048];
+        let (sh_len, _) = server.write_handshake(&mut sh_buf).unwrap();
+        client
+            .read_handshake(Level::Initial, &sh_buf[..sh_len])
+            .unwrap();
+        let _ = client.derived_keys();
+
+        let mut hs_buf = [0u8; 2048];
+        let (hs_len, _) = server.write_handshake(&mut hs_buf).unwrap();
+        client
+            .read_handshake(Level::Handshake, &hs_buf[..hs_len])
+            .unwrap();
+        let _ = client.derived_keys();
+
+        // Server should have negotiated h3
+        assert_eq!(server.alpn(), Some(b"h3".as_slice()));
+        // Client should also see h3
+        assert_eq!(client.alpn(), Some(b"h3".as_slice()));
+
+        // Complete the handshake
+        let mut cfin_buf = [0u8; 256];
+        let (cfin_len, _) = client.write_handshake(&mut cfin_buf).unwrap();
+        server
+            .read_handshake(Level::Handshake, &cfin_buf[..cfin_len])
+            .unwrap();
+        assert!(client.is_complete());
+        assert!(server.is_complete());
+    }
+
+    /// Test: Transport params exchange between client and server.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn transport_params_exchange() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        let client_tp = TransportParams {
+            max_idle_timeout: 10_000,
+            initial_max_data: 500_000,
+            ..TransportParams::default_params()
+        };
+        let server_tp = TransportParams {
+            max_idle_timeout: 20_000,
+            initial_max_data: 1_000_000,
+            ..TransportParams::default_params()
+        };
+
+        let client_config = TlsConfig {
+            server_name: heapless::String::try_from("test.local").unwrap(),
+            alpn_protocols: &[b"h3"],
+            transport_params: client_tp.clone(),
+            pinned_certs: &[],
+        };
+        let server_config = ServerTlsConfig {
+            cert_der: FAKE_CERT_DER,
+            private_key_der: FAKE_KEY_DER,
+            alpn_protocols: &[b"h3"],
+            transport_params: server_tp.clone(),
+        };
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(client_config, [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(server_config, [0xAA; 32], [0xBB; 32]);
+
+        // Run handshake
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, _) = client.write_handshake(&mut ch_buf).unwrap();
+        server
+            .read_handshake(Level::Initial, &ch_buf[..ch_len])
+            .unwrap();
+        let _ = server.derived_keys();
+
+        let mut sh_buf = [0u8; 2048];
+        let (sh_len, _) = server.write_handshake(&mut sh_buf).unwrap();
+        client
+            .read_handshake(Level::Initial, &sh_buf[..sh_len])
+            .unwrap();
+        let _ = client.derived_keys();
+
+        let mut hs_buf = [0u8; 2048];
+        let (hs_len, _) = server.write_handshake(&mut hs_buf).unwrap();
+        client
+            .read_handshake(Level::Handshake, &hs_buf[..hs_len])
+            .unwrap();
+        let _ = client.derived_keys();
+
+        let mut cfin_buf = [0u8; 256];
+        let (cfin_len, _) = client.write_handshake(&mut cfin_buf).unwrap();
+        server
+            .read_handshake(Level::Handshake, &cfin_buf[..cfin_len])
+            .unwrap();
+        let _ = server.derived_keys();
+
+        // Server should have the client's transport params
+        let server_peer_tp = server.peer_transport_params().unwrap();
+        assert_eq!(server_peer_tp.max_idle_timeout, client_tp.max_idle_timeout);
+        assert_eq!(server_peer_tp.initial_max_data, client_tp.initial_max_data);
+
+        // Client should have the server's transport params
+        let client_peer_tp = client.peer_transport_params().unwrap();
+        assert_eq!(client_peer_tp.max_idle_timeout, server_tp.max_idle_timeout);
+        assert_eq!(client_peer_tp.initial_max_data, server_tp.initial_max_data);
+    }
+
+    /// Test: Server rejects ClientHello at wrong level.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn server_rejects_client_hello_at_wrong_level() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, _) = client.write_handshake(&mut ch_buf).unwrap();
+
+        // Send ClientHello at Handshake level (wrong!)
+        let result = server.read_handshake(Level::Handshake, &ch_buf[..ch_len]);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            Error::Transport(crate::error::TransportError::ProtocolViolation)
+        );
+    }
+
+    /// Test: Server rejects ClientHello with no common cipher suite.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn server_rejects_no_common_cipher_suite() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+
+        // Build a ClientHello with only unsupported cipher suites
+        let random = [0u8; 32];
+        // Use a non-existent cipher suite
+        let mut fake_ch_body = [0u8; 256];
+        let mut off = 0;
+
+        // Version 0x0303
+        fake_ch_body[off] = 0x03;
+        fake_ch_body[off + 1] = 0x03;
+        off += 2;
+
+        // Random
+        fake_ch_body[off..off + 32].copy_from_slice(&random);
+        off += 32;
+
+        // Session ID: 0
+        fake_ch_body[off] = 0;
+        off += 1;
+
+        // Cipher suites: only 0xFFFF (unsupported)
+        fake_ch_body[off] = 0;
+        fake_ch_body[off + 1] = 2;
+        off += 2;
+        fake_ch_body[off] = 0xFF;
+        fake_ch_body[off + 1] = 0xFF;
+        off += 2;
+
+        // Compression methods: null
+        fake_ch_body[off] = 1;
+        off += 1;
+        fake_ch_body[off] = 0;
+        off += 1;
+
+        // Extensions: supported_versions + key_share (minimal)
+        let mut ext_buf = [0u8; 128];
+        let mut ext_off = 0;
+
+        // supported_versions
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x2b;
+        ext_off += 2;
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x03;
+        ext_off += 2;
+        ext_buf[ext_off] = 0x02;
+        ext_off += 1;
+        ext_buf[ext_off] = 0x03;
+        ext_buf[ext_off + 1] = 0x04;
+        ext_off += 2;
+
+        // key_share with X25519
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x33;
+        ext_off += 2;
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x26; // 2 + 2 + 2 + 32 = 38
+        ext_off += 2;
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x24; // shares length = 36
+        ext_off += 2;
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x1d; // X25519
+        ext_off += 2;
+        ext_buf[ext_off] = 0x00;
+        ext_buf[ext_off + 1] = 0x20; // key length = 32
+        ext_off += 2;
+        ext_buf[ext_off..ext_off + 32].copy_from_slice(&[0x42; 32]);
+        ext_off += 32;
+
+        // Extensions length
+        fake_ch_body[off] = ((ext_off >> 8) & 0xFF) as u8;
+        fake_ch_body[off + 1] = (ext_off & 0xFF) as u8;
+        off += 2;
+        fake_ch_body[off..off + ext_off].copy_from_slice(&ext_buf[..ext_off]);
+        off += ext_off;
+
+        // Build full message with header
+        let body_len = off;
+        let mut msg = [0u8; 512];
+        msg[0] = HandshakeType::ClientHello as u8;
+        msg[1] = ((body_len >> 16) & 0xFF) as u8;
+        msg[2] = ((body_len >> 8) & 0xFF) as u8;
+        msg[3] = (body_len & 0xFF) as u8;
+        msg[4..4 + body_len].copy_from_slice(&fake_ch_body[..body_len]);
+
+        let result = server.read_handshake(Level::Initial, &msg[..4 + body_len]);
+        assert!(result.is_err());
     }
 }

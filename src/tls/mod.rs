@@ -17,7 +17,7 @@ pub mod transcript;
 pub mod transport_params;
 
 pub use alert::AlertDescription;
-pub use handshake::TlsEngine;
+pub use handshake::{ServerTlsConfig, TlsEngine};
 pub use messages::CipherSuite;
 pub use transport_params::TransportParams;
 
