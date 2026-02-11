@@ -5,6 +5,9 @@ pub mod error;
 pub mod frame;
 pub mod varint;
 
+#[cfg(feature = "h3")]
+pub mod h3;
+
 pub mod transport;
 pub use transport::{Address, Clock, DatagramRecv, DatagramSend, Instant, Rng, ServerTransport};
 
@@ -17,6 +20,3 @@ pub use connection::{
     Connection, ConnectionConfig, ConnectionId, ConnectionState, DefaultConfig, Event, Transmit,
 };
 pub use tls::handshake::Role;
-
-#[cfg(feature = "h3")]
-pub mod h3;

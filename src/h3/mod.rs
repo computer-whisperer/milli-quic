@@ -1,12 +1,13 @@
-//! HTTP/3 framing layer (RFC 9114).
+//! HTTP/3 framing and header compression (RFC 9114, RFC 9204).
 //!
-//! This module provides the HTTP/3 frame codec, operating on top of QUIC
-//! streams. Frames use the standard TLV (Type-Length-Value) format with
-//! QUIC variable-length integers for the type and length fields.
+//! This module provides the HTTP/3 frame codec operating on top of QUIC
+//! streams, plus QPACK header compression in static-only mode.
 
 pub mod frame;
+pub mod qpack;
 
 pub use frame::{decode_h3_frame, encode_h3_frame, H3Frame, PushPromiseFrame};
+pub use qpack::{QpackDecoder, QpackEncoder};
 
 /// HTTP/3 settings (RFC 9114 §7.2.4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
