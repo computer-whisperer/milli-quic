@@ -17,3 +17,6 @@ pub use connection::{
     Connection, ConnectionConfig, ConnectionId, ConnectionState, DefaultConfig, Event, Transmit,
 };
 pub use tls::handshake::Role;
+
+#[cfg(feature = "h3")]
+pub mod h3;
