@@ -964,6 +964,129 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Edge case hardening tests for TLS messages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_server_hello_truncated() {
+        // Too short for version + random + session_id_len
+        assert!(parse_server_hello(&[0x03, 0x03]).is_err());
+        assert!(parse_server_hello(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_client_hello_truncated() {
+        assert!(parse_client_hello(&[]).is_err());
+        assert!(parse_client_hello(&[0x03]).is_err());
+        // Just version + random but no session_id len
+        let mut short = [0u8; 34];
+        short[0] = 0x03;
+        short[1] = 0x03;
+        assert!(parse_client_hello(&short).is_err());
+    }
+
+    #[test]
+    fn parse_encrypted_extensions_truncated() {
+        assert!(parse_encrypted_extensions(&[]).is_err());
+        assert!(parse_encrypted_extensions(&[0x00]).is_err());
+        // Claims 10 bytes but only 2 available
+        assert!(parse_encrypted_extensions(&[0x00, 0x0a]).is_err());
+    }
+
+    #[test]
+    fn parse_certificate_empty() {
+        assert!(parse_certificate(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_certificate_verify_truncated() {
+        assert!(parse_certificate_verify(&[]).is_err());
+        assert!(parse_certificate_verify(&[0x08]).is_err());
+        assert!(parse_certificate_verify(&[0x08, 0x07, 0x00]).is_err());
+        // Claims 10 byte signature but no data
+        assert!(parse_certificate_verify(&[0x08, 0x07, 0x00, 0x0a]).is_err());
+    }
+
+    #[test]
+    fn parse_finished_too_short() {
+        assert!(parse_finished(&[]).is_err());
+        assert!(parse_finished(&[0u8; 31]).is_err());
+        // Exactly 32 bytes should succeed
+        assert!(parse_finished(&[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn read_handshake_header_truncated() {
+        assert!(read_handshake_header(&[]).is_err());
+        assert!(read_handshake_header(&[0x01, 0x00]).is_err());
+        assert!(read_handshake_header(&[0x01, 0x00, 0x00]).is_err());
+        // Exactly 4 bytes: valid header
+        let (msg_type, body_len) = read_handshake_header(&[0x01, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(msg_type, 1);
+        assert_eq!(body_len, 0);
+    }
+
+    #[test]
+    fn handshake_type_unknown_values() {
+        assert_eq!(HandshakeType::from_u8(0), None);
+        assert_eq!(HandshakeType::from_u8(3), None);
+        assert_eq!(HandshakeType::from_u8(255), None);
+    }
+
+    #[test]
+    fn cipher_suite_unknown_values() {
+        assert_eq!(CipherSuite::from_u16(0x0000), None);
+        assert_eq!(CipherSuite::from_u16(0x1302), None); // Not supported
+        assert_eq!(CipherSuite::from_u16(0xFFFF), None);
+    }
+
+    #[test]
+    fn encode_parse_client_hello_with_session_id() {
+        let random = [0x42u8; 32];
+        let session_id = [0x11, 0x22, 0x33, 0x44];
+        let suites = [CipherSuite::TlsChacha20Poly1305Sha256];
+        let extensions = [0xAA];
+
+        let mut buf = [0u8; 512];
+        let len = encode_client_hello(&random, &session_id, &suites, &extensions, &mut buf).unwrap();
+
+        let ch = parse_client_hello(&buf[4..len]).unwrap();
+        assert_eq!(ch.session_id, &session_id);
+        assert_eq!(ch.extensions, &[0xAA]);
+    }
+
+    #[test]
+    fn server_hello_unsupported_cipher_fails() {
+        // Build a ServerHello with unsupported cipher suite 0x1302
+        let mut data = [0u8; 256];
+        let mut off = 0;
+        data[off] = 0x03; data[off+1] = 0x03; off += 2;
+        off += 32; // random (zeros)
+        data[off] = 0; off += 1; // session_id len
+        data[off] = 0x13; data[off+1] = 0x02; off += 2; // unsupported suite
+        data[off] = 0; off += 1; // compression
+        data[off] = 0; data[off+1] = 0; off += 2; // extensions len
+
+        assert!(parse_server_hello(&data[..off]).is_err());
+    }
+
+    #[test]
+    fn iter_certificate_entries_empty() {
+        let entries: &[u8] = &[];
+        let count = iter_certificate_entries(entries).count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn iter_certificate_entries_truncated() {
+        // Only 2 bytes (needs at least 3 for cert_data length)
+        let entries: &[u8] = &[0x00, 0x01];
+        let results: heapless::Vec<_, 4> = iter_certificate_entries(entries).collect();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+    }
+
     #[test]
     fn encode_parse_certificate_verify_roundtrip() {
         let signature = [0xAA; 64];

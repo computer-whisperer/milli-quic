@@ -25,6 +25,12 @@ where
             return None;
         }
 
+        // Anti-amplification check: if address is not validated and we've
+        // already sent 3x what we received, we cannot send anything.
+        if !self.address_validated && !self.amplification_allows(1) {
+            return None;
+        }
+
         let mut total_written = 0;
 
         // Try to send at each level, coalescing into one datagram.
@@ -103,6 +109,15 @@ where
         }
 
         if total_written > 0 {
+            // Anti-amplification: check the 3x limit on the final datagram size
+            if !self.address_validated && !self.amplification_allows(total_written) {
+                return None;
+            }
+            // Track bytes sent for anti-amplification accounting
+            if !self.address_validated {
+                self.anti_amplification_bytes_sent =
+                    self.anti_amplification_bytes_sent.saturating_add(total_written);
+            }
             Some(Transmit {
                 data: &buf[..total_written],
             })

@@ -421,6 +421,52 @@ mod tests {
         assert_eq!(fc.send_capacity(), 2000);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Resource exhaustion resistance tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flow_control_prevents_buffer_overrun() {
+        let mut fc = FlowController::new(100, 4, 2);
+        // Can receive up to 100 bytes
+        fc.on_recv(50).unwrap();
+        fc.on_recv(50).unwrap();
+        // Any more should be rejected
+        assert_eq!(
+            fc.on_recv(1).unwrap_err(),
+            Error::Transport(TransportError::FlowControlError)
+        );
+    }
+
+    #[test]
+    fn maximum_window_sizes() {
+        // Very large initial window
+        let mut fc = FlowController::new(u64::MAX / 2, 100, 100);
+        // Should be able to receive large amounts
+        fc.on_recv(1_000_000).unwrap();
+        fc.on_recv(1_000_000_000).unwrap();
+    }
+
+    #[test]
+    fn send_exceeds_max_data_exactly_at_boundary() {
+        let mut fc = FlowController::new(1000, 4, 2);
+        fc.handle_max_data(100);
+        // Send exactly to the limit
+        fc.on_send(100).unwrap();
+        assert!(fc.is_send_blocked());
+        assert_eq!(fc.send_capacity(), 0);
+        // One more byte should fail
+        assert!(fc.on_send(1).is_err());
+    }
+
+    #[test]
+    fn recv_exactly_at_limit() {
+        let mut fc = FlowController::new(1000, 4, 2);
+        fc.on_recv(1000).unwrap();
+        // Exactly at limit should succeed, one more should fail
+        assert!(fc.on_recv(1).is_err());
+    }
+
     #[test]
     fn zero_initial_max_data() {
         let fc = FlowController::new(0, 0, 0);

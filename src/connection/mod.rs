@@ -251,6 +251,13 @@ pub struct Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> 
     // Stream receive buffers (simple, indexed by position)
     pub(crate) stream_recv_bufs: [Option<StreamRecvBuf>; 32],
 
+    // Anti-amplification: total bytes received before address validation
+    pub(crate) anti_amplification_bytes_received: usize,
+    // Anti-amplification: total bytes sent before address validation
+    pub(crate) anti_amplification_bytes_sent: usize,
+    // Whether address has been validated (handshake complete or Retry)
+    pub(crate) address_validated: bool,
+
     // Marker for config type
     _cfg: core::marker::PhantomData<Cfg>,
 }
@@ -333,6 +340,9 @@ where
             need_handshake_done: false,
             stream_send_queue: heapless::Vec::new(),
             stream_recv_bufs: core::array::from_fn(|_| None),
+            anti_amplification_bytes_received: 0,
+            anti_amplification_bytes_sent: 0,
+            address_validated: true, // Client doesn't need amplification protection
             _cfg: core::marker::PhantomData,
         })
     }
@@ -393,6 +403,9 @@ where
             need_handshake_done: true,
             stream_send_queue: heapless::Vec::new(),
             stream_recv_bufs: core::array::from_fn(|_| None),
+            anti_amplification_bytes_received: 0,
+            anti_amplification_bytes_sent: 0,
+            address_validated: false, // Server must validate address before sending freely
             _cfg: core::marker::PhantomData,
         })
     }
@@ -629,6 +642,16 @@ where
         }
     }
 
+    /// Check whether the anti-amplification limit allows sending `bytes` more bytes.
+    /// Returns `true` if sending is allowed, `false` if it would exceed the 3x limit.
+    pub(crate) fn amplification_allows(&self, bytes: usize) -> bool {
+        if self.address_validated {
+            return true;
+        }
+        self.anti_amplification_bytes_sent + bytes
+            <= 3 * self.anti_amplification_bytes_received
+    }
+
     /// Track a received packet number for ACK generation.
     pub(crate) fn track_received_pn(&mut self, level: Level, pn: u64) {
         let idx = level_index(level);
@@ -835,6 +858,218 @@ mod tests {
     // =========================================================================
     // Integration test: full client-server handshake over Connection API
     // =========================================================================
+
+    // -----------------------------------------------------------------------
+    // Phase 13: Anti-amplification tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    mod amplification_tests {
+        use super::*;
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+        use crate::tls::handshake::ServerTlsConfig;
+
+        const FAKE_CERT: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        const FAKE_KEY: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+
+        struct TestRng(u8);
+        impl Rng for TestRng {
+            fn fill(&mut self, buf: &mut [u8]) {
+                for b in buf.iter_mut() {
+                    *b = self.0;
+                    self.0 = self.0.wrapping_add(1);
+                }
+            }
+        }
+
+        #[test]
+        fn client_address_always_validated() {
+            let mut rng = TestRng(0x10);
+            let tp = crate::tls::transport_params::TransportParams::default_params();
+            let conn = Connection::<Aes128GcmProvider>::client(
+                Aes128GcmProvider,
+                "example.com",
+                &[b"h3"],
+                tp,
+                &mut rng,
+            )
+            .unwrap();
+            assert!(conn.address_validated);
+        }
+
+        #[test]
+        fn server_address_not_validated_initially() {
+            let mut rng = TestRng(0x20);
+            let tp = crate::tls::transport_params::TransportParams::default_params();
+            let config = ServerTlsConfig {
+                cert_der: FAKE_CERT,
+                private_key_der: FAKE_KEY,
+                alpn_protocols: &[b"h3"],
+                transport_params: tp.clone(),
+            };
+            let conn = Connection::<Aes128GcmProvider>::server(
+                Aes128GcmProvider,
+                config,
+                tp,
+                &mut rng,
+            )
+            .unwrap();
+            assert!(!conn.address_validated);
+        }
+
+        #[test]
+        fn amplification_allows_within_3x() {
+            let mut rng = TestRng(0x20);
+            let tp = crate::tls::transport_params::TransportParams::default_params();
+            let config = ServerTlsConfig {
+                cert_der: FAKE_CERT,
+                private_key_der: FAKE_KEY,
+                alpn_protocols: &[b"h3"],
+                transport_params: tp.clone(),
+            };
+            let mut conn = Connection::<Aes128GcmProvider>::server(
+                Aes128GcmProvider,
+                config,
+                tp,
+                &mut rng,
+            )
+            .unwrap();
+
+            // Simulate receiving 1200 bytes
+            conn.anti_amplification_bytes_received = 1200;
+
+            // Can send up to 3600 bytes
+            assert!(conn.amplification_allows(3600));
+            assert!(!conn.amplification_allows(3601));
+
+            // After sending some, check remaining
+            conn.anti_amplification_bytes_sent = 3000;
+            assert!(conn.amplification_allows(600));
+            assert!(!conn.amplification_allows(601));
+        }
+
+        #[test]
+        fn amplification_allows_after_validation() {
+            let mut rng = TestRng(0x20);
+            let tp = crate::tls::transport_params::TransportParams::default_params();
+            let config = ServerTlsConfig {
+                cert_der: FAKE_CERT,
+                private_key_der: FAKE_KEY,
+                alpn_protocols: &[b"h3"],
+                transport_params: tp.clone(),
+            };
+            let mut conn = Connection::<Aes128GcmProvider>::server(
+                Aes128GcmProvider,
+                config,
+                tp,
+                &mut rng,
+            )
+            .unwrap();
+
+            // Before validation, 0 received means 0 can be sent
+            assert!(!conn.amplification_allows(1));
+
+            // After validation, anything can be sent
+            conn.address_validated = true;
+            assert!(conn.amplification_allows(1_000_000));
+        }
+
+        #[test]
+        fn amplification_zero_received_blocks_all() {
+            let mut rng = TestRng(0x20);
+            let tp = crate::tls::transport_params::TransportParams::default_params();
+            let config = ServerTlsConfig {
+                cert_der: FAKE_CERT,
+                private_key_der: FAKE_KEY,
+                alpn_protocols: &[b"h3"],
+                transport_params: tp.clone(),
+            };
+            let conn = Connection::<Aes128GcmProvider>::server(
+                Aes128GcmProvider,
+                config,
+                tp,
+                &mut rng,
+            )
+            .unwrap();
+
+            // No bytes received, no bytes can be sent
+            assert!(!conn.amplification_allows(1));
+            // But 0 bytes is OK
+            assert!(conn.amplification_allows(0));
+        }
+
+        #[test]
+        fn server_validated_after_handshake() {
+            // Full handshake should set address_validated = true on the server
+            let mut rng_c = TestRng(0x10);
+            let mut rng_s = TestRng(0x50);
+            let tp = crate::tls::transport_params::TransportParams::default_params();
+
+            let mut client = Connection::<Aes128GcmProvider>::client(
+                Aes128GcmProvider,
+                "test.local",
+                &[b"h3"],
+                tp.clone(),
+                &mut rng_c,
+            )
+            .unwrap();
+
+            let config = ServerTlsConfig {
+                cert_der: FAKE_CERT,
+                private_key_der: FAKE_KEY,
+                alpn_protocols: &[b"h3"],
+                transport_params: tp.clone(),
+            };
+            let mut server = Connection::<Aes128GcmProvider>::server(
+                Aes128GcmProvider,
+                config,
+                tp,
+                &mut rng_s,
+            )
+            .unwrap();
+
+            assert!(!server.address_validated);
+
+            // Run handshake
+            let now = 1_000_000u64;
+            for _round in 0..20 {
+                loop {
+                    let mut buf = [0u8; 4096];
+                    match client.poll_transmit(&mut buf, now) {
+                        Some(tx) => {
+                            let data: heapless::Vec<u8, 4096> = {
+                                let mut v = heapless::Vec::new();
+                                let _ = v.extend_from_slice(tx.data);
+                                v
+                            };
+                            let _ = server.recv(&data, now);
+                        }
+                        None => break,
+                    }
+                }
+                loop {
+                    let mut buf = [0u8; 4096];
+                    match server.poll_transmit(&mut buf, now) {
+                        Some(tx) => {
+                            let data: heapless::Vec<u8, 4096> = {
+                                let mut v = heapless::Vec::new();
+                                let _ = v.extend_from_slice(tx.data);
+                                v
+                            };
+                            let _ = client.recv(&data, now);
+                        }
+                        None => break,
+                    }
+                }
+                if client.is_established() && server.is_established() {
+                    break;
+                }
+            }
+
+            assert!(server.is_established());
+            assert!(server.address_validated, "server should be address-validated after handshake");
+        }
+    }
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     mod integration {

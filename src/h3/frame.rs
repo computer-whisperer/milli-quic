@@ -740,6 +740,70 @@ mod tests {
         assert_eq!(written, 5);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Edge case hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_length_data_h3() {
+        roundtrip(&H3Frame::Data(b""));
+    }
+
+    #[test]
+    fn settings_with_unknown_identifiers_preserved() {
+        // Build a SETTINGS frame with an unknown identifier interleaved
+        let mut buf = [0u8; 64];
+        let mut off = 0;
+        off += encode_varint(H3_FRAME_SETTINGS, &mut buf[off..]).unwrap();
+
+        let mut payload = [0u8; 32];
+        let mut poff = 0;
+        // Unknown identifier 0x1234
+        poff += encode_varint(0x1234, &mut payload[poff..]).unwrap();
+        poff += encode_varint(99, &mut payload[poff..]).unwrap();
+        // Known: qpack_blocked_streams = 16
+        poff += encode_varint(SETTINGS_QPACK_BLOCKED_STREAMS, &mut payload[poff..]).unwrap();
+        poff += encode_varint(16, &mut payload[poff..]).unwrap();
+        // Unknown identifier 0xFFFF
+        poff += encode_varint(0xFFFF, &mut payload[poff..]).unwrap();
+        poff += encode_varint(0, &mut payload[poff..]).unwrap();
+
+        off += encode_varint(poff as u64, &mut buf[off..]).unwrap();
+        buf[off..off + poff].copy_from_slice(&payload[..poff]);
+        off += poff;
+
+        let (frame, consumed) = decode_h3_frame(&buf[..off]).unwrap();
+        assert_eq!(consumed, off);
+        let expected = H3Settings {
+            qpack_blocked_streams: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(frame, H3Frame::Settings(expected));
+    }
+
+    #[test]
+    fn goaway_max_push_id_value() {
+        roundtrip(&H3Frame::GoAway(crate::varint::MAX_VARINT));
+    }
+
+    #[test]
+    fn push_promise_roundtrip_with_data() {
+        let pp = PushPromiseFrame {
+            push_id: 42,
+            header_block: b"\x00\x00\xd1\xd7\x51\x86\xaa\xbb",
+        };
+        roundtrip(&H3Frame::PushPromise(pp));
+    }
+
+    #[test]
+    fn push_promise_large_push_id() {
+        let pp = PushPromiseFrame {
+            push_id: crate::varint::MAX_VARINT,
+            header_block: b"",
+        };
+        roundtrip(&H3Frame::PushPromise(pp));
+    }
+
     #[test]
     fn multiple_frames_in_buffer() {
         // Encode two frames back-to-back and decode them sequentially.

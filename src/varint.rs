@@ -223,4 +223,117 @@ mod tests {
         let mut buf = [0u8; 8];
         assert!(encode_varint(MAX_VARINT + 1, &mut buf).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 13: Edge case hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_62bit_value_roundtrip() {
+        let v = MAX_VARINT; // 2^62 - 1
+        let mut buf = [0u8; 8];
+        let written = encode_varint(v, &mut buf).unwrap();
+        assert_eq!(written, 8);
+        let (decoded, consumed) = decode_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, v);
+        assert_eq!(consumed, 8);
+    }
+
+    #[test]
+    fn all_boundary_values_roundtrip() {
+        let boundaries = [63u64, 16383, 1073741823, 4611686018427387903];
+        let expected_lens = [1, 2, 4, 8];
+        for (v, expected_len) in boundaries.iter().zip(expected_lens.iter()) {
+            let mut buf = [0u8; 8];
+            let written = encode_varint(*v, &mut buf).unwrap();
+            assert_eq!(written, *expected_len, "boundary {v} should need {expected_len} bytes");
+            let (decoded, consumed) = decode_varint(&buf[..written]).unwrap();
+            assert_eq!(decoded, *v);
+            assert_eq!(consumed, *expected_len);
+        }
+    }
+
+    #[test]
+    fn truncated_input_2byte() {
+        // 2-byte varint prefix (0x40) but only 1 byte
+        assert!(decode_varint(&[0x40]).is_err());
+    }
+
+    #[test]
+    fn truncated_input_4byte() {
+        // 4-byte varint prefix (0x80) but only 1, 2, or 3 bytes
+        assert!(decode_varint(&[0x80]).is_err());
+        assert!(decode_varint(&[0x80, 0x00]).is_err());
+        assert!(decode_varint(&[0x80, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn truncated_input_8byte() {
+        // 8-byte varint prefix (0xC0) but truncated at each length
+        for len in 1..8 {
+            let mut buf = [0u8; 8];
+            buf[0] = 0xC0;
+            assert!(decode_varint(&buf[..len]).is_err(), "should fail at len={len}");
+        }
+    }
+
+    #[test]
+    fn every_single_byte_value_0_to_63() {
+        for v in 0..=63u64 {
+            let mut buf = [0u8; 1];
+            let written = encode_varint(v, &mut buf).unwrap();
+            assert_eq!(written, 1);
+            let (decoded, consumed) = decode_varint(&buf[..1]).unwrap();
+            assert_eq!(decoded, v);
+            assert_eq!(consumed, 1);
+        }
+    }
+
+    #[test]
+    fn values_just_above_boundaries() {
+        // Just above 1-byte boundary
+        let v = 64u64;
+        let mut buf = [0u8; 8];
+        let written = encode_varint(v, &mut buf).unwrap();
+        assert_eq!(written, 2);
+        let (decoded, _) = decode_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, v);
+
+        // Just above 2-byte boundary
+        let v = 16384u64;
+        let written = encode_varint(v, &mut buf).unwrap();
+        assert_eq!(written, 4);
+        let (decoded, _) = decode_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, v);
+
+        // Just above 4-byte boundary
+        let v = 1073741824u64;
+        let written = encode_varint(v, &mut buf).unwrap();
+        assert_eq!(written, 8);
+        let (decoded, _) = decode_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn encode_exact_buffer_sizes() {
+        // 1-byte value in a 1-byte buffer
+        let mut buf = [0u8; 1];
+        assert!(encode_varint(0, &mut buf).is_ok());
+
+        // 2-byte value in a 2-byte buffer
+        let mut buf = [0u8; 2];
+        assert!(encode_varint(64, &mut buf).is_ok());
+
+        // 2-byte value in a 1-byte buffer should fail
+        let mut buf = [0u8; 1];
+        assert!(encode_varint(64, &mut buf).is_err());
+
+        // 4-byte value in a 4-byte buffer
+        let mut buf = [0u8; 4];
+        assert!(encode_varint(16384, &mut buf).is_ok());
+
+        // 4-byte value in a 3-byte buffer should fail
+        let mut buf = [0u8; 3];
+        assert!(encode_varint(16384, &mut buf).is_err());
+    }
 }

@@ -468,6 +468,135 @@ mod tests {
         assert_eq!(pn_length(8388608, 0), 4);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Edge case hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn minimum_size_initial_packet() {
+        // Minimum viable Initial: zero-length CIDs, no token, minimal payload
+        let dcid = b"";
+        let scid = b"";
+        let token = b"";
+        let mut buf = [0u8; 256];
+        let written = encode_initial_header(dcid, scid, token, 1, 1, &mut buf).unwrap();
+        let (hdr, _) = parse_initial_header(&buf[..written]).unwrap();
+        assert_eq!(hdr.dcid.len(), 0);
+        assert_eq!(hdr.scid.len(), 0);
+        assert_eq!(hdr.token.len(), 0);
+        assert_eq!(hdr.payload_length, 1);
+    }
+
+    #[test]
+    fn maximum_dcid_scid_lengths() {
+        // MAX_CID_LEN = 20 for both DCID and SCID
+        let dcid = [0xAA; MAX_CID_LEN];
+        let scid = [0xBB; MAX_CID_LEN];
+        let mut buf = [0u8; 256];
+        let written = encode_initial_header(&dcid, &scid, b"", 1, 10, &mut buf).unwrap();
+        let (hdr, _) = parse_initial_header(&buf[..written]).unwrap();
+        assert_eq!(hdr.dcid.len(), MAX_CID_LEN);
+        assert_eq!(hdr.scid.len(), MAX_CID_LEN);
+
+        // Also test handshake header with max CID lengths
+        let written = encode_handshake_header(&dcid, &scid, 1, 10, &mut buf).unwrap();
+        let (hdr, _) = parse_handshake_header(&buf[..written]).unwrap();
+        assert_eq!(hdr.dcid.len(), MAX_CID_LEN);
+        assert_eq!(hdr.scid.len(), MAX_CID_LEN);
+    }
+
+    #[test]
+    fn version_negotiation_empty_versions() {
+        // Version Negotiation with version = 0 and no supported versions
+        let mut buf = [0u8; 30];
+        buf[0] = 0x80; // long header form bit
+        // version = 0
+        buf[1..5].copy_from_slice(&[0, 0, 0, 0]);
+        // DCID len = 0
+        buf[5] = 0;
+        // SCID len = 0
+        buf[6] = 0;
+
+        let (hdr, consumed) = parse_long_header(&buf[..7]).unwrap();
+        assert_eq!(consumed, 7);
+        match hdr {
+            PacketHeader::VersionNegotiation(vn) => {
+                assert_eq!(vn.dcid.len(), 0);
+                assert_eq!(vn.scid.len(), 0);
+                assert_eq!(vn.supported_versions.len(), 0);
+            }
+            _ => panic!("expected VersionNegotiation"),
+        }
+    }
+
+    #[test]
+    fn version_negotiation_multiple_versions() {
+        let mut buf = [0u8; 64];
+        buf[0] = 0x80;
+        buf[1..5].copy_from_slice(&[0, 0, 0, 0]); // version = 0
+        buf[5] = 2; // DCID len
+        buf[6] = 0x01;
+        buf[7] = 0x02;
+        buf[8] = 1; // SCID len
+        buf[9] = 0x0a;
+        // Two supported versions
+        buf[10..14].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]); // v1
+        buf[14..18].copy_from_slice(&[0xff, 0x00, 0x00, 0x1d]); // draft-29
+
+        let (hdr, consumed) = parse_long_header(&buf[..18]).unwrap();
+        assert_eq!(consumed, 18);
+        match hdr {
+            PacketHeader::VersionNegotiation(vn) => {
+                assert_eq!(vn.dcid, &[0x01, 0x02]);
+                assert_eq!(vn.scid, &[0x0a]);
+                assert_eq!(vn.supported_versions.len(), 8); // 2 * 4 bytes
+            }
+            _ => panic!("expected VersionNegotiation"),
+        }
+    }
+
+    #[test]
+    fn truncated_headers_all_sizes() {
+        // Empty buffer
+        assert!(parse_long_header(&[]).is_err());
+        assert!(parse_initial_header(&[]).is_err());
+        assert!(parse_handshake_header(&[]).is_err());
+
+        // Just first byte
+        assert!(parse_long_header(&[0xC0]).is_err());
+        assert!(parse_initial_header(&[0xC0]).is_err());
+        assert!(parse_handshake_header(&[0xE0]).is_err());
+
+        // First byte + partial version
+        assert!(parse_long_header(&[0xC0, 0x00, 0x00]).is_err());
+        assert!(parse_initial_header(&[0xC0, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn short_header_zero_dcid() {
+        let first_byte = 0x40; // form=0, fixed=1
+        let mut buf = [0u8; 4];
+        let written = encode_short_header(b"", first_byte, &mut buf).unwrap();
+        assert_eq!(written, 1); // just the first byte
+
+        let (hdr, consumed) = parse_short_header(&buf[..written], 0).unwrap();
+        assert_eq!(hdr.dcid.len(), 0);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn short_header_max_dcid() {
+        let dcid = [0xFF; MAX_CID_LEN];
+        let first_byte = 0x41;
+        let mut buf = [0u8; 32];
+        let written = encode_short_header(&dcid, first_byte, &mut buf).unwrap();
+        assert_eq!(written, 1 + MAX_CID_LEN);
+
+        let (hdr, consumed) = parse_short_header(&buf[..written], MAX_CID_LEN).unwrap();
+        assert_eq!(hdr.dcid, &dcid[..]);
+        assert_eq!(consumed, written);
+    }
+
     #[test]
     fn coalesced_single_short_header() {
         // A short header packet consumes the rest of the datagram
