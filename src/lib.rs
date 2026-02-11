@@ -11,3 +11,9 @@ pub use transport::{Address, Clock, DatagramRecv, DatagramSend, Instant, Rng, Se
 pub mod crypto;
 pub mod packet;
 pub mod tls;
+
+pub mod connection;
+pub use connection::{
+    Connection, ConnectionConfig, ConnectionId, ConnectionState, DefaultConfig, Event, Transmit,
+};
+pub use tls::handshake::Role;
