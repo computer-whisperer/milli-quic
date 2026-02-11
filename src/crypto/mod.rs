@@ -12,7 +12,6 @@ mod hkdf;
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 pub mod rustcrypto;
 
-#[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 pub mod key_schedule;
 
 pub use aead::Aead;
