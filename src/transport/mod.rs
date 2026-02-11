@@ -1,3 +1,6 @@
+pub mod flow_control;
+pub mod stream;
+
 /// Timestamp in microseconds from an arbitrary epoch.
 /// Used for RTT measurement and loss detection timers.
 pub type Instant = u64;
