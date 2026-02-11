@@ -1125,6 +1125,120 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Edge case hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_length_data_stream_frame() {
+        roundtrip(&Frame::Stream(StreamFrame {
+            stream_id: 0,
+            offset: 0,
+            data: &[],
+            fin: false,
+        }));
+    }
+
+    #[test]
+    fn maximum_stream_id_values() {
+        let max_stream_id = crate::varint::MAX_VARINT;
+        roundtrip(&Frame::Stream(StreamFrame {
+            stream_id: max_stream_id,
+            offset: 0,
+            data: b"x",
+            fin: false,
+        }));
+        roundtrip(&Frame::MaxStreamData(MaxStreamDataFrame {
+            stream_id: max_stream_id,
+            max_data: crate::varint::MAX_VARINT,
+        }));
+    }
+
+    #[test]
+    fn stream_all_flag_combinations() {
+        // All 8 combinations: FIN (0/1), LEN (always set by encoder), OFF (0/nonzero)
+        for &fin in &[false, true] {
+            for &offset in &[0u64, 1, 100] {
+                for &data in &[b"" as &[u8], b"hello"] {
+                    let frame = Frame::Stream(StreamFrame {
+                        stream_id: 4,
+                        offset,
+                        data,
+                        fin,
+                    });
+                    roundtrip(&frame);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ack_with_many_ranges() {
+        // Build max-capacity ACK ranges: 8 pairs
+        let mut range_buf = [0u8; 128];
+        let mut off = 0;
+        for i in 0u64..8 {
+            off += encode_varint(i + 1, &mut range_buf[off..]).unwrap(); // gap
+            off += encode_varint(i + 2, &mut range_buf[off..]).unwrap(); // range
+        }
+
+        let frame = Frame::Ack(AckFrame {
+            largest_ack: 1000,
+            ack_delay: 100,
+            first_ack_range: 50,
+            ack_ranges: &range_buf[..off],
+            ecn: None,
+        });
+        roundtrip(&frame);
+    }
+
+    #[test]
+    fn connection_close_max_reason_length() {
+        let reason = [0x41u8; 256]; // 256 bytes of 'A'
+        let frame = Frame::ConnectionClose(ConnectionCloseFrame {
+            is_application: false,
+            error_code: 0x0a,
+            frame_type: 0x06,
+            reason: &reason,
+        });
+        let mut buf = [0u8; 512];
+        let written = encode(&frame, &mut buf).expect("encode");
+        let (decoded, consumed) = decode(&buf[..written]).expect("decode");
+        assert_eq!(consumed, written);
+        if let Frame::ConnectionClose(cc) = decoded {
+            assert_eq!(cc.reason, &reason[..]);
+        } else {
+            panic!("expected ConnectionClose");
+        }
+    }
+
+    #[test]
+    fn connection_close_application_with_reason() {
+        let frame = Frame::ConnectionClose(ConnectionCloseFrame {
+            is_application: true,
+            error_code: 0x0100,
+            frame_type: 0,
+            reason: b"application error occurred",
+        });
+        roundtrip(&frame);
+    }
+
+    #[test]
+    fn unknown_frame_type_large_varint() {
+        // Use a large unknown frame type (0xff)
+        let mut buf = [0u8; 16];
+        let n = encode_varint(0xff, &mut buf).unwrap();
+        assert!(decode(&buf[..n]).is_err());
+    }
+
+    #[test]
+    fn unknown_frame_type_2byte_varint() {
+        // Unknown frame type requiring 2-byte varint
+        let mut buf = [0u8; 16];
+        let n = encode_varint(0x1000, &mut buf).unwrap();
+        assert!(decode(&buf[..n]).is_err());
+    }
+
     #[test]
     fn new_connection_id_cid_too_long() {
         // Manually encode a NEW_CONNECTION_ID with cid_len=21 (> 20 limit)

@@ -1,0 +1,49 @@
+[package]
+name = "milli-quic-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.milli-quic]
+path = ".."
+features = ["quic", "h3", "rustcrypto-chacha"]
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_varint"
+path = "fuzz_targets/fuzz_varint.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_frame_decode"
+path = "fuzz_targets/fuzz_frame_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_packet_header"
+path = "fuzz_targets/fuzz_packet_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_h3_frame"
+path = "fuzz_targets/fuzz_h3_frame.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_qpack"
+path = "fuzz_targets/fuzz_qpack.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tls_messages"
+path = "fuzz_targets/fuzz_tls_messages.rs"
+doc = false

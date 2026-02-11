@@ -28,6 +28,12 @@ where
 
         self.last_activity = now;
 
+        // Anti-amplification: track bytes received (RFC 9000 section 8.1)
+        if !self.address_validated {
+            self.anti_amplification_bytes_received =
+                self.anti_amplification_bytes_received.saturating_add(datagram.len());
+        }
+
         // Iterate over coalesced packets in the datagram.
         let mut iter = CoalescedPackets::new(datagram);
         while let Some(pkt_result) = iter.next() {
@@ -166,6 +172,11 @@ where
         let largest_pn = self.largest_recv_pn[level_index(Level::Application)].unwrap_or(0);
         let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
 
+        // Reject unreasonably large packet numbers (> 2^62)
+        if pn > crate::varint::MAX_VARINT {
+            return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
+        }
+
         // Decrypt payload
         let payload_offset = pn_offset + pn_len;
         let payload_len = pkt_len - payload_offset;
@@ -245,6 +256,11 @@ where
         }
         let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
         let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
+
+        // Reject unreasonably large packet numbers (> 2^62)
+        if pn > crate::varint::MAX_VARINT {
+            return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
+        }
 
         // Decrypt payload
         let payload_offset = pn_offset + pn_len;
@@ -452,6 +468,7 @@ where
                 if self.role == crate::tls::handshake::Role::Client {
                     if matches!(self.state, ConnectionState::Handshaking) {
                         self.state = ConnectionState::Active;
+                        self.address_validated = true;
                         let _ = self.events.push_back(Event::Connected);
                     }
                     // Drop handshake keys now that handshake is confirmed
@@ -486,6 +503,15 @@ where
         offset: u64,
         data: &[u8],
     ) -> Result<(), Error> {
+        // Reject CRYPTO frames with very large offsets that could cause
+        // resource exhaustion or overflow issues.
+        const MAX_CRYPTO_OFFSET: u64 = 1 << 20; // 1 MiB should be more than enough for TLS
+        if offset > MAX_CRYPTO_OFFSET || offset.saturating_add(data.len() as u64) > MAX_CRYPTO_OFFSET {
+            return Err(Error::Transport(
+                crate::error::TransportError::CryptoBufferExceeded,
+            ));
+        }
+
         let idx = level_index(level);
 
         // For simplicity, we only handle in-order crypto data.
@@ -564,6 +590,7 @@ where
                         // but the transition to Active happens when the client's
                         // Finished is received and app keys are derived
                         self.state = ConnectionState::Active;
+                        self.address_validated = true;
                         let _ = self.events.push_back(Event::Connected);
                         // Server drops handshake keys after confirming
                         self.keys.drop_handshake();

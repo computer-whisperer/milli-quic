@@ -797,6 +797,119 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Edge case hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_99_static_table_entries_encode_decode() {
+        let encoder = QpackEncoder::new();
+        let decoder = QpackDecoder::new();
+
+        for (idx, entry) in static_table::STATIC_TABLE.iter().enumerate() {
+            // Exact match: encode a single header matching this entry
+            let headers: &[(&[u8], &[u8])] = &[(entry.name, entry.value)];
+            let mut buf = [0u8; 512];
+            let n = encoder.encode_field_section(headers, &mut buf)
+                .unwrap_or_else(|e| panic!("encode failed for index {idx}: {e:?}"));
+
+            let mut collected = CollectedHeaders::new();
+            let consumed = decoder
+                .decode_field_section(&buf[..n], |name, value| collected.push(name, value))
+                .unwrap_or_else(|e| panic!("decode failed for index {idx}: {e:?}"));
+
+            assert_eq!(consumed, n, "consumed mismatch for index {idx}");
+            assert_eq!(collected.entries.len(), 1, "expected 1 header for index {idx}");
+            assert_eq!(
+                collected.entries[0].0.as_slice(),
+                entry.name,
+                "name mismatch for index {idx}"
+            );
+            assert_eq!(
+                collected.entries[0].1.as_slice(),
+                entry.value,
+                "value mismatch for index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn headers_with_empty_values() {
+        let encoder = QpackEncoder::new();
+        let decoder = QpackDecoder::new();
+
+        let headers: &[(&[u8], &[u8])] = &[
+            (b"x-empty1", b""),
+            (b"x-empty2", b""),
+            (b":authority", b""), // static table entry 0 has empty value
+        ];
+        let mut buf = [0u8; 512];
+        let n = encoder.encode_field_section(headers, &mut buf).unwrap();
+
+        let mut collected = CollectedHeaders::new();
+        decoder
+            .decode_field_section(&buf[..n], |name, value| collected.push(name, value))
+            .unwrap();
+        assert_eq!(collected.entries.len(), 3);
+        assert_eq!(collected.entries[0].1.as_slice(), b"");
+        assert_eq!(collected.entries[1].1.as_slice(), b"");
+        assert_eq!(collected.entries[2].1.as_slice(), b"");
+    }
+
+    #[test]
+    fn headers_with_long_values() {
+        let encoder = QpackEncoder::new();
+        let decoder = QpackDecoder::new();
+
+        // Value up to buffer limit: use 200 bytes
+        let long_value = [0x61u8; 200]; // 200 'a' bytes
+        let headers: &[(&[u8], &[u8])] = &[(b"x-long", &long_value)];
+        let mut buf = [0u8; 1024];
+        let n = encoder.encode_field_section(headers, &mut buf).unwrap();
+
+        let mut collected = CollectedHeaders::new();
+        decoder
+            .decode_field_section(&buf[..n], |name, value| collected.push(name, value))
+            .unwrap();
+        assert_eq!(collected.entries.len(), 1);
+        assert_eq!(collected.entries[0].1.as_slice(), &long_value[..]);
+    }
+
+    #[test]
+    fn integer_encoding_at_prefix_boundaries() {
+        // Test values at exact prefix boundaries for each prefix size
+        let prefixes: &[u8] = &[3, 4, 5, 6, 7, 8];
+        for &prefix in prefixes {
+            let max_prefix_val = (1u64 << prefix) - 2; // just below multi-byte threshold
+            let threshold = (1u64 << prefix) - 1;      // exactly at threshold
+            let above = threshold + 1;                   // just above
+
+            for val in [max_prefix_val, threshold, above] {
+                let mut buf = [0u8; 16];
+                let n = integer::encode_integer(val, prefix, 0, &mut buf).unwrap();
+                let (decoded, consumed) = integer::decode_integer(&buf[..n], prefix).unwrap();
+                assert_eq!(decoded, val, "prefix={prefix}, value={val}");
+                assert_eq!(consumed, n);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_invalid_static_index() {
+        let decoder = QpackDecoder::new();
+        // Manually build: RIC=0, delta_base=0, then indexed static line with index 99 (out of bounds)
+        let mut src = [0u8; 16];
+        src[0] = 0x00; // RIC=0
+        src[1] = 0x00; // delta_base=0
+        // Indexed: 0b11_xxxxxx with index=99 (but STATIC_TABLE only has 99 entries, max index=98)
+        // 99 > 63 so it needs multi-byte: 0b11_111111, then 99-63=36
+        src[2] = 0b1111_1111; // 0xC0 | 0x3F = 0xFF
+        src[3] = 36; // 99 - 63 = 36
+
+        let result = decoder.decode_field_section(&src[..4], |_, _| {});
+        assert!(result.is_err());
+    }
+
     #[test]
     fn roundtrip_mixed_encoding_types() {
         let encoder = QpackEncoder::new();

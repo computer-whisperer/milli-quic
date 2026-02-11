@@ -939,6 +939,64 @@ mod tests {
         assert!(!map.is_terminal(999));
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 13: Resource exhaustion resistance tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stream_map_rejects_beyond_max_streams() {
+        // StreamMap<2> has capacity for 2 streams
+        let mut map = StreamMap::<2>::new();
+        assert!(map.open_bidi(true).is_ok()); // slot 0
+        assert!(map.open_bidi(true).is_ok()); // slot 1
+        // Third should fail: no more slots
+        assert_eq!(map.open_bidi(true).unwrap_err(), Error::StreamLimitExhausted);
+        // Uni should also fail
+        assert_eq!(map.open_uni(true).unwrap_err(), Error::StreamLimitExhausted);
+    }
+
+    #[test]
+    fn stream_map_rejects_peer_streams_beyond_capacity() {
+        let mut map = StreamMap::<2>::new();
+        // We are client; peer server opens bidi streams 1 and 5
+        assert!(map.get_or_create(1, true, 65536).is_ok());
+        assert!(map.get_or_create(5, true, 65536).is_ok());
+        // Third peer stream should fail
+        assert_eq!(
+            map.get_or_create(9, true, 65536).unwrap_err(),
+            Error::StreamLimitExhausted
+        );
+    }
+
+    #[test]
+    fn opening_streams_at_capacity_boundary() {
+        // Exactly at the limit
+        let mut map = StreamMap::<4>::new();
+        for _ in 0..4 {
+            assert!(map.open_bidi(true).is_ok());
+        }
+        // One more should fail
+        assert_eq!(map.open_bidi(true).unwrap_err(), Error::StreamLimitExhausted);
+
+        // After GC of terminal streams, should be able to open more
+        let id0 = 0u64; // first stream opened
+        map.get_mut(id0).unwrap().send.as_mut().unwrap().state = SendStreamState::DataRecvd;
+        map.get_mut(id0).unwrap().recv.as_mut().unwrap().state = RecvStreamState::DataRead;
+        map.gc();
+        assert!(map.open_bidi(true).is_ok());
+    }
+
+    #[test]
+    fn mixed_bidi_uni_capacity() {
+        let mut map = StreamMap::<3>::new();
+        assert!(map.open_bidi(true).is_ok()); // slot 0
+        assert!(map.open_uni(true).is_ok());  // slot 1
+        assert!(map.open_bidi(true).is_ok()); // slot 2
+        // All slots taken
+        assert!(map.open_bidi(true).is_err());
+        assert!(map.open_uni(true).is_err());
+    }
+
     #[test]
     fn uni_stream_terminal() {
         let mut map = StreamMap::<4>::new();
