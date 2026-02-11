@@ -6,6 +6,7 @@ use crate::error::Error;
 // ---- HKDF-SHA256 ----
 
 /// HKDF using SHA-256 (via the `hkdf` crate).
+#[derive(Default)]
 pub struct HkdfSha256;
 
 impl HkdfTrait for HkdfSha256 {

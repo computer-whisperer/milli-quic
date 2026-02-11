@@ -10,12 +10,14 @@ default = ["quic", "h3", "rustcrypto-chacha"]
 quic = []
 h3 = ["quic"]
 alloc = []
-rustcrypto-chacha = ["quic", "dep:chacha20poly1305", "dep:chacha20", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:sha2", "dep:hmac"]
-rustcrypto-aes = ["quic", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:sha2", "dep:hmac"]
+rustcrypto-chacha = ["quic", "dep:chacha20poly1305", "dep:chacha20", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
+rustcrypto-aes = ["quic", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
 discovery = []
 
 [dependencies]
 heapless = "0.8"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+sha2 = { version = "0.10", default-features = false }
 
 # RustCrypto - all no_std compatible
 chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
@@ -23,7 +25,6 @@ chacha20 = { version = "0.9", default-features = false, optional = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"], optional = true }
 aes = { version = "0.8", default-features = false, optional = true }
 hkdf = { version = "0.12", default-features = false, optional = true }
-sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 
 [dev-dependencies]

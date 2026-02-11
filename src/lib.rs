@@ -10,3 +10,4 @@ pub use transport::{Address, Clock, DatagramRecv, DatagramSend, Instant, Rng, Se
 
 pub mod crypto;
 pub mod packet;
+pub mod tls;
