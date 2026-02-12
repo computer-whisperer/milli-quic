@@ -236,14 +236,17 @@ impl QpackDecoder {
                     return Err(Error::Transport(TransportError::FrameEncodingError));
                 }
 
-                if huffman {
-                    return Err(Error::Http3(H3Error::QpackDecompressionFailed));
-                }
-
                 let value = &src[pos..pos + value_len];
                 pos += value_len;
 
-                emit(STATIC_TABLE[name_index].name, value);
+                if huffman {
+                    let mut huff_buf = [0u8; 512];
+                    let decoded_len = huffman::decode(value, &mut huff_buf)
+                        .map_err(|_| Error::Http3(H3Error::QpackDecompressionFailed))?;
+                    emit(STATIC_TABLE[name_index].name, &huff_buf[..decoded_len]);
+                } else {
+                    emit(STATIC_TABLE[name_index].name, value);
+                }
             } else if first & 0b1110_0000 == 0b0010_0000 {
                 // Literal Field Line With Literal Name: 001Nxxxx
                 // H bit for name is embedded in first byte below the N bit.
@@ -261,12 +264,18 @@ impl QpackDecoder {
                     return Err(Error::Transport(TransportError::FrameEncodingError));
                 }
 
-                if name_huffman {
-                    return Err(Error::Http3(H3Error::QpackDecompressionFailed));
-                }
-
-                let name = &src[pos..pos + name_len];
+                let name_raw = &src[pos..pos + name_len];
                 pos += name_len;
+
+                // Decode name (possibly Huffman-encoded)
+                let mut name_huff_buf = [0u8; 256];
+                let name_slice = if name_huffman {
+                    let decoded_len = huffman::decode(name_raw, &mut name_huff_buf)
+                        .map_err(|_| Error::Http3(H3Error::QpackDecompressionFailed))?;
+                    &name_huff_buf[..decoded_len]
+                } else {
+                    name_raw
+                };
 
                 // Value: H bit + length (prefix=7)
                 if pos >= src.len() {
@@ -281,14 +290,20 @@ impl QpackDecoder {
                     return Err(Error::Transport(TransportError::FrameEncodingError));
                 }
 
-                if value_huffman {
-                    return Err(Error::Http3(H3Error::QpackDecompressionFailed));
-                }
-
-                let value = &src[pos..pos + value_len];
+                let value_raw = &src[pos..pos + value_len];
                 pos += value_len;
 
-                emit(name, value);
+                // Decode value (possibly Huffman-encoded)
+                let mut value_huff_buf = [0u8; 512];
+                let value_slice = if value_huffman {
+                    let decoded_len = huffman::decode(value_raw, &mut value_huff_buf)
+                        .map_err(|_| Error::Http3(H3Error::QpackDecompressionFailed))?;
+                    &value_huff_buf[..decoded_len]
+                } else {
+                    value_raw
+                };
+
+                emit(name_slice, value_slice);
             } else if first & 0b1111_0000 == 0b0001_0000 {
                 // Indexed Field Line With Post-Base Index: 0001xxxx
                 // Not used in static-only mode.
@@ -368,8 +383,8 @@ mod tests {
         assert_eq!(STATIC_TABLE[0].name, b":authority");
         assert_eq!(STATIC_TABLE[17].name, b":method");
         assert_eq!(STATIC_TABLE[17].value, b"GET");
-        assert_eq!(STATIC_TABLE[26].name, b":status");
-        assert_eq!(STATIC_TABLE[26].value, b"200");
+        assert_eq!(STATIC_TABLE[25].name, b":status");
+        assert_eq!(STATIC_TABLE[25].value, b"200");
     }
 
     // -----------------------------------------------------------------------
@@ -584,8 +599,8 @@ mod tests {
         assert_eq!(collected.entries[2].1.as_slice(), b"https");
         assert_eq!(collected.entries[3].0.as_slice(), b":authority");
         assert_eq!(collected.entries[3].1.as_slice(), b"api.example.com");
-        // accept "application/json" is not an exact match (static has */* at 59 and
-        // application/dns-message at 60), so name-match at index 59.
+        // accept "application/json" is not an exact match (static has */* at 29 and
+        // application/dns-message at 30), so name-match at index 29.
         assert_eq!(collected.entries[4].0.as_slice(), b"accept");
         assert_eq!(collected.entries[4].1.as_slice(), b"application/json");
         assert_eq!(collected.entries[5].0.as_slice(), b"content-type");

@@ -555,8 +555,19 @@ mod tests {
     use crate::tls::transport_params::TransportParams;
     use crate::transport::Rng;
 
-    const FAKE_CERT: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-    const FAKE_KEY: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+    const TEST_ED25519_SEED: [u8; 32] = [0x01u8; 32];
+
+    fn get_test_ed25519_cert_der() -> &'static [u8] {
+        use std::sync::LazyLock;
+        static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+            let s: [u8; 32] = [0x01u8; 32];
+            let pk = crate::crypto::ed25519::ed25519_public_key_from_seed(&s);
+            let mut b = [0u8; 512];
+            let n = crate::crypto::ed25519::build_ed25519_cert_der(&pk, &mut b).unwrap();
+            b[..n].to_vec()
+        });
+        &V
+    }
 
     struct TestRng(u8);
     impl Rng for TestRng {
@@ -583,8 +594,8 @@ mod tests {
     fn make_quic_server() -> Connection<Aes128GcmProvider> {
         let mut rng = TestRng(0x50);
         let config = ServerTlsConfig {
-            cert_der: FAKE_CERT,
-            private_key_der: FAKE_KEY,
+            cert_der: get_test_ed25519_cert_der(),
+            private_key_der: &TEST_ED25519_SEED,
             alpn_protocols: &[b"h3"],
             transport_params: TransportParams::default_params(),
         };

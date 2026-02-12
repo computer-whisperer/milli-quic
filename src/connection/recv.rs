@@ -9,6 +9,157 @@ use crate::transport::Instant;
 
 use super::{Connection, ConnectionConfig, ConnectionState, Event};
 
+// ---------------------------------------------------------------------------
+// CRYPTO frame reassembly buffer
+// ---------------------------------------------------------------------------
+
+/// Reassembly buffer for out-of-order CRYPTO frames (one per encryption level).
+///
+/// CRYPTO frames in QUIC form a reliable, ordered byte stream for TLS data.
+/// Frames may arrive out of order within a packet or across packets. This
+/// buffer stores bytes at arbitrary offsets and only delivers contiguous,
+/// complete TLS handshake messages to the TLS engine.
+pub(crate) struct CryptoReassemblyBuf {
+    /// Raw byte buffer. Index `i` corresponds to absolute CRYPTO stream
+    /// offset `delivered + i`.
+    buf: [u8; 4096],
+    /// Absolute offset of bytes already delivered to TLS.
+    pub(crate) delivered: u64,
+    /// Received byte ranges relative to `delivered`, stored as `(start, end)`
+    /// pairs. Always sorted by `start` and non-overlapping.
+    ranges: heapless::Vec<(usize, usize), 16>,
+}
+
+impl CryptoReassemblyBuf {
+    pub fn new() -> Self {
+        Self {
+            buf: [0u8; 4096],
+            delivered: 0,
+            ranges: heapless::Vec::new(),
+        }
+    }
+
+    /// Insert data from a CRYPTO frame at the given absolute stream offset.
+    pub fn insert(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let end = offset + data.len() as u64;
+
+        // Entirely before the delivery frontier — retransmit, ignore.
+        if end <= self.delivered {
+            return Ok(());
+        }
+
+        // Trim overlap with already-delivered prefix.
+        let (data, offset) = if offset < self.delivered {
+            let skip = (self.delivered - offset) as usize;
+            (&data[skip..], self.delivered)
+        } else {
+            (data, offset)
+        };
+
+        let rel_start = (offset - self.delivered) as usize;
+        let rel_end = rel_start + data.len();
+
+        if rel_end > self.buf.len() {
+            return Err(Error::Transport(
+                crate::error::TransportError::CryptoBufferExceeded,
+            ));
+        }
+
+        // Copy data into the buffer at the correct position.
+        self.buf[rel_start..rel_end].copy_from_slice(data);
+
+        // Merge the new range into our range list.
+        self.merge_range(rel_start, rel_end);
+
+        Ok(())
+    }
+
+    /// Returns the length of contiguous data available from the delivery
+    /// frontier (i.e. starting at relative offset 0).
+    pub fn contiguous_len(&self) -> usize {
+        match self.ranges.first() {
+            Some(&(0, end)) => end,
+            _ => 0,
+        }
+    }
+
+    /// Returns a slice of contiguous data available from the delivery frontier.
+    pub fn contiguous_data(&self) -> &[u8] {
+        let len = self.contiguous_len();
+        &self.buf[..len]
+    }
+
+    /// Mark the first `n` bytes as delivered and shift the buffer contents.
+    pub fn advance(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.delivered += n as u64;
+
+        // Shift buffer contents left by n bytes.
+        self.buf.copy_within(n.., 0);
+        let buf_len = self.buf.len();
+        // Zero the vacated tail.
+        for b in &mut self.buf[buf_len - n..] {
+            *b = 0;
+        }
+
+        // Adjust all tracked ranges.
+        let mut i = 0;
+        while i < self.ranges.len() {
+            let (s, e) = self.ranges[i];
+            if e <= n {
+                // Entirely consumed.
+                self.ranges.remove(i);
+            } else if s < n {
+                // Partially consumed — starts at 0 after shift.
+                self.ranges[i] = (0, e - n);
+                i += 1;
+            } else {
+                self.ranges[i] = (s - n, e - n);
+                i += 1;
+            }
+        }
+    }
+
+    /// Merge a new `(start, end)` range into the sorted, non-overlapping list.
+    fn merge_range(&mut self, start: usize, end: usize) {
+        let mut new_start = start;
+        let mut new_end = end;
+
+        // Remove any ranges that overlap or are adjacent, merging them.
+        let mut i = 0;
+        while i < self.ranges.len() {
+            let (s, e) = self.ranges[i];
+            if s > new_end {
+                // Past our range — stop scanning.
+                break;
+            }
+            if e < new_start {
+                // Before our range — skip.
+                i += 1;
+                continue;
+            }
+            // Overlapping or adjacent — absorb it.
+            new_start = new_start.min(s);
+            new_end = new_end.max(e);
+            self.ranges.remove(i);
+        }
+
+        // Insert the merged range at position i (maintains sort order).
+        if self.ranges.len() < self.ranges.capacity() {
+            let _ = self.ranges.insert(i, (new_start, new_end));
+        }
+        // If the range list is full, the data is still in the buffer;
+        // we just lose gap-tracking precision. This should not happen
+        // in practice with 16 slots.
+    }
+}
+
 /// Result of processing a single decrypted packet.
 struct PacketResult {
     ack_eliciting: bool,
@@ -65,7 +216,7 @@ where
 
             match result {
                 Ok(pr) => {
-                    if pr.ack_eliciting {
+                                        if pr.ack_eliciting {
                         let idx = level_index(pr.level);
                         self.ack_eliciting_received[idx] = true;
                     }
@@ -100,11 +251,26 @@ where
         let (hdr, _consumed) = packet::parse_initial_header(pkt_data)?;
 
         // If we are server and this is the first Initial, derive Initial keys from DCID
+        // and record the original DCID + initial SCID in the TLS transport params
+        // so they appear in the server's EncryptedExtensions (RFC 9000 §18.2).
         #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
         if !self.keys.has_recv_keys(Level::Initial) {
             // Server receiving first client Initial
             self.keys
                 .derive_initial(&self.crypto, hdr.dcid, self.role == crate::tls::handshake::Role::Client)?;
+
+            // For the server: set original_destination_connection_id (the DCID from
+            // the client's first Initial) and initial_source_connection_id (our own
+            // CID) on the TLS engine's transport params before the ClientHello is
+            // processed, so they are included in EncryptedExtensions.
+            if self.role == crate::tls::handshake::Role::Server {
+                let local_scid = if self.local_cids.is_empty() {
+                    &[]
+                } else {
+                    self.local_cids[0].as_slice()
+                };
+                self.tls.set_transport_param_cids(hdr.dcid, local_scid);
+            }
         }
 
         // Store remote SCID if we haven't yet (server learns client SCID from Initial)
@@ -112,14 +278,41 @@ where
             self.remote_cid = ConnectionId::from_slice(hdr.scid);
         }
 
-        self.decrypt_and_process_long(pkt_data, &hdr.pn_offset, hdr.payload_length, Level::Initial, now)
+        // Initial keys are concrete AES types, so use the type-specific accessor.
+        // We scope the key borrow so it ends before dispatch_frames borrows &mut self.
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        {
+            let level = Level::Initial;
+            let (decrypted, pn) = {
+                let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
+                let recv = self.keys.initial_recv_keys().ok_or(Error::Crypto)?;
+                decrypt_long_packet(
+                    pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
+                )?
+            };
+            let ack_eliciting = self.dispatch_frames(&decrypted, level, now)?;
+            Ok(PacketResult { ack_eliciting, level, pn })
+        }
+        #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+        {
+            Err(Error::Crypto)
+        }
     }
 
     /// Process a Handshake packet.
     fn recv_handshake(&mut self, pkt_data: &[u8], now: Instant) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_handshake_header(pkt_data)?;
 
-        self.decrypt_and_process_long(pkt_data, &hdr.pn_offset, hdr.payload_length, Level::Handshake, now)
+        let level = Level::Handshake;
+        let (decrypted, pn) = {
+            let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
+            let recv = self.keys.recv_keys(Level::Handshake).ok_or(Error::Crypto)?;
+            decrypt_long_packet(
+                pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
+            )?
+        };
+        let ack_eliciting = self.dispatch_frames(&decrypted, level, now)?;
+        Ok(PacketResult { ack_eliciting, level, pn })
     }
 
     /// Process a short (1-RTT) packet.
@@ -209,89 +402,9 @@ where
         })
     }
 
-    /// Decrypt and process a long header packet (Initial or Handshake).
-    fn decrypt_and_process_long(
-        &mut self,
-        pkt_data: &[u8],
-        pn_offset: &usize,
-        payload_length: usize,
-        level: Level,
-        now: Instant,
-    ) -> Result<PacketResult, Error> {
-        let pn_offset = *pn_offset;
-
-        let recv = self.keys.recv_keys(level).ok_or(Error::Crypto)?;
-
-        // Copy packet data to mutable buffer for in-place decryption
-        let total_len = pn_offset + payload_length;
-        let mut buf = [0u8; 2048];
-        if total_len > buf.len() {
-            return Err(Error::BufferTooSmall { needed: total_len });
-        }
-        buf[..total_len].copy_from_slice(&pkt_data[..total_len]);
-
-        // Remove header protection (RFC 9001 Section 5.4.2)
-        // Sample starts at pn_offset + 4
-        let sample_offset = pn_offset + 4;
-        if sample_offset + 16 > total_len {
-            return Err(Error::Crypto);
-        }
-        let mut sample = [0u8; 16];
-        sample.copy_from_slice(&buf[sample_offset..sample_offset + 16]);
-        let mask = recv.header_protection.mask(&sample);
-
-        // For long headers: first_byte ^= mask[0] & 0x0f
-        buf[0] ^= mask[0] & 0x0f;
-        let pn_len = ((buf[0] & 0x03) + 1) as usize;
-
-        // Unmask PN bytes
-        for i in 0..pn_len {
-            buf[pn_offset + i] ^= mask[1 + i];
-        }
-
-        // Decode packet number
-        let mut truncated_pn: u32 = 0;
-        for i in 0..pn_len {
-            truncated_pn = (truncated_pn << 8) | buf[pn_offset + i] as u32;
-        }
-        let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
-        let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
-
-        // Reject unreasonably large packet numbers (> 2^62)
-        if pn > crate::varint::MAX_VARINT {
-            return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
-        }
-
-        // Decrypt payload
-        let payload_offset = pn_offset + pn_len;
-        let encrypted_len = payload_length - pn_len; // payload_length includes PN
-
-        // AAD is the entire header up to and including PN
-        let mut aad_buf = [0u8; 256];
-        if payload_offset > aad_buf.len() {
-            return Err(Error::BufferTooSmall {
-                needed: payload_offset,
-            });
-        }
-        aad_buf[..payload_offset].copy_from_slice(&buf[..payload_offset]);
-
-        let nonce = recv.nonce(pn);
-        let pt_len = recv.aead.open_in_place(
-            &nonce,
-            &aad_buf[..payload_offset],
-            &mut buf[payload_offset..],
-            encrypted_len,
-        )?;
-
-        // Parse and dispatch frames
-        let ack_eliciting = self.dispatch_frames(&buf[payload_offset..payload_offset + pt_len], level, now)?;
-
-        Ok(PacketResult {
-            ack_eliciting,
-            level,
-            pn,
-        })
-    }
+    // decrypt_and_process_long is replaced by the standalone decrypt_long_packet
+    // function below, which separates decryption from frame dispatch to avoid
+    // borrow conflicts when Initial and Handshake keys have different types.
 
     /// Parse and dispatch all frames from decrypted payload.
     /// Returns true if any frame was ack-eliciting.
@@ -496,7 +609,13 @@ where
         Ok(())
     }
 
-    /// Handle a CRYPTO frame: buffer data and feed to TLS engine.
+    /// Handle a CRYPTO frame: reassemble data and feed complete TLS messages
+    /// to the TLS engine.
+    ///
+    /// CRYPTO frames may arrive out of order within a packet or across packets.
+    /// We buffer them and only deliver contiguous data to the TLS engine when
+    /// we have at least one complete TLS handshake message (4-byte header +
+    /// body).
     fn handle_crypto_frame(
         &mut self,
         level: Level,
@@ -505,8 +624,10 @@ where
     ) -> Result<(), Error> {
         // Reject CRYPTO frames with very large offsets that could cause
         // resource exhaustion or overflow issues.
-        const MAX_CRYPTO_OFFSET: u64 = 1 << 20; // 1 MiB should be more than enough for TLS
-        if offset > MAX_CRYPTO_OFFSET || offset.saturating_add(data.len() as u64) > MAX_CRYPTO_OFFSET {
+        const MAX_CRYPTO_OFFSET: u64 = 1 << 20; // 1 MiB
+        if offset > MAX_CRYPTO_OFFSET
+            || offset.saturating_add(data.len() as u64) > MAX_CRYPTO_OFFSET
+        {
             return Err(Error::Transport(
                 crate::error::TransportError::CryptoBufferExceeded,
             ));
@@ -514,49 +635,50 @@ where
 
         let idx = level_index(level);
 
-        // For simplicity, we only handle in-order crypto data.
-        // If offset matches our expected offset, buffer and process.
-        let expected = self.crypto_recv_offset[idx];
-        if offset != expected {
-            // Out of order: if offset < expected, it's a retransmit we already processed.
-            // If offset > expected, we'd need reassembly. For now, just ignore.
-            if offset < expected {
-                return Ok(());
+        // Insert into the reassembly buffer.
+        self.crypto_reasm[idx].insert(offset, data)?;
+
+        // Deliver complete TLS handshake messages from the contiguous frontier.
+        loop {
+            let avail = self.crypto_reasm[idx].contiguous_len();
+            if avail < 4 {
+                // Not enough data for a TLS handshake message header.
+                break;
             }
-            // Gap detected: can't process yet. In a full implementation we'd buffer.
-            return Ok(());
-        }
 
-        // Append to crypto receive buffer
-        let buf = &mut self.crypto_recv_buf[idx];
-        let start = buf.len();
-        if start + data.len() > buf.capacity() {
-            return Err(Error::Transport(
-                crate::error::TransportError::CryptoBufferExceeded,
-            ));
-        }
-        let _ = buf.extend_from_slice(data);
-        self.crypto_recv_offset[idx] = offset + data.len() as u64;
+            // Peek at the TLS handshake header to determine message length.
+            let msg_len = {
+                let hdr = self.crypto_reasm[idx].contiguous_data();
+                // TLS handshake: 1 byte type + 3 bytes length
+                4 + ((hdr[1] as usize) << 16 | (hdr[2] as usize) << 8 | hdr[3] as usize)
+            };
 
-        // Feed all buffered crypto data to TLS engine
-        let crypto_data_copy = {
+
+
+            if avail < msg_len {
+                // Incomplete TLS message — wait for more data.
+                break;
+            }
+
+            // Copy the complete message to a stack buffer (to release the
+            // borrow on crypto_reasm before calling into TLS).
             let mut tmp = [0u8; 4096];
-            let len = buf.len();
-            if len > tmp.len() {
+            if msg_len > tmp.len() {
                 return Err(Error::Tls);
             }
-            tmp[..len].copy_from_slice(buf);
-            (tmp, len)
-        };
+            tmp[..msg_len].copy_from_slice(
+                &self.crypto_reasm[idx].contiguous_data()[..msg_len],
+            );
 
-        // Clear the buffer after copying
-        self.crypto_recv_buf[idx].clear();
+            // Advance the reassembly buffer past this message.
+            self.crypto_reasm[idx].advance(msg_len);
 
-        self.tls
-            .read_handshake(level, &crypto_data_copy.0[..crypto_data_copy.1])?;
+            // Feed to the TLS engine.
+            self.tls.read_handshake(level, &tmp[..msg_len])?;
 
-        // Check for newly derived keys
-        self.check_tls_keys()?;
+            // Check for newly derived keys after each TLS message.
+            self.check_tls_keys()?;
+        }
 
         Ok(())
     }
@@ -632,4 +754,206 @@ pub(crate) fn level_index(level: Level) -> usize {
     }
 }
 
+/// Decrypt a long-header packet (Initial or Handshake) and return the
+/// decrypted payload bytes and the decoded packet number.
+///
+/// This is a free function (not a method on `Connection`) so that the
+/// borrow on the keys does not conflict with the `&mut self` borrow
+/// needed for subsequent frame dispatch.
+///
+/// Generic over AEAD and HeaderProtection so that Initial packets
+/// (concrete AES-128-GCM) and Handshake packets (negotiated cipher)
+/// can share the same decryption logic.
+fn decrypt_long_packet<A: Aead, HP: HeaderProtection>(
+    pkt_data: &[u8],
+    pn_offset: usize,
+    payload_length: usize,
+    largest_pn: u64,
+    recv: &crate::crypto::DirectionalKeys<A, HP>,
+) -> Result<(heapless::Vec<u8, 2048>, u64), Error> {
+    // Copy packet data to mutable buffer for in-place decryption
+    let total_len = pn_offset + payload_length;
+    let mut buf = [0u8; 2048];
+    if total_len > buf.len() {
+        return Err(Error::BufferTooSmall { needed: total_len });
+    }
+    buf[..total_len].copy_from_slice(&pkt_data[..total_len]);
+
+    // Remove header protection (RFC 9001 Section 5.4.2)
+    // Sample starts at pn_offset + 4
+    let sample_offset = pn_offset + 4;
+    if sample_offset + 16 > total_len {
+        return Err(Error::Crypto);
+    }
+    let mut sample = [0u8; 16];
+    sample.copy_from_slice(&buf[sample_offset..sample_offset + 16]);
+    let mask = recv.header_protection.mask(&sample);
+
+    // For long headers: first_byte ^= mask[0] & 0x0f
+    buf[0] ^= mask[0] & 0x0f;
+    let pn_len = ((buf[0] & 0x03) + 1) as usize;
+
+    // Unmask PN bytes
+    for i in 0..pn_len {
+        buf[pn_offset + i] ^= mask[1 + i];
+    }
+
+    // Decode packet number
+    let mut truncated_pn: u32 = 0;
+    for i in 0..pn_len {
+        truncated_pn = (truncated_pn << 8) | buf[pn_offset + i] as u32;
+    }
+    let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
+
+    // Reject unreasonably large packet numbers (> 2^62)
+    if pn > crate::varint::MAX_VARINT {
+        return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
+    }
+
+    // Decrypt payload
+    let payload_offset = pn_offset + pn_len;
+    let encrypted_len = payload_length - pn_len; // payload_length includes PN
+
+    // AAD is the entire header up to and including PN
+    let mut aad_buf = [0u8; 256];
+    if payload_offset > aad_buf.len() {
+        return Err(Error::BufferTooSmall {
+            needed: payload_offset,
+        });
+    }
+    aad_buf[..payload_offset].copy_from_slice(&buf[..payload_offset]);
+
+    let nonce = recv.nonce(pn);
+    let pt_len = recv.aead.open_in_place(
+        &nonce,
+        &aad_buf[..payload_offset],
+        &mut buf[payload_offset..],
+        encrypted_len,
+    )?;
+
+    // Copy decrypted payload into a heapless Vec to return
+    let mut result = heapless::Vec::new();
+    let _ = result.extend_from_slice(&buf[payload_offset..payload_offset + pt_len]);
+
+    Ok((result, pn))
+}
+
 use super::ConnectionId;
+
+#[cfg(test)]
+mod tests {
+    use super::CryptoReassemblyBuf;
+
+    #[test]
+    fn in_order_delivery() {
+        let mut buf = CryptoReassemblyBuf::new();
+        buf.insert(0, b"hello").unwrap();
+        assert_eq!(buf.contiguous_len(), 5);
+        assert_eq!(buf.contiguous_data(), b"hello");
+
+        buf.insert(5, b" world").unwrap();
+        assert_eq!(buf.contiguous_len(), 11);
+        assert_eq!(buf.contiguous_data(), b"hello world");
+    }
+
+    #[test]
+    fn out_of_order_two_frames() {
+        let mut buf = CryptoReassemblyBuf::new();
+        // Second chunk arrives first.
+        buf.insert(5, b" world").unwrap();
+        assert_eq!(buf.contiguous_len(), 0);
+
+        // First chunk fills the gap.
+        buf.insert(0, b"hello").unwrap();
+        assert_eq!(buf.contiguous_len(), 11);
+        assert_eq!(buf.contiguous_data(), b"hello world");
+    }
+
+    #[test]
+    fn out_of_order_three_frames() {
+        let mut buf = CryptoReassemblyBuf::new();
+        // Arrive in order: [10..15], [0..5], [5..10]
+        buf.insert(10, b"CCCCC").unwrap();
+        assert_eq!(buf.contiguous_len(), 0);
+
+        buf.insert(0, b"AAAAA").unwrap();
+        assert_eq!(buf.contiguous_len(), 5); // only A block contiguous
+
+        buf.insert(5, b"BBBBB").unwrap();
+        assert_eq!(buf.contiguous_len(), 15); // all contiguous now
+        assert_eq!(buf.contiguous_data(), b"AAAAABBBBBCCCCC");
+    }
+
+    #[test]
+    fn advance_shifts_buffer() {
+        let mut buf = CryptoReassemblyBuf::new();
+        buf.insert(0, b"AAAAABBBBB").unwrap();
+        assert_eq!(buf.contiguous_len(), 10);
+
+        buf.advance(5);
+        assert_eq!(buf.contiguous_len(), 5);
+        assert_eq!(buf.contiguous_data(), b"BBBBB");
+        assert_eq!(buf.delivered, 5);
+
+        // Insert more data after advance.
+        buf.insert(10, b"CCCCC").unwrap();
+        assert_eq!(buf.contiguous_len(), 10);
+        assert_eq!(buf.contiguous_data(), b"BBBBBCCCCC");
+    }
+
+    #[test]
+    fn duplicate_retransmit_ignored() {
+        let mut buf = CryptoReassemblyBuf::new();
+        buf.insert(0, b"hello").unwrap();
+        buf.advance(5);
+
+        // Retransmit of already-delivered data.
+        buf.insert(0, b"hello").unwrap();
+        assert_eq!(buf.contiguous_len(), 0);
+        assert_eq!(buf.delivered, 5);
+    }
+
+    #[test]
+    fn partial_overlap_with_delivered() {
+        let mut buf = CryptoReassemblyBuf::new();
+        buf.insert(0, b"hello").unwrap();
+        buf.advance(3); // delivered 3 bytes, "lo" remains
+
+        // Frame overlaps: bytes 2..7 but 2..3 already delivered.
+        buf.insert(2, b"lo wo").unwrap();
+        assert_eq!(buf.contiguous_len(), 4); // "lo w" from offset 3..7
+        // But note: "lo" was already there, and "o w" is new. Let's check:
+        // After advance(3), delivered=3, buffer has "lo" at [0..2].
+        // insert(2, "lo wo") → trimmed to insert(3, "o wo") → rel 0..4.
+        // Merged with existing [0..2] → [0..4].
+        assert_eq!(&buf.contiguous_data()[..4], b"o wo");
+    }
+
+    #[test]
+    fn overlapping_ranges_merge() {
+        let mut buf = CryptoReassemblyBuf::new();
+        buf.insert(0, b"AAAA").unwrap(); // [0..4]
+        buf.insert(8, b"CCCC").unwrap(); // [8..12]
+        assert_eq!(buf.contiguous_len(), 4); // only first block
+
+        // Bridge the gap.
+        buf.insert(3, b"BBBBBBB").unwrap(); // [3..10] overlaps both
+        assert_eq!(buf.contiguous_len(), 12);
+    }
+
+    #[test]
+    fn empty_insert_is_noop() {
+        let mut buf = CryptoReassemblyBuf::new();
+        buf.insert(0, b"").unwrap();
+        assert_eq!(buf.contiguous_len(), 0);
+    }
+
+    #[test]
+    fn buffer_overflow_returns_error() {
+        let mut buf = CryptoReassemblyBuf::new();
+        // Try to insert beyond buffer capacity.
+        let big = [0u8; 100];
+        let result = buf.insert(4000, &big);
+        assert!(result.is_err());
+    }
+}

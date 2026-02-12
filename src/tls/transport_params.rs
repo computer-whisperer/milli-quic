@@ -31,9 +31,18 @@ pub struct TransportParams {
     pub max_ack_delay: u64,
     /// Active connection ID limit (default 2).
     pub active_connection_id_limit: u64,
+    /// original_destination_connection_id (param 0x00, server-only, RFC 9000 §18.2).
+    pub original_dcid: [u8; 20],
+    /// Length of `original_dcid` in bytes (0 = not present).
+    pub original_dcid_len: u8,
+    /// initial_source_connection_id (param 0x0f, RFC 9000 §18.2).
+    pub initial_scid: [u8; 20],
+    /// Length of `initial_scid` in bytes (0 = not present).
+    pub initial_scid_len: u8,
 }
 
 // Parameter IDs
+const PARAM_ORIGINAL_DCID: u64 = 0x00;
 const PARAM_MAX_IDLE_TIMEOUT: u64 = 0x01;
 const PARAM_MAX_UDP_PAYLOAD_SIZE: u64 = 0x03;
 const PARAM_INITIAL_MAX_DATA: u64 = 0x04;
@@ -45,6 +54,7 @@ const PARAM_INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
 const PARAM_ACK_DELAY_EXPONENT: u64 = 0x0a;
 const PARAM_MAX_ACK_DELAY: u64 = 0x0b;
 const PARAM_ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
+const PARAM_INITIAL_SCID: u64 = 0x0f;
 
 impl TransportParams {
     /// Create transport parameters with sensible defaults.
@@ -61,6 +71,10 @@ impl TransportParams {
             ack_delay_exponent: 3,
             max_ack_delay: 25,
             active_connection_id_limit: 2,
+            original_dcid: [0u8; 20],
+            original_dcid_len: 0,
+            initial_scid: [0u8; 20],
+            initial_scid_len: 0,
         }
     }
 
@@ -79,10 +93,44 @@ impl TransportParams {
         Ok(())
     }
 
+    /// Encode a raw-bytes parameter: id (varint) + length (varint) + raw bytes.
+    /// Used for connection-ID params like original_destination_connection_id
+    /// and initial_source_connection_id, which are NOT varint-encoded values.
+    fn encode_bytes_param(
+        id: u64,
+        data: &[u8],
+        buf: &mut [u8],
+        offset: &mut usize,
+    ) -> Result<(), Error> {
+        let data_len = data.len();
+        let needed = varint_len(id) + varint_len(data_len as u64) + data_len;
+        if buf.len() < *offset + needed {
+            return Err(Error::BufferTooSmall {
+                needed: *offset + needed,
+            });
+        }
+        *offset += encode_varint(id, &mut buf[*offset..])?;
+        *offset += encode_varint(data_len as u64, &mut buf[*offset..])?;
+        buf[*offset..*offset + data_len].copy_from_slice(data);
+        *offset += data_len;
+        Ok(())
+    }
+
     /// Encode transport parameters into `buf`.
     /// Returns the number of bytes written.
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize, Error> {
         let mut off = 0;
+
+        // Encode CID params first (they have lower param IDs).
+        // original_destination_connection_id (0x00) — only when set.
+        if self.original_dcid_len > 0 {
+            Self::encode_bytes_param(
+                PARAM_ORIGINAL_DCID,
+                &self.original_dcid[..self.original_dcid_len as usize],
+                buf,
+                &mut off,
+            )?;
+        }
 
         Self::encode_param(PARAM_MAX_IDLE_TIMEOUT, self.max_idle_timeout, buf, &mut off)?;
         Self::encode_param(
@@ -136,6 +184,16 @@ impl TransportParams {
             &mut off,
         )?;
 
+        // initial_source_connection_id (0x0f) — only when set.
+        if self.initial_scid_len > 0 {
+            Self::encode_bytes_param(
+                PARAM_INITIAL_SCID,
+                &self.initial_scid[..self.initial_scid_len as usize],
+                buf,
+                &mut off,
+            )?;
+        }
+
         Ok(off)
     }
 
@@ -153,6 +211,10 @@ impl TransportParams {
             ack_delay_exponent: 3,
             max_ack_delay: 25,
             active_connection_id_limit: 2,
+            original_dcid: [0u8; 20],
+            original_dcid_len: 0,
+            initial_scid: [0u8; 20],
+            initial_scid_len: 0,
         };
 
         let mut off = 0;
@@ -170,6 +232,16 @@ impl TransportParams {
             let param_data = &buf[off..off + param_len as usize];
 
             match id {
+                PARAM_ORIGINAL_DCID => {
+                    let copy_len = param_data.len().min(20);
+                    params.original_dcid[..copy_len].copy_from_slice(&param_data[..copy_len]);
+                    params.original_dcid_len = copy_len as u8;
+                }
+                PARAM_INITIAL_SCID => {
+                    let copy_len = param_data.len().min(20);
+                    params.initial_scid[..copy_len].copy_from_slice(&param_data[..copy_len]);
+                    params.initial_scid_len = copy_len as u8;
+                }
                 PARAM_MAX_IDLE_TIMEOUT
                 | PARAM_MAX_UDP_PAYLOAD_SIZE
                 | PARAM_INITIAL_MAX_DATA
@@ -247,6 +319,10 @@ mod tests {
             ack_delay_exponent: 4,
             max_ack_delay: 50,
             active_connection_id_limit: 4,
+            original_dcid: [0u8; 20],
+            original_dcid_len: 0,
+            initial_scid: [0u8; 20],
+            initial_scid_len: 0,
         };
         let mut buf = [0u8; 256];
         let len = params.encode(&mut buf).unwrap();
@@ -268,11 +344,46 @@ mod tests {
             ack_delay_exponent: 0,
             max_ack_delay: 0,
             active_connection_id_limit: 0,
+            original_dcid: [0u8; 20],
+            original_dcid_len: 0,
+            initial_scid: [0u8; 20],
+            initial_scid_len: 0,
         };
         let mut buf = [0u8; 256];
         let len = params.encode(&mut buf).unwrap();
         let decoded = TransportParams::decode(&buf[..len]).unwrap();
         assert_eq!(params, decoded);
+    }
+
+    #[test]
+    fn roundtrip_with_cid_params() {
+        let mut params = TransportParams::default_params();
+        // Set original_dcid
+        params.original_dcid[..8].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        params.original_dcid_len = 8;
+        // Set initial_scid
+        params.initial_scid[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        params.initial_scid_len = 4;
+
+        let mut buf = [0u8; 256];
+        let len = params.encode(&mut buf).unwrap();
+        let decoded = TransportParams::decode(&buf[..len]).unwrap();
+        assert_eq!(params, decoded);
+        assert_eq!(decoded.original_dcid_len, 8);
+        assert_eq!(&decoded.original_dcid[..8], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(decoded.initial_scid_len, 4);
+        assert_eq!(&decoded.initial_scid[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn roundtrip_zero_length_cid() {
+        // When CID lengths are 0, they should not be encoded and should decode as 0
+        let params = TransportParams::default_params();
+        let mut buf = [0u8; 256];
+        let len = params.encode(&mut buf).unwrap();
+        let decoded = TransportParams::decode(&buf[..len]).unwrap();
+        assert_eq!(decoded.original_dcid_len, 0);
+        assert_eq!(decoded.initial_scid_len, 0);
     }
 
     #[test]

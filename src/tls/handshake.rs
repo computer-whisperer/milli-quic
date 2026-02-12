@@ -12,7 +12,7 @@
 //! WaitClientFinished -> Complete
 //! ```
 
-use crate::crypto::{CryptoProvider, Level};
+use crate::crypto::{Aead, CryptoProvider, Level};
 use crate::error::Error;
 use crate::tls::extensions::{
     encode_client_hello_extensions, encode_encrypted_extensions_data,
@@ -86,12 +86,11 @@ pub struct TlsConfig {
 
 /// Configuration for creating a server-side TLS engine.
 pub struct ServerTlsConfig {
-    /// DER-encoded server certificate.
+    /// DER-encoded server certificate containing an Ed25519 public key.
     pub cert_der: &'static [u8],
-    /// DER-encoded private key (for CertificateVerify signing).
-    /// For the initial implementation, we'll skip actual signing and
-    /// just include a placeholder signature. Real signing requires
-    /// an Ed25519/ECDSA library.
+    /// Ed25519 private key seed (32 bytes) for CertificateVerify signing.
+    /// This is the raw 32-byte Ed25519 seed that corresponds to the
+    /// public key in `cert_der`.
     pub private_key_der: &'static [u8],
     /// ALPN protocols the server supports.
     pub alpn_protocols: &'static [&'static [u8]],
@@ -152,9 +151,7 @@ pub struct TlsEngine<C: CryptoProvider> {
 
     // Server certificate DER (static reference, for server role)
     server_cert_der: &'static [u8],
-    // Server private key DER (static reference, for server role)
-    // TODO: Used when real Ed25519 signing is implemented for CertificateVerify.
-    #[allow(dead_code)]
+    // Server Ed25519 private key seed (static reference, for server role)
     server_private_key_der: &'static [u8],
 
     // Handshake complete flag
@@ -249,6 +246,19 @@ where
             complete: false,
             _crypto: core::marker::PhantomData,
         }
+    }
+
+    /// Update the CID-related transport parameters (original_destination_connection_id
+    /// and initial_source_connection_id). Called by the Connection layer so these
+    /// are included in the server's EncryptedExtensions.
+    pub fn set_transport_param_cids(&mut self, original_dcid: &[u8], initial_scid: &[u8]) {
+        let odcid_len = original_dcid.len().min(20);
+        self.transport_params.original_dcid[..odcid_len].copy_from_slice(&original_dcid[..odcid_len]);
+        self.transport_params.original_dcid_len = odcid_len as u8;
+
+        let iscid_len = initial_scid.len().min(20);
+        self.transport_params.initial_scid[..iscid_len].copy_from_slice(&initial_scid[..iscid_len]);
+        self.transport_params.initial_scid_len = iscid_len as u8;
     }
 
     // =========================================================================
@@ -384,12 +394,24 @@ where
     }
 
     /// Process a CertificateVerify message (client side).
-    fn process_certificate_verify(&mut self, msg_body: &[u8]) -> Result<(), Error> {
-        let _cv = parse_certificate_verify(msg_body)?;
+    ///
+    /// Verifies the Ed25519 signature over the transcript hash per RFC 8446 section 4.4.3.
+    /// The transcript hash used is the hash of all messages up to and including the
+    /// Certificate message (which was added to the transcript before this method is called,
+    /// but the CertificateVerify itself has NOT yet been added).
+    fn process_certificate_verify(
+        &mut self,
+        msg_body: &[u8],
+        transcript_before_cv: &[u8; 32],
+    ) -> Result<(), Error> {
+        let cv = parse_certificate_verify(msg_body)?;
 
-        // For the initial implementation, we verify against pinned certificates
-        // by comparing the raw DER bytes. Full signature verification would
-        // require an ASN.1 parser and signature verification library.
+        // Verify the algorithm is Ed25519
+        if cv.algorithm != crate::crypto::ed25519::ED25519_ALGORITHM {
+            return Err(Error::Tls);
+        }
+
+        // Check pinned certificates if configured
         if !self.pinned_certs.is_empty() {
             let mut found = false;
             for pinned in self.pinned_certs {
@@ -402,7 +424,18 @@ where
                 return Err(Error::Tls);
             }
         }
-        // If pinned_certs is empty, we skip verification (TOFU / testing mode)
+
+        // Extract the Ed25519 public key from the server's certificate
+        let pubkey = crate::crypto::ed25519::extract_ed25519_pubkey_from_cert(
+            self.server_cert_data.as_slice(),
+        )?;
+
+        // Verify the signature over the transcript hash
+        crate::crypto::ed25519::verify_certificate_verify(
+            &pubkey,
+            cv.signature,
+            transcript_before_cv,
+        )?;
 
         self.state = HandshakeState::WaitFinished;
         Ok(())
@@ -510,15 +543,25 @@ where
         // Must have key_share (X25519)
         let client_public_bytes = ext.key_share.ok_or(Error::Tls)?;
 
-        // Select cipher suite: find the first one we support that the client offers
-        let mut selected_suite: Option<CipherSuite> = None;
+        // Select cipher suite that matches our CryptoProvider's AEAD.
+        // The cipher suite must match the AEAD key length to ensure the
+        // QUIC packet encryption uses the correct algorithm.
+        let our_suite = match C::Aead::KEY_LEN {
+            16 => CipherSuite::TlsAes128GcmSha256,
+            32 => CipherSuite::TlsChacha20Poly1305Sha256,
+            _ => return Err(Error::Tls),
+        };
+        let mut client_supports_our_suite = false;
         for cs_u16 in iter_cipher_suites(ch.cipher_suites) {
-            if let Some(cs) = CipherSuite::from_u16(cs_u16) {
-                selected_suite = Some(cs);
+            if cs_u16 == our_suite.to_u16() {
+                client_supports_our_suite = true;
                 break;
             }
         }
-        let selected_suite = selected_suite.ok_or(Error::Tls)?;
+        if !client_supports_our_suite {
+            return Err(Error::Tls);
+        }
+        let selected_suite = our_suite;
         self.cipher_suite = Some(selected_suite);
 
         // ALPN negotiation: select the first protocol the client offers that we support
@@ -627,11 +670,23 @@ where
         hs_buf[hs_off..hs_off + cert_len].copy_from_slice(&cert_msg_buf[..cert_len]);
         hs_off += cert_len;
 
-        // CertificateVerify — placeholder signature
-        // Use Ed25519 algorithm (0x0807) with a 64-byte placeholder signature.
-        let placeholder_sig = [0xAA; 64];
+        // CertificateVerify — Ed25519 signature (RFC 8446 section 4.4.3)
+        // The signed content is: 64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + transcript_hash
+        let cv_transcript_hash = self.transcript.current_hash();
+        let signing_key_bytes: [u8; 32] = self
+            .server_private_key_der
+            .try_into()
+            .map_err(|_| Error::Tls)?;
+        let signature = crate::crypto::ed25519::sign_certificate_verify(
+            &signing_key_bytes,
+            &cv_transcript_hash,
+        )?;
         let mut cv_msg_buf = [0u8; 256];
-        let cv_len = encode_certificate_verify(0x0807, &placeholder_sig, &mut cv_msg_buf)?;
+        let cv_len = encode_certificate_verify(
+            crate::crypto::ed25519::ED25519_ALGORITHM,
+            &signature,
+            &mut cv_msg_buf,
+        )?;
         self.transcript.update(&cv_msg_buf[..cv_len]);
         if hs_off + cv_len > hs_buf.len() {
             return Err(Error::BufferTooSmall {
@@ -792,8 +847,11 @@ where
                     self.process_certificate(msg_body)?;
                 }
                 (HandshakeState::WaitCertificateVerify, HandshakeType::CertificateVerify) => {
+                    // Get transcript hash BEFORE adding CertificateVerify message
+                    // (the signature is computed over this hash)
+                    let transcript_before_cv = self.transcript.current_hash();
                     self.transcript.update(full_msg);
-                    self.process_certificate_verify(msg_body)?;
+                    self.process_certificate_verify(msg_body, &transcript_before_cv)?;
                 }
                 (HandshakeState::WaitFinished, HandshakeType::Finished) => {
                     // Get transcript hash BEFORE adding Finished message
@@ -1068,6 +1126,7 @@ mod tests {
     }
 
     /// Integration test: simulate a full client handshake with constructed server messages.
+    /// Uses real Ed25519 signing/verification for CertificateVerify.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     #[test]
     fn client_full_handshake_flow() {
@@ -1113,6 +1172,11 @@ mod tests {
         let keys = engine.derived_keys().unwrap();
         assert_eq!(keys.level, Level::Handshake);
 
+        // Start maintaining a parallel transcript for computing server messages
+        let mut server_transcript = TranscriptHash::new();
+        server_transcript.update(&buf[..ch_len]);
+        server_transcript.update(&sh_buf[..sh_len]);
+
         // Step 3: Feed EncryptedExtensions
         let mut ee_buf = [0u8; 512];
         let ee_len = build_test_encrypted_extensions(&mut ee_buf);
@@ -1126,25 +1190,33 @@ mod tests {
         // Check we got transport params
         assert!(engine.peer_transport_params().is_some());
 
-        // Step 4: Feed Certificate
+        server_transcript.update(&ee_buf[..ee_len]);
+
+        // Step 4: Feed Certificate (with real Ed25519 cert)
         let mut cert_buf = [0u8; 512];
-        let cert_len = build_test_certificate(&mut cert_buf);
+        let cert_len = build_test_certificate(get_test_ed25519_cert_der(), &mut cert_buf);
         engine
             .read_handshake(Level::Handshake, &cert_buf[..cert_len])
             .unwrap();
 
-        // Step 5: Feed CertificateVerify
-        let mut cv_buf = [0u8; 128];
-        let cv_len = build_test_certificate_verify(&mut cv_buf);
+        server_transcript.update(&cert_buf[..cert_len]);
+
+        // Step 5: Feed CertificateVerify (with real Ed25519 signature)
+        // The transcript hash before CertificateVerify is what gets signed
+        let cv_transcript_hash = server_transcript.current_hash();
+        let mut cv_buf = [0u8; 256];
+        let cv_len = build_test_certificate_verify(
+            &TEST_ED25519_SEED,
+            &cv_transcript_hash,
+            &mut cv_buf,
+        );
         engine
             .read_handshake(Level::Handshake, &cv_buf[..cv_len])
             .unwrap();
 
-        // Step 6: Feed server Finished
-        // We need to compute the real server Finished.
-        // The server's Finished key is derived from server_handshake_secret.
-        // We need to derive it the same way as the client did.
+        server_transcript.update(&cv_buf[..cv_len]);
 
+        // Step 6: Feed server Finished
         // Compute the shared secret as the server would
         let client_pk = x25519_dalek::PublicKey::from(
             &x25519_dalek::StaticSecret::from(client_secret_bytes),
@@ -1159,22 +1231,16 @@ mod tests {
             .unwrap();
 
         // We need the transcript hash at ClientHello..ServerHello
-        // Rebuild it: hash(ClientHello || ServerHello)
-        let mut server_transcript = TranscriptHash::new();
-        server_transcript.update(&buf[..ch_len]);
-        server_transcript.update(&sh_buf[..sh_len]);
-        let ch_sh_hash = server_transcript.current_hash();
+        let mut ch_sh_transcript = TranscriptHash::new();
+        ch_sh_transcript.update(&buf[..ch_len]);
+        ch_sh_transcript.update(&sh_buf[..sh_len]);
+        let ch_sh_hash = ch_sh_transcript.current_hash();
 
         let mut s_client_hs = [0u8; 32];
         let mut s_server_hs = [0u8; 32];
         server_ks
             .derive_handshake_traffic_secrets(&hkdf, &ch_sh_hash, &mut s_client_hs, &mut s_server_hs)
             .unwrap();
-
-        // Add EE, Certificate, CertificateVerify to server transcript
-        server_transcript.update(&ee_buf[..ee_len]);
-        server_transcript.update(&cert_buf[..cert_len]);
-        server_transcript.update(&cv_buf[..cv_len]);
 
         // Compute server Finished
         let mut server_fin_key = [0u8; 32];
@@ -1347,33 +1413,29 @@ mod tests {
     }
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn build_test_certificate(out: &mut [u8]) -> usize {
-        // Build a minimal Certificate message
-        let mut body = [0u8; 256];
+    fn build_test_certificate(cert_der: &[u8], out: &mut [u8]) -> usize {
+        // Build a Certificate message wrapping the given cert DER
+        let mut body = [0u8; 512];
         let mut off = 0;
 
         // certificate_request_context length = 0
         body[off] = 0;
         off += 1;
 
-        // Fake cert data
-        let fake_cert = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-
         // certificate_list length (3 bytes)
-        // entry: cert_data_len(3) + cert_data(6) + extensions_len(2) = 11
-        let list_len = 3 + fake_cert.len() + 2;
-        body[off] = 0;
+        let list_len = 3 + cert_der.len() + 2;
+        body[off] = ((list_len >> 16) & 0xFF) as u8;
         body[off + 1] = ((list_len >> 8) & 0xFF) as u8;
         body[off + 2] = (list_len & 0xFF) as u8;
         off += 3;
 
         // cert_data_length
-        body[off] = 0;
-        body[off + 1] = 0;
-        body[off + 2] = fake_cert.len() as u8;
+        body[off] = ((cert_der.len() >> 16) & 0xFF) as u8;
+        body[off + 1] = ((cert_der.len() >> 8) & 0xFF) as u8;
+        body[off + 2] = (cert_der.len() & 0xFF) as u8;
         off += 3;
-        body[off..off + fake_cert.len()].copy_from_slice(&fake_cert);
-        off += fake_cert.len();
+        body[off..off + cert_der.len()].copy_from_slice(cert_der);
+        off += cert_der.len();
 
         // extensions_length = 0
         body[off] = 0;
@@ -1390,21 +1452,34 @@ mod tests {
         4 + off
     }
 
+    /// Build a CertificateVerify message with a real Ed25519 signature.
+    ///
+    /// `signing_key_seed` is the 32-byte Ed25519 seed.
+    /// `transcript_hash` is the hash of the transcript up to (and including)
+    /// the Certificate message.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn build_test_certificate_verify(out: &mut [u8]) -> usize {
-        // Build a minimal CertificateVerify message
+    fn build_test_certificate_verify(
+        signing_key_seed: &[u8; 32],
+        transcript_hash: &[u8; 32],
+        out: &mut [u8],
+    ) -> usize {
+        let signature = crate::crypto::ed25519::sign_certificate_verify(
+            signing_key_seed,
+            transcript_hash,
+        )
+        .unwrap();
+
         let mut body = [0u8; 128];
 
         // Algorithm: Ed25519 = 0x0807
         body[0] = 0x08;
         body[1] = 0x07;
 
-        // Signature: fake 64-byte signature
-        let fake_sig = [0xAA; 64];
+        // Signature length + data
         body[2] = 0;
-        body[3] = fake_sig.len() as u8;
-        body[4..4 + fake_sig.len()].copy_from_slice(&fake_sig);
-        let body_len = 4 + fake_sig.len();
+        body[3] = signature.len() as u8;
+        body[4..4 + signature.len()].copy_from_slice(&signature);
+        let body_len = 4 + signature.len();
 
         // Handshake header
         out[0] = HandshakeType::CertificateVerify as u8;
@@ -1420,15 +1495,28 @@ mod tests {
     // Server-side tests
     // =========================================================================
 
-    /// Fake DER cert for tests.
-    const FAKE_CERT_DER: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-    const FAKE_KEY_DER: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+    /// Ed25519 private key seed used by all TLS tests.
+    const TEST_ED25519_SEED: [u8; 32] = [0x01u8; 32];
+
+    /// Build a real Ed25519 certificate DER from the test seed.
+    /// Returns a `&'static [u8]` by caching in a `LazyLock`.
+    fn get_test_ed25519_cert_der() -> &'static [u8] {
+        use std::sync::LazyLock;
+        static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+            let seed: [u8; 32] = [0x01u8; 32];
+            let pk = crate::crypto::ed25519::ed25519_public_key_from_seed(&seed);
+            let mut buf = [0u8; 512];
+            let len = crate::crypto::ed25519::build_ed25519_cert_der(&pk, &mut buf).unwrap();
+            buf[..len].to_vec()
+        });
+        &V
+    }
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     fn make_server_config() -> ServerTlsConfig {
         ServerTlsConfig {
-            cert_der: FAKE_CERT_DER,
-            private_key_der: FAKE_KEY_DER,
+            cert_der: get_test_ed25519_cert_der(),
+            private_key_der: &TEST_ED25519_SEED,
             alpn_protocols: &[b"h3"],
             transport_params: TransportParams::default_params(),
         }
@@ -1618,8 +1706,8 @@ mod tests {
             pinned_certs: &[],
         };
         let server_config = ServerTlsConfig {
-            cert_der: FAKE_CERT_DER,
-            private_key_der: FAKE_KEY_DER,
+            cert_der: get_test_ed25519_cert_der(),
+            private_key_der: &TEST_ED25519_SEED,
             alpn_protocols: &[b"h3"],
             transport_params: TransportParams::default_params(),
         };
@@ -1690,8 +1778,8 @@ mod tests {
             pinned_certs: &[],
         };
         let server_config = ServerTlsConfig {
-            cert_der: FAKE_CERT_DER,
-            private_key_der: FAKE_KEY_DER,
+            cert_der: get_test_ed25519_cert_der(),
+            private_key_der: &TEST_ED25519_SEED,
             alpn_protocols: &[b"h3"],
             transport_params: server_tp.clone(),
         };

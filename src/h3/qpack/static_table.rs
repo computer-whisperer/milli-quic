@@ -33,98 +33,101 @@ pub static STATIC_TABLE: [StaticEntry; 99] = [
     StaticEntry { name: b":method", value: b"OPTIONS" },                             // 19
     StaticEntry { name: b":method", value: b"POST" },                                // 20
     StaticEntry { name: b":method", value: b"PUT" },                                 // 21
-    StaticEntry { name: b":path", value: b"/" },                                     // 22
-    StaticEntry { name: b":scheme", value: b"http" },                                // 23
-    StaticEntry { name: b":scheme", value: b"https" },                               // 24
-    StaticEntry { name: b":status", value: b"103" },                                 // 25
-    StaticEntry { name: b":status", value: b"200" },                                 // 26
-    StaticEntry { name: b":status", value: b"304" },                                 // 27
-    StaticEntry { name: b":status", value: b"404" },                                 // 28
-    StaticEntry { name: b":status", value: b"503" },                                 // 29
-    StaticEntry { name: b"content-type", value: b"" },                               // 30
-    StaticEntry { name: b"content-type", value: b"application/dns-message" },         // 31
-    StaticEntry { name: b"content-type", value: b"application/javascript" },          // 32
-    StaticEntry { name: b"content-type", value: b"application/json" },                // 33
-    StaticEntry { name: b"content-type", value: b"application/x-www-form-urlencoded" }, // 34
-    StaticEntry { name: b"content-type", value: b"image/gif" },                       // 35
-    StaticEntry { name: b"content-type", value: b"image/jpeg" },                      // 36
-    StaticEntry { name: b"content-type", value: b"image/png" },                       // 37
-    StaticEntry { name: b"content-type", value: b"text/css" },                        // 38
-    StaticEntry { name: b"content-type", value: b"text/html; charset=utf-8" },        // 39
-    StaticEntry { name: b"content-type", value: b"text/plain" },                      // 40
-    StaticEntry { name: b"content-type", value: b"text/plain;charset=utf-8" },        // 41
-    StaticEntry { name: b"range", value: b"bytes=0-" },                              // 42
-    StaticEntry { name: b"strict-transport-security", value: b"max-age=31536000" },   // 43
+    StaticEntry { name: b":scheme", value: b"http" },                                // 22
+    StaticEntry { name: b":scheme", value: b"https" },                               // 23
+    StaticEntry { name: b":status", value: b"103" },                                 // 24
+    StaticEntry { name: b":status", value: b"200" },                                 // 25
+    StaticEntry { name: b":status", value: b"304" },                                 // 26
+    StaticEntry { name: b":status", value: b"404" },                                 // 27
+    StaticEntry { name: b":status", value: b"503" },                                 // 28
+    StaticEntry { name: b"accept", value: b"*/*" },                                  // 29
+    StaticEntry { name: b"accept", value: b"application/dns-message" },               // 30
+    StaticEntry { name: b"accept-encoding", value: b"gzip, deflate, br" },            // 31
+    StaticEntry { name: b"accept-ranges", value: b"bytes" },                          // 32
+    StaticEntry { name: b"access-control-allow-headers", value: b"cache-control" },   // 33
+    StaticEntry { name: b"access-control-allow-headers", value: b"content-type" },    // 34
+    StaticEntry { name: b"access-control-allow-origin", value: b"*" },                // 35
+    StaticEntry { name: b"cache-control", value: b"max-age=0" },                      // 36
+    StaticEntry { name: b"cache-control", value: b"max-age=2592000" },                // 37
+    StaticEntry { name: b"cache-control", value: b"max-age=604800" },                 // 38
+    StaticEntry { name: b"cache-control", value: b"no-cache" },                       // 39
+    StaticEntry { name: b"cache-control", value: b"no-store" },                       // 40
+    StaticEntry { name: b"cache-control", value: b"public, max-age=31536000" },       // 41
+    StaticEntry { name: b"content-encoding", value: b"br" },                          // 42
+    StaticEntry { name: b"content-encoding", value: b"gzip" },                        // 43
+    StaticEntry { name: b"content-type", value: b"application/dns-message" },         // 44
+    StaticEntry { name: b"content-type", value: b"application/javascript" },          // 45
+    StaticEntry { name: b"content-type", value: b"application/json" },                // 46
+    StaticEntry { name: b"content-type", value: b"application/x-www-form-urlencoded" }, // 47
+    StaticEntry { name: b"content-type", value: b"image/gif" },                       // 48
+    StaticEntry { name: b"content-type", value: b"image/jpeg" },                      // 49
+    StaticEntry { name: b"content-type", value: b"image/png" },                       // 50
+    StaticEntry { name: b"content-type", value: b"text/css" },                        // 51
+    StaticEntry { name: b"content-type", value: b"text/html; charset=utf-8" },        // 52
+    StaticEntry { name: b"content-type", value: b"text/plain" },                      // 53
+    StaticEntry { name: b"content-type", value: b"text/plain;charset=utf-8" },        // 54
+    StaticEntry { name: b"range", value: b"bytes=0-" },                              // 55
+    StaticEntry { name: b"strict-transport-security", value: b"max-age=31536000" },   // 56
     StaticEntry {
         name: b"strict-transport-security",
         value: b"max-age=31536000; includesubdomains",
-    }, // 44
+    }, // 57
     StaticEntry {
         name: b"strict-transport-security",
         value: b"max-age=31536000; includesubdomains; preload",
-    }, // 45
-    StaticEntry { name: b"vary", value: b"accept-encoding" },                        // 46
-    StaticEntry { name: b"vary", value: b"origin" },                                 // 47
-    StaticEntry { name: b"x-content-type-options", value: b"nosniff" },               // 48
-    StaticEntry { name: b"x-xss-protection", value: b"1; mode=block" },               // 49
-    StaticEntry { name: b":status", value: b"100" },                                 // 50
-    StaticEntry { name: b":status", value: b"204" },                                 // 51
-    StaticEntry { name: b":status", value: b"206" },                                 // 52
-    StaticEntry { name: b":status", value: b"302" },                                 // 53
-    StaticEntry { name: b":status", value: b"400" },                                 // 54
-    StaticEntry { name: b":status", value: b"403" },                                 // 55
-    StaticEntry { name: b":status", value: b"421" },                                 // 56
-    StaticEntry { name: b":status", value: b"425" },                                 // 57
-    StaticEntry { name: b":status", value: b"500" },                                 // 58
-    StaticEntry { name: b"accept", value: b"*/*" },                                  // 59
-    StaticEntry { name: b"accept", value: b"application/dns-message" },               // 60
-    StaticEntry { name: b"accept-encoding", value: b"gzip, deflate, br" },            // 61
-    StaticEntry { name: b"accept-ranges", value: b"bytes" },                          // 62
-    StaticEntry { name: b"access-control-allow-headers", value: b"cache-control" },   // 63
-    StaticEntry { name: b"access-control-allow-headers", value: b"content-type" },    // 64
-    StaticEntry { name: b"access-control-allow-origin", value: b"*" },                // 65
-    StaticEntry { name: b"cache-control", value: b"max-age=0" },                      // 66
-    StaticEntry { name: b"cache-control", value: b"max-age=2592000" },                // 67
-    StaticEntry { name: b"cache-control", value: b"max-age=604800" },                 // 68
-    StaticEntry { name: b"cache-control", value: b"no-cache" },                       // 69
-    StaticEntry { name: b"cache-control", value: b"no-store" },                       // 70
-    StaticEntry { name: b"cache-control", value: b"public, max-age=31536000" },       // 71
-    StaticEntry { name: b"content-encoding", value: b"br" },                          // 72
-    StaticEntry { name: b"content-encoding", value: b"gzip" },                        // 73
-    StaticEntry { name: b"content-type", value: b"application/grpc" },                // 74
-    StaticEntry { name: b"content-type", value: b"application/grpc+proto" },          // 75
-    StaticEntry { name: b"date", value: b"" },                                       // 76
-    StaticEntry { name: b"expect-ct", value: b"" },                                  // 77
-    StaticEntry { name: b"forwarded", value: b"" },                                  // 78
-    StaticEntry { name: b"if-range", value: b"" },                                   // 79
-    StaticEntry { name: b"origin", value: b"" },                                     // 80
-    StaticEntry { name: b"purpose", value: b"prefetch" },                            // 81
-    StaticEntry { name: b"server", value: b"" },                                     // 82
-    StaticEntry { name: b"timing-allow-origin", value: b"*" },                        // 83
-    StaticEntry { name: b"upgrade-insecure-requests", value: b"1" },                  // 84
-    StaticEntry { name: b"user-agent", value: b"" },                                 // 85
-    StaticEntry { name: b"x-forwarded-for", value: b"" },                            // 86
-    StaticEntry { name: b"x-frame-options", value: b"deny" },                         // 87
-    StaticEntry { name: b"x-frame-options", value: b"sameorigin" },                   // 88
-    StaticEntry { name: b"accept-language", value: b"" },                            // 89
+    }, // 58
+    StaticEntry { name: b"vary", value: b"accept-encoding" },                        // 59
+    StaticEntry { name: b"vary", value: b"origin" },                                 // 60
+    StaticEntry { name: b"x-content-type-options", value: b"nosniff" },               // 61
+    StaticEntry { name: b"x-xss-protection", value: b"1; mode=block" },               // 62
+    StaticEntry { name: b":status", value: b"100" },                                 // 63
+    StaticEntry { name: b":status", value: b"204" },                                 // 64
+    StaticEntry { name: b":status", value: b"206" },                                 // 65
+    StaticEntry { name: b":status", value: b"302" },                                 // 66
+    StaticEntry { name: b":status", value: b"400" },                                 // 67
+    StaticEntry { name: b":status", value: b"403" },                                 // 68
+    StaticEntry { name: b":status", value: b"421" },                                 // 69
+    StaticEntry { name: b":status", value: b"425" },                                 // 70
+    StaticEntry { name: b":status", value: b"500" },                                 // 71
+    StaticEntry { name: b"accept-language", value: b"" },                            // 72
     StaticEntry {
         name: b"access-control-allow-credentials",
         value: b"FALSE",
-    }, // 90
+    }, // 73
     StaticEntry {
         name: b"access-control-allow-credentials",
         value: b"TRUE",
-    }, // 91
-    StaticEntry { name: b"access-control-allow-methods", value: b"get" },             // 92
+    }, // 74
+    StaticEntry { name: b"access-control-allow-headers", value: b"*" },              // 75
+    StaticEntry { name: b"access-control-allow-methods", value: b"get" },             // 76
     StaticEntry {
         name: b"access-control-allow-methods",
         value: b"get, post, options",
-    }, // 93
-    StaticEntry { name: b"access-control-allow-methods", value: b"options" },         // 94
-    StaticEntry { name: b"access-control-expose-headers", value: b"content-length" }, // 95
-    StaticEntry { name: b"access-control-request-headers", value: b"content-type" },  // 96
-    StaticEntry { name: b"access-control-request-method", value: b"get" },            // 97
-    StaticEntry { name: b"access-control-request-method", value: b"post" },           // 98
+    }, // 77
+    StaticEntry { name: b"access-control-allow-methods", value: b"options" },         // 78
+    StaticEntry { name: b"access-control-expose-headers", value: b"content-length" }, // 79
+    StaticEntry { name: b"access-control-request-headers", value: b"content-type" },  // 80
+    StaticEntry { name: b"access-control-request-method", value: b"get" },            // 81
+    StaticEntry { name: b"access-control-request-method", value: b"post" },           // 82
+    StaticEntry { name: b"alt-svc", value: b"clear" },                               // 83
+    StaticEntry { name: b"authorization", value: b"" },                              // 84
+    StaticEntry {
+        name: b"content-security-policy",
+        value: b"script-src 'none'; object-src 'none'; base-uri 'none'",
+    }, // 85
+    StaticEntry { name: b"early-data", value: b"1" },                                // 86
+    StaticEntry { name: b"expect-ct", value: b"" },                                  // 87
+    StaticEntry { name: b"forwarded", value: b"" },                                  // 88
+    StaticEntry { name: b"if-range", value: b"" },                                   // 89
+    StaticEntry { name: b"origin", value: b"" },                                     // 90
+    StaticEntry { name: b"purpose", value: b"prefetch" },                            // 91
+    StaticEntry { name: b"server", value: b"" },                                     // 92
+    StaticEntry { name: b"timing-allow-origin", value: b"*" },                        // 93
+    StaticEntry { name: b"upgrade-insecure-requests", value: b"1" },                  // 94
+    StaticEntry { name: b"user-agent", value: b"" },                                 // 95
+    StaticEntry { name: b"x-forwarded-for", value: b"" },                            // 96
+    StaticEntry { name: b"x-frame-options", value: b"deny" },                         // 97
+    StaticEntry { name: b"x-frame-options", value: b"sameorigin" },                   // 98
 ];
 
 /// Result of a static table lookup.
@@ -189,33 +192,33 @@ mod tests {
     }
 
     #[test]
-    fn entry_26_status_200() {
-        assert_eq!(STATIC_TABLE[26].name, b":status");
-        assert_eq!(STATIC_TABLE[26].value, b"200");
+    fn entry_25_status_200() {
+        assert_eq!(STATIC_TABLE[25].name, b":status");
+        assert_eq!(STATIC_TABLE[25].value, b"200");
     }
 
     #[test]
     fn entry_98_last() {
-        assert_eq!(STATIC_TABLE[98].name, b"access-control-request-method");
-        assert_eq!(STATIC_TABLE[98].value, b"post");
+        assert_eq!(STATIC_TABLE[98].name, b"x-frame-options");
+        assert_eq!(STATIC_TABLE[98].value, b"sameorigin");
     }
 
     #[test]
-    fn entry_33_content_type_json() {
-        assert_eq!(STATIC_TABLE[33].name, b"content-type");
-        assert_eq!(STATIC_TABLE[33].value, b"application/json");
+    fn entry_46_content_type_json() {
+        assert_eq!(STATIC_TABLE[46].name, b"content-type");
+        assert_eq!(STATIC_TABLE[46].value, b"application/json");
     }
 
     #[test]
-    fn entry_24_scheme_https() {
-        assert_eq!(STATIC_TABLE[24].name, b":scheme");
-        assert_eq!(STATIC_TABLE[24].value, b"https");
+    fn entry_23_scheme_https() {
+        assert_eq!(STATIC_TABLE[23].name, b":scheme");
+        assert_eq!(STATIC_TABLE[23].value, b"https");
     }
 
     #[test]
-    fn entry_61_accept_encoding() {
-        assert_eq!(STATIC_TABLE[61].name, b"accept-encoding");
-        assert_eq!(STATIC_TABLE[61].value, b"gzip, deflate, br");
+    fn entry_31_accept_encoding() {
+        assert_eq!(STATIC_TABLE[31].name, b"accept-encoding");
+        assert_eq!(STATIC_TABLE[31].value, b"gzip, deflate, br");
     }
 
     #[test]
@@ -239,19 +242,19 @@ mod tests {
     #[test]
     fn lookup_exact_status_200() {
         let result = lookup(b":status", b"200");
-        assert_eq!(result, LookupResult::ExactMatch(26));
+        assert_eq!(result, LookupResult::ExactMatch(25));
     }
 
     #[test]
     fn lookup_name_only_status() {
         let result = lookup(b":status", b"201");
-        // First :status entry is index 25
-        assert_eq!(result, LookupResult::NameMatch(25));
+        // First :status entry is index 24
+        assert_eq!(result, LookupResult::NameMatch(24));
     }
 
     #[test]
     fn lookup_exact_content_type_json() {
         let result = lookup(b"content-type", b"application/json");
-        assert_eq!(result, LookupResult::ExactMatch(33));
+        assert_eq!(result, LookupResult::ExactMatch(46));
     }
 }

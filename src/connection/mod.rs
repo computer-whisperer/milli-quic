@@ -286,8 +286,7 @@ pub struct Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> 
     pub(crate) flow_control: FlowController,
 
     // Crypto frame reassembly buffers (one per level: Initial, Handshake, Application)
-    pub(crate) crypto_recv_buf: [heapless::Vec<u8, 4096>; 3],
-    pub(crate) crypto_recv_offset: [u64; 3],
+    pub(crate) crypto_reasm: [recv::CryptoReassemblyBuf; 3],
 
     // Crypto send offsets (tracks how many bytes we've sent per level)
     pub(crate) crypto_send_offset: [u64; 3],
@@ -363,17 +362,25 @@ where
         rng.fill(&mut secret_bytes);
         rng.fill(&mut random);
 
+        // Generate a local connection ID
+        let local_cid = ConnectionId::generate(rng, 8);
+
+        // Set the client's initial_source_connection_id in transport params
+        // (RFC 9000 §18.2 — both endpoints MUST include this).
+        let mut tp = transport_params.clone();
+        let scid_slice = local_cid.as_slice();
+        let scid_len = scid_slice.len().min(20);
+        tp.initial_scid[..scid_len].copy_from_slice(&scid_slice[..scid_len]);
+        tp.initial_scid_len = scid_len as u8;
+
         let tls_config = TlsConfig {
             server_name: heapless::String::try_from(server_name).map_err(|_| Error::Tls)?,
             alpn_protocols: alpn,
-            transport_params: transport_params.clone(),
+            transport_params: tp,
             pinned_certs: &[],
         };
 
         let tls = TlsEngine::<C>::new_client(tls_config, secret_bytes, random);
-
-        // Generate a local connection ID
-        let local_cid = ConnectionId::generate(rng, 8);
 
         // Generate a random destination CID for the server
         let initial_dcid = ConnectionId::generate(rng, 8);
@@ -402,8 +409,7 @@ where
             loss_detector: LossDetector::new(transport_params.max_ack_delay * 1000),
             congestion: CongestionController::new(1200),
             flow_control: fc,
-            crypto_recv_buf: core::array::from_fn(|_| heapless::Vec::new()),
-            crypto_recv_offset: [0; 3],
+            crypto_reasm: core::array::from_fn(|_| recv::CryptoReassemblyBuf::new()),
             crypto_send_offset: [0; 3],
             pending_crypto: core::array::from_fn(|_| heapless::Vec::new()),
             pending_crypto_level: [Level::Initial; 3],
@@ -465,8 +471,7 @@ where
             loss_detector: LossDetector::new(transport_params.max_ack_delay * 1000),
             congestion: CongestionController::new(1200),
             flow_control: fc,
-            crypto_recv_buf: core::array::from_fn(|_| heapless::Vec::new()),
-            crypto_recv_offset: [0; 3],
+            crypto_reasm: core::array::from_fn(|_| recv::CryptoReassemblyBuf::new()),
             crypto_send_offset: [0; 3],
             pending_crypto: core::array::from_fn(|_| heapless::Vec::new()),
             pending_crypto_level: [Level::Initial; 3],
@@ -979,8 +984,19 @@ mod tests {
         use crate::crypto::rustcrypto::Aes128GcmProvider;
         use crate::tls::handshake::ServerTlsConfig;
 
-        const FAKE_CERT: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-        const FAKE_KEY: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+        const TEST_ED25519_SEED: [u8; 32] = [0x01u8; 32];
+
+        fn get_test_ed25519_cert_der() -> &'static [u8] {
+            use std::sync::LazyLock;
+            static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+                let s: [u8; 32] = [0x01u8; 32];
+                let pk = crate::crypto::ed25519::ed25519_public_key_from_seed(&s);
+                let mut b = [0u8; 512];
+                let n = crate::crypto::ed25519::build_ed25519_cert_der(&pk, &mut b).unwrap();
+                b[..n].to_vec()
+            });
+            &V
+        }
 
         struct TestRng(u8);
         impl Rng for TestRng {
@@ -1012,8 +1028,8 @@ mod tests {
             let mut rng = TestRng(0x20);
             let tp = crate::tls::transport_params::TransportParams::default_params();
             let config = ServerTlsConfig {
-                cert_der: FAKE_CERT,
-                private_key_der: FAKE_KEY,
+                cert_der: get_test_ed25519_cert_der(),
+                private_key_der: &TEST_ED25519_SEED,
                 alpn_protocols: &[b"h3"],
                 transport_params: tp.clone(),
             };
@@ -1032,8 +1048,8 @@ mod tests {
             let mut rng = TestRng(0x20);
             let tp = crate::tls::transport_params::TransportParams::default_params();
             let config = ServerTlsConfig {
-                cert_der: FAKE_CERT,
-                private_key_der: FAKE_KEY,
+                cert_der: get_test_ed25519_cert_der(),
+                private_key_der: &TEST_ED25519_SEED,
                 alpn_protocols: &[b"h3"],
                 transport_params: tp.clone(),
             };
@@ -1063,8 +1079,8 @@ mod tests {
             let mut rng = TestRng(0x20);
             let tp = crate::tls::transport_params::TransportParams::default_params();
             let config = ServerTlsConfig {
-                cert_der: FAKE_CERT,
-                private_key_der: FAKE_KEY,
+                cert_der: get_test_ed25519_cert_der(),
+                private_key_der: &TEST_ED25519_SEED,
                 alpn_protocols: &[b"h3"],
                 transport_params: tp.clone(),
             };
@@ -1089,8 +1105,8 @@ mod tests {
             let mut rng = TestRng(0x20);
             let tp = crate::tls::transport_params::TransportParams::default_params();
             let config = ServerTlsConfig {
-                cert_der: FAKE_CERT,
-                private_key_der: FAKE_KEY,
+                cert_der: get_test_ed25519_cert_der(),
+                private_key_der: &TEST_ED25519_SEED,
                 alpn_protocols: &[b"h3"],
                 transport_params: tp.clone(),
             };
@@ -1125,8 +1141,8 @@ mod tests {
             .unwrap();
 
             let config = ServerTlsConfig {
-                cert_der: FAKE_CERT,
-                private_key_der: FAKE_KEY,
+                cert_der: get_test_ed25519_cert_der(),
+                private_key_der: &TEST_ED25519_SEED,
                 alpn_protocols: &[b"h3"],
                 transport_params: tp.clone(),
             };
@@ -1188,8 +1204,19 @@ mod tests {
         use crate::packet::MIN_INITIAL_PACKET_SIZE;
         use crate::tls::handshake::ServerTlsConfig;
 
-        const FAKE_CERT: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-        const FAKE_KEY: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+        const TEST_ED25519_SEED: [u8; 32] = [0x01u8; 32];
+
+        fn get_test_ed25519_cert_der() -> &'static [u8] {
+            use std::sync::LazyLock;
+            static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+                let s: [u8; 32] = [0x01u8; 32];
+                let pk = crate::crypto::ed25519::ed25519_public_key_from_seed(&s);
+                let mut b = [0u8; 512];
+                let n = crate::crypto::ed25519::build_ed25519_cert_der(&pk, &mut b).unwrap();
+                b[..n].to_vec()
+            });
+            &V
+        }
 
         struct TestRng(u8);
         impl Rng for TestRng {
@@ -1216,8 +1243,8 @@ mod tests {
         fn make_server() -> Connection<Aes128GcmProvider> {
             let mut rng = TestRng(0x50);
             let config = ServerTlsConfig {
-                cert_der: FAKE_CERT,
-                private_key_der: FAKE_KEY,
+                cert_der: get_test_ed25519_cert_der(),
+                private_key_der: &TEST_ED25519_SEED,
                 alpn_protocols: &[b"h3"],
                 transport_params: TransportParams::default_params(),
             };
@@ -1676,6 +1703,113 @@ mod tests {
             let buf = conn.stream_recv_bufs.iter().find_map(|s| s.as_ref()).unwrap();
             assert_eq!(&buf.data[..buf.len], b"done");
             assert!(buf.fin_received);
+        }
+    }
+
+    /// Test that processes a real curl --http3 Initial packet.
+    #[cfg(feature = "rustcrypto-chacha")]
+    mod curl_interop {
+        use super::*;
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        /// Hex-encoded Initial packet captured from `curl --http3`.
+        const CURL_INITIAL_HEX: &str = "ca00000001145853147be8dc7ffd04d27473064d582c2c9f8d471486e5be8c8451a8acebec17f0649776ebdd90221c008000047c69639d2b78e5215ce9d38a549bb4e688821d3188bc79338e5e0431d6551a14ea5b36462fb746f1a17913ae38d0ae789132b5b31d5c8ed9c418ba0ac877f4a68fa436f7477f5ee9f5bd90d4137dafdfec0b04ffcaef83f5e0184b9742faac00fe7246d94117a9d11ab92944b1cc9e8dbb799545ae87db196f9e5f7f0ab0779685b369ae3bb9c281ac872de74c1bdba52d7c0b61b52b1c56e5a42ef9c01751348961ecb3bb4b8b052b1ef0919fe4fb66beafc588e0761ad77b6b8f036e0baa8e7f8dbe369dd82bf79fc40664a4f5b9679c8c435fc6eac36f10cfb00f864a8fed955eda0bffd0f822ff30202f8e4d73511560078339b3961a90bfbb93bab6d0c832bc1912adc6dbc2cab5adb9acf3764bcff373394c1b08e29ebeecffecf1e3de0d205e07676198c11a9a803cf03c9b706885cbb89e43aa1eb8779eeb3ea94ff590ae853b6bc394f0091c93b2e5da54bb674c55d820bdc57bef9b401022198a573b74ce7430dfaf84efe24de129a93f2b05d902234490b4398a6e7a13f766c131d3dae63a71c434de7ba68002162bea6c0105d378cca320817f6192ae6701fc040c06f52dac2cf8fe00813810202478c2b81a98778d9a264c33a57ddae92e0d4375aa5fd19825582e5f5293a6a4a9c1ad24e6c4476b77c3c5228637708c0ec6b3469e3874a3509df2d36806caf72f1a60fcbfe2fcb0c0dcba4b54f80838dfc10f610e5377d95041ac78a03e9f2c74acc27bbc61b4e6c911f0c591a1da67ccb3ce982603238b34a0ccb486f79226f0046289e6317edc55569d41a01ad04ee4d359acb8fa494cc3229251d56eab7da70e46c543c4afd49a7f5efb8f12b890f982a4002c1513cb0c87e25f9b59035b4f9987b96feb1b5c6e86c1314d3064f418bfd6d1a3a7242e761a50ebc6c4e190919fa4a0a2a9406b741b53534a1baebe185ef8698998ff47cf0a9165b8b7cd5e4966c8e6a5faaa4a8309f973f5ae0ff7d96c6eadf12a89124b6f1297c90363727aa64c8d1be9ff4fdb886dbe8add8ccd7410d705617c4830ab90949544b1e47544d25c25e7f3d8e36054e95205ecb68464e0561cc5e8f0f458a4c82c3fdb1fdb2c1e7bd9b2da14807b4d3eda466f4fc57554fac825803557c28d4537175c672bd1496c361c211613838b465b4dcec2a5d64d31760c713f55b480205f228c0a9999c94684e88f2b645d5961818afb145ac12511896784bdf7688d7f4381cbc98a2584b05c31a81071e96d67ace70663601d2e88963590c82dd37983df27688618a584a54f2c33e6d9013ea434577a813d9e9d433a2c59ed070c7db47d286fd2b687428c0a22b9933149ca9988682803dc554cb0603edb5f62b0f16217abca14be43b1ba03931158b40695f3e3ec03b51ebd1dbd30e36daa3f527955f25e3524db0480c65d4c2c8d4b87c5d58c0a2bf5e6bcbc5354b97b9dc50f22b3c961c2ded546556beb3dbd6d48e3c69b182abd6034df6a806d7e235ea8f9bd7c648197d5e56c65591d26da0e0e62e3e536570eefd1dd66a5b9e376d116dfad88d7bb337a856a5a95b98b2840b58d83c769d2d8b01dc12b09a0f8db6c667c2fe4752ebd21cdc4c97349de0fcf805db46253b4503f18";
+
+        const TEST_SEED: [u8; 32] = [0x42u8; 32];
+
+        fn get_test_cert_der() -> &'static [u8] {
+            use std::sync::LazyLock;
+            static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+                let pk = crate::crypto::ed25519::ed25519_public_key_from_seed(&TEST_SEED);
+                let mut b = [0u8; 512];
+                let n = crate::crypto::ed25519::build_ed25519_cert_der(&pk, &mut b).unwrap();
+                b[..n].to_vec()
+            });
+            &V
+        }
+
+        fn hex_to_bytes(hex: &str) -> std::vec::Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        #[test]
+        fn server_processes_curl_initial_packet() {
+            let data = hex_to_bytes(CURL_INITIAL_HEX);
+            assert_eq!(data.len(), 1200);
+
+            let tp = TransportParams::default_params();
+            let config = crate::tls::handshake::ServerTlsConfig {
+                cert_der: get_test_cert_der(),
+                private_key_der: &TEST_SEED,
+                alpn_protocols: &[b"h3"],
+                transport_params: tp.clone(),
+            };
+
+            struct TestRng(u8);
+            impl Rng for TestRng {
+                fn fill(&mut self, buf: &mut [u8]) {
+                    for b in buf.iter_mut() {
+                        *b = self.0;
+                        self.0 = self.0.wrapping_add(1);
+                    }
+                }
+            }
+            let mut rng = TestRng(0x10);
+            let mut server =
+                Connection::<Aes128GcmProvider>::server(Aes128GcmProvider, config, tp, &mut rng)
+                    .expect("create server");
+
+            // Process the curl Initial packet
+            let now = 1_000_000u64;
+            let result = server.recv(&data, now);
+            std::eprintln!("recv result: {:?}", result);
+            assert!(result.is_ok(), "recv should succeed: {:?}", result);
+
+            // Check that the server:
+            // 1. Derived initial keys (from DCID)
+            assert!(
+                server.keys.has_recv_keys(Level::Initial),
+                "should have initial recv keys"
+            );
+
+            // 2. Marked the packet as ack-eliciting
+            assert!(
+                server.ack_eliciting_received[0],
+                "Initial packet should be ack-eliciting"
+            );
+
+            // 3. Tracked PN 0 in the recv_pn_tracker
+            assert!(
+                !server.recv_pn_tracker[0].ranges.is_empty(),
+                "should have tracked PN 0"
+            );
+
+            // 4. Buffered CRYPTO data in the reassembly buffer
+            // The ClientHello is 1499 bytes but only ~1077 fit in this datagram.
+            let reasm = &server.crypto_reasm[0];
+            let avail = reasm.contiguous_len();
+            std::eprintln!(
+                "CRYPTO reassembly: {} contiguous bytes, delivered={}",
+                avail, reasm.delivered
+            );
+            assert!(avail > 0, "should have some contiguous CRYPTO data");
+            assert!(
+                avail < 1499,
+                "shouldn't have the full ClientHello yet (only one datagram)"
+            );
+
+            // 5. poll_transmit should produce an ACK (even though TLS hasn't
+            //    processed the ClientHello yet).
+            let mut tx_buf = [0u8; 2048];
+            let tx = server.poll_transmit(&mut tx_buf, now);
+            std::eprintln!("poll_transmit: {:?}", tx.as_ref().map(|t| t.data.len()));
+            assert!(
+                tx.is_some(),
+                "server should send an ACK for the client's Initial"
+            );
         }
     }
 }

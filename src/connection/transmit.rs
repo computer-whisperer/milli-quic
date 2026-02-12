@@ -58,12 +58,29 @@ where
             if let Ok(frame_len) = frame::encode(&close_frame, &mut frame_buf) {
                 let result = if level == Level::Initial {
                     let is_client = self.role == crate::tls::handshake::Role::Client;
-                    self.build_and_encrypt_initial_packet(
-                        &frame_buf[..frame_len],
-                        is_client,
-                        buf,
-                        now,
-                    )
+                    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+                    {
+                        // Take initial keys out temporarily to avoid borrow conflict.
+                        let send = self.keys.initial_send.take();
+                        let r = if let Some(ref k) = send {
+                            self.build_and_encrypt_initial_packet(
+                                &frame_buf[..frame_len],
+                                is_client,
+                                buf,
+                                now,
+                                k,
+                            )
+                        } else {
+                            Err(Error::Crypto)
+                        };
+                        self.keys.initial_send = send;
+                        r
+                    }
+                    #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+                    {
+                        let _ = is_client;
+                        Err(Error::Crypto)
+                    }
                 } else {
                     self.build_and_encrypt_packet(
                         level,
@@ -153,12 +170,29 @@ where
         // Pad Initial packets from client to 1200 bytes minimum
         let is_client = self.role == crate::tls::handshake::Role::Client;
 
-        match self.build_and_encrypt_initial_packet(
-            &frame_buf[..frame_len],
-            is_client,
-            buf,
-            now,
-        ) {
+        // Get initial send keys (concrete AES type) and build the packet.
+        // Take keys out temporarily to avoid borrow conflict with &mut self.
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        let result = {
+            let send = self.keys.initial_send.take();
+            let r = if let Some(ref k) = send {
+                self.build_and_encrypt_initial_packet(
+                    &frame_buf[..frame_len],
+                    is_client,
+                    buf,
+                    now,
+                    k,
+                )
+            } else {
+                return None;
+            };
+            self.keys.initial_send = send;
+            r
+        };
+        #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+        let result: Result<usize, Error> = Err(Error::Crypto);
+
+        match result {
             Ok(pkt_len) => {
                 // Server: once we've sent the ServerHello (Initial-level),
                 // we can drop Initial keys if Handshake keys are already installed.
@@ -421,12 +455,16 @@ where
     }
 
     /// Build and encrypt an Initial packet with proper padding.
-    fn build_and_encrypt_initial_packet(
+    ///
+    /// Generic over AEAD and HeaderProtection types so that Initial keys
+    /// (concrete AES-128-GCM per RFC 9001) can be passed directly.
+    fn build_and_encrypt_initial_packet<A: Aead, HP: HeaderProtection>(
         &mut self,
         payload_frames: &[u8],
         pad_to_min: bool,
         out: &mut [u8],
         now: Instant,
+        send: &crate::crypto::DirectionalKeys<A, HP>,
     ) -> Result<usize, Error> {
         let level = Level::Initial;
         let pn = self.next_pn[level_index(level)];
@@ -504,7 +542,6 @@ where
         let mut aad_buf = [0u8; 256];
         aad_buf[..aad_len].copy_from_slice(&out[..aad_len]);
 
-        let send = self.keys.send_keys(level).ok_or(Error::Crypto)?;
         let nonce = send.nonce(pn);
         let ct_len = send.aead.seal_in_place(
             &nonce,

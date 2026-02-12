@@ -3,15 +3,30 @@
 //! Tracks send/recv `DirectionalKeys` for each encryption level
 //! (Initial, Handshake, Application) and provides helpers to derive
 //! Initial keys from a DCID and install keys from TLS-derived secrets.
+//!
+//! Per RFC 9001 section 5.2, Initial packets always use AES-128-GCM
+//! regardless of the negotiated cipher suite. The initial key fields
+//! therefore use concrete AES types instead of the generic `CryptoProvider`.
 
 use crate::crypto::{CryptoProvider, DirectionalKeys, Level};
 use crate::error::Error;
 use crate::tls::DerivedKeys;
 
+#[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+use crate::crypto::rustcrypto::{Aes128GcmAead, AesHeaderProtection};
+
 /// All keys for a QUIC connection, separated by level and direction.
 pub struct ConnectionKeys<C: CryptoProvider> {
-    pub initial_send: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
-    pub initial_recv: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
+    // Initial keys always use AES-128-GCM per RFC 9001 section 5.2,
+    // regardless of the negotiated cipher suite (C).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub initial_send: Option<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>,
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub initial_recv: Option<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>,
+    // Without crypto features, we still need the fields for the struct definition.
+    #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+    _initial_marker: core::marker::PhantomData<C>,
+    // Handshake and Application keys use the negotiated cipher suite.
     pub handshake_send: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
     pub handshake_recv: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
     pub app_send: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
@@ -22,8 +37,12 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
     /// Create an empty key set (no keys installed yet).
     pub fn new() -> Self {
         Self {
+            #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
             initial_send: None,
+            #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
             initial_recv: None,
+            #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+            _initial_marker: core::marker::PhantomData,
             handshake_send: None,
             handshake_recv: None,
             app_send: None,
@@ -33,16 +52,21 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
     /// Derive and install Initial keys from a Destination Connection ID.
     ///
+    /// Per RFC 9001 section 5.2, Initial keys always use AES-128-GCM with
+    /// AES header protection, regardless of the negotiated cipher suite.
+    ///
     /// For a client: send = client keys, recv = server keys.
     /// For a server: send = server keys, recv = client keys.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     pub fn derive_initial(
         &mut self,
-        provider: &C,
+        _provider: &C,
         dcid: &[u8],
         is_client: bool,
     ) -> Result<(), Error> {
-        let hkdf = provider.hkdf();
+        // Always use AES-128-GCM for Initial keys per RFC 9001.
+        let aes_provider = crate::crypto::rustcrypto::Aes128GcmProvider;
+        let hkdf = aes_provider.hkdf();
         let mut client_secret = [0u8; 32];
         let mut server_secret = [0u8; 32];
         crate::crypto::key_schedule::derive_initial_secrets(
@@ -53,9 +77,9 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         )?;
 
         let client_keys =
-            crate::crypto::key_schedule::derive_directional_keys(provider, &hkdf, &client_secret)?;
+            crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &client_secret)?;
         let server_keys =
-            crate::crypto::key_schedule::derive_directional_keys(provider, &hkdf, &server_secret)?;
+            crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &server_secret)?;
 
         if is_client {
             self.initial_send = Some(client_keys);
@@ -96,43 +120,65 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
                 self.app_recv = Some(recv_keys);
             }
             Level::Initial => {
-                // Initial keys are derived differently; this shouldn't happen
-                // but handle gracefully.
-                self.initial_send = Some(send_keys);
-                self.initial_recv = Some(recv_keys);
+                // Initial keys are derived via derive_initial() with AES-128-GCM.
+                // This path should not be reached; ignore gracefully.
             }
         }
         Ok(())
     }
 
-    /// Get the send-direction keys for a given level.
+    /// Get the send-direction initial keys (AES-128-GCM per RFC 9001).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub fn initial_send_keys(&self) -> Option<&DirectionalKeys<Aes128GcmAead, AesHeaderProtection>> {
+        self.initial_send.as_ref()
+    }
+
+    /// Get the recv-direction initial keys (AES-128-GCM per RFC 9001).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub fn initial_recv_keys(&self) -> Option<&DirectionalKeys<Aes128GcmAead, AesHeaderProtection>> {
+        self.initial_recv.as_ref()
+    }
+
+    /// Get the send-direction keys for a given level (Handshake or Application).
+    ///
+    /// For Initial keys, use [`initial_send_keys`](Self::initial_send_keys)
+    /// instead, since Initial keys use concrete AES types.
     pub fn send_keys(
         &self,
         level: Level,
     ) -> Option<&DirectionalKeys<C::Aead, C::HeaderProtection>> {
         match level {
-            Level::Initial => self.initial_send.as_ref(),
+            Level::Initial => None,
             Level::Handshake => self.handshake_send.as_ref(),
             Level::Application => self.app_send.as_ref(),
         }
     }
 
-    /// Get the recv-direction keys for a given level.
+    /// Get the recv-direction keys for a given level (Handshake or Application).
+    ///
+    /// For Initial keys, use [`initial_recv_keys`](Self::initial_recv_keys)
+    /// instead, since Initial keys use concrete AES types.
     pub fn recv_keys(
         &self,
         level: Level,
     ) -> Option<&DirectionalKeys<C::Aead, C::HeaderProtection>> {
         match level {
-            Level::Initial => self.initial_recv.as_ref(),
+            Level::Initial => None,
             Level::Handshake => self.handshake_recv.as_ref(),
             Level::Application => self.app_recv.as_ref(),
         }
     }
 
     /// Drop Initial keys (after handshake keys are installed).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     pub fn drop_initial(&mut self) {
         self.initial_send = None;
         self.initial_recv = None;
+    }
+
+    #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+    pub fn drop_initial(&mut self) {
+        // No initial key fields without crypto features.
     }
 
     /// Drop Handshake keys (after handshake is confirmed).
@@ -143,12 +189,24 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
     /// Check if we have send keys at a given level.
     pub fn has_send_keys(&self, level: Level) -> bool {
-        self.send_keys(level).is_some()
+        match level {
+            #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+            Level::Initial => self.initial_send.is_some(),
+            #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+            Level::Initial => false,
+            _ => self.send_keys(level).is_some(),
+        }
     }
 
     /// Check if we have recv keys at a given level.
     pub fn has_recv_keys(&self, level: Level) -> bool {
-        self.recv_keys(level).is_some()
+        match level {
+            #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+            Level::Initial => self.initial_recv.is_some(),
+            #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+            Level::Initial => false,
+            _ => self.recv_keys(level).is_some(),
+        }
     }
 }
 
@@ -250,8 +308,12 @@ mod tests {
         let mut keys = ConnectionKeys::<Aes128GcmProvider>::new();
         keys.derive_initial(&provider, &[1, 2, 3, 4], true).unwrap();
 
-        assert!(keys.send_keys(Level::Initial).is_some());
-        assert!(keys.recv_keys(Level::Initial).is_some());
+        // Initial keys use dedicated accessors (concrete AES type)
+        assert!(keys.initial_send_keys().is_some());
+        assert!(keys.initial_recv_keys().is_some());
+        // has_send_keys/has_recv_keys still works for Initial
+        assert!(keys.has_send_keys(Level::Initial));
+        assert!(keys.has_recv_keys(Level::Initial));
         assert!(keys.send_keys(Level::Handshake).is_none());
         assert!(keys.recv_keys(Level::Handshake).is_none());
         assert!(keys.send_keys(Level::Application).is_none());
@@ -279,14 +341,14 @@ mod tests {
         let mut buf = [0u8; 128];
         buf[..plaintext.len()].copy_from_slice(plaintext);
 
-        let send = client_keys.send_keys(Level::Initial).unwrap();
+        let send = client_keys.initial_send_keys().unwrap();
         let nonce = send.nonce(0);
         let ct_len = send
             .aead
             .seal_in_place(&nonce, aad, &mut buf, plaintext.len())
             .unwrap();
 
-        let recv = server_keys.recv_keys(Level::Initial).unwrap();
+        let recv = server_keys.initial_recv_keys().unwrap();
         let nonce = recv.nonce(0);
         let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
         assert_eq!(&buf[..pt_len], plaintext);
