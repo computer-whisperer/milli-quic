@@ -19,10 +19,12 @@ use super::{Connection, ConnectionState, Event};
 /// Frames may arrive out of order within a packet or across packets. This
 /// buffer stores bytes at arbitrary offsets and only delivers contiguous,
 /// complete TLS handshake messages to the TLS engine.
-pub(crate) struct CryptoReassemblyBuf {
+///
+/// The const generic `N` controls the buffer size (default: 4096).
+pub(crate) struct CryptoReassemblyBuf<const N: usize = 4096> {
     /// Raw byte buffer. Index `i` corresponds to absolute CRYPTO stream
     /// offset `delivered + i`.
-    buf: [u8; 4096],
+    buf: [u8; N],
     /// Absolute offset of bytes already delivered to TLS.
     pub(crate) delivered: u64,
     /// Received byte ranges relative to `delivered`, stored as `(start, end)`
@@ -30,10 +32,10 @@ pub(crate) struct CryptoReassemblyBuf {
     ranges: heapless::Vec<(usize, usize), 16>,
 }
 
-impl CryptoReassemblyBuf {
+impl<const N: usize> CryptoReassemblyBuf<N> {
     pub fn new() -> Self {
         Self {
-            buf: [0u8; 4096],
+            buf: [0u8; N],
             delivered: 0,
             ranges: heapless::Vec::new(),
         }
@@ -167,8 +169,8 @@ struct PacketResult {
     pn: u64,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
 where
     C::Hkdf: Default,
 {
@@ -935,7 +937,7 @@ mod tests {
 
     #[test]
     fn in_order_delivery() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         buf.insert(0, b"hello").unwrap();
         assert_eq!(buf.contiguous_len(), 5);
         assert_eq!(buf.contiguous_data(), b"hello");
@@ -947,7 +949,7 @@ mod tests {
 
     #[test]
     fn out_of_order_two_frames() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         // Second chunk arrives first.
         buf.insert(5, b" world").unwrap();
         assert_eq!(buf.contiguous_len(), 0);
@@ -960,7 +962,7 @@ mod tests {
 
     #[test]
     fn out_of_order_three_frames() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         // Arrive in order: [10..15], [0..5], [5..10]
         buf.insert(10, b"CCCCC").unwrap();
         assert_eq!(buf.contiguous_len(), 0);
@@ -975,7 +977,7 @@ mod tests {
 
     #[test]
     fn advance_shifts_buffer() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         buf.insert(0, b"AAAAABBBBB").unwrap();
         assert_eq!(buf.contiguous_len(), 10);
 
@@ -992,7 +994,7 @@ mod tests {
 
     #[test]
     fn duplicate_retransmit_ignored() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         buf.insert(0, b"hello").unwrap();
         buf.advance(5);
 
@@ -1004,7 +1006,7 @@ mod tests {
 
     #[test]
     fn partial_overlap_with_delivered() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         buf.insert(0, b"hello").unwrap();
         buf.advance(3); // delivered 3 bytes, "lo" remains
 
@@ -1020,7 +1022,7 @@ mod tests {
 
     #[test]
     fn overlapping_ranges_merge() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         buf.insert(0, b"AAAA").unwrap(); // [0..4]
         buf.insert(8, b"CCCC").unwrap(); // [8..12]
         assert_eq!(buf.contiguous_len(), 4); // only first block
@@ -1032,14 +1034,14 @@ mod tests {
 
     #[test]
     fn empty_insert_is_noop() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         buf.insert(0, b"").unwrap();
         assert_eq!(buf.contiguous_len(), 0);
     }
 
     #[test]
     fn buffer_overflow_returns_error() {
-        let mut buf = CryptoReassemblyBuf::new();
+        let mut buf = CryptoReassemblyBuf::<4096>::new();
         // Try to insert beyond buffer capacity.
         let big = [0u8; 100];
         let result = buf.insert(4000, &big);

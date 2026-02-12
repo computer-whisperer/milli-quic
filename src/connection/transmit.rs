@@ -11,8 +11,8 @@ use crate::transport::recovery::SentPacket;
 use super::recv::level_index;
 use super::{Connection, ConnectionState, Transmit};
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
 where
     C::Hkdf: Default,
 {

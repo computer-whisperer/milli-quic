@@ -73,8 +73,11 @@ pub struct H3Connection<
     const MAX_STREAMS: usize = 32,
     const SENT_PER_SPACE: usize = 128,
     const MAX_CIDS: usize = 4,
+    const STREAM_BUF: usize = 1024,
+    const SEND_QUEUE: usize = 16,
+    const CRYPTO_BUF: usize = 4096,
 > {
-    pub(crate) quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>,
+    pub(crate) quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>,
 
     // Control streams
     pub(crate) local_control_stream: Option<u64>,
@@ -107,13 +110,13 @@ pub struct H3Connection<
     pub(crate) pending_uni_streams: heapless::Vec<u64, 16>,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
-    H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
+    H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
 where
     C::Hkdf: Default,
 {
     /// Create a new H3Connection wrapping an underlying QUIC connection.
-    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>) -> Self {
         Self {
             quic,
             local_control_stream: None,

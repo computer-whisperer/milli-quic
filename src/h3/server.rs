@@ -20,17 +20,20 @@ pub struct H3Server<
     const MAX_STREAMS: usize = 32,
     const SENT_PER_SPACE: usize = 128,
     const MAX_CIDS: usize = 4,
+    const STREAM_BUF: usize = 1024,
+    const SEND_QUEUE: usize = 16,
+    const CRYPTO_BUF: usize = 4096,
 > {
-    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>,
+    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
-    H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
+    H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
 where
     C::Hkdf: Default,
 {
     /// Wrap a QUIC connection as an HTTP/3 server.
-    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>) -> Self {
         Self {
             inner: H3Connection::new(quic),
         }

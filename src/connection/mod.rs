@@ -153,19 +153,23 @@ pub struct Transmit<'a> {
 // ---------------------------------------------------------------------------
 
 /// A pending stream data send.
+///
+/// The const generic `N` controls the per-entry buffer size (default: 1024).
 #[derive(Clone)]
-pub struct StreamSendEntry {
+pub struct StreamSendEntry<const N: usize = 1024> {
     pub stream_id: u64,
     pub offset: u64,
-    pub data: [u8; 1024],
+    pub data: [u8; N],
     pub len: usize,
     pub fin: bool,
 }
 
 /// A simple received-data buffer for a single stream.
-pub struct StreamRecvBuf {
+///
+/// The const generic `N` controls the per-stream buffer size (default: 1024).
+pub struct StreamRecvBuf<const N: usize = 1024> {
     pub stream_id: u64,
-    pub data: [u8; 1024],
+    pub data: [u8; N],
     pub len: usize,
     pub read_offset: usize,
     pub fin_received: bool,
@@ -293,14 +297,29 @@ impl RecvPnTracker {
 /// - `SENT_PER_SPACE` — maximum sent packets tracked per encryption space for
 ///   loss detection and ACK processing (default: 128).
 /// - `MAX_CIDS` — maximum number of local connection IDs (default: 4).
+/// - `STREAM_BUF` — per-stream receive/send buffer size in bytes (default: 1024).
+/// - `SEND_QUEUE` — maximum number of pending stream send entries (default: 16).
+/// - `CRYPTO_BUF` — CRYPTO frame reassembly buffer size per level (default: 4096).
 ///
 /// The defaults match the previous hardcoded values, so
 /// `Connection<MyProvider>` is source-compatible with existing code.
+///
+/// # Size estimates
+///
+/// With defaults (`Connection<P>`): ~98 KiB per connection.
+///
+/// For a minimal embedded configuration:
+/// ```text
+/// Connection<P, 4, 32, 2, 256, 4, 2048>  — ~15-20 KiB
+/// ```
 pub struct Connection<
     C: CryptoProvider,
     const MAX_STREAMS: usize = 32,
     const SENT_PER_SPACE: usize = 128,
     const MAX_CIDS: usize = 4,
+    const STREAM_BUF: usize = 1024,
+    const SEND_QUEUE: usize = 16,
+    const CRYPTO_BUF: usize = 4096,
 > {
     pub(crate) state: ConnectionState,
     pub(crate) role: Role,
@@ -314,7 +333,7 @@ pub struct Connection<
     pub(crate) flow_control: FlowController,
 
     // Crypto frame reassembly buffers (one per level: Initial, Handshake, Application)
-    pub(crate) crypto_reasm: [recv::CryptoReassemblyBuf; 3],
+    pub(crate) crypto_reasm: [recv::CryptoReassemblyBuf<CRYPTO_BUF>; 3],
 
     // Crypto send offsets (tracks how many bytes we've sent per level)
     pub(crate) crypto_send_offset: [u64; 3],
@@ -355,10 +374,10 @@ pub struct Connection<
     pub(crate) need_handshake_done: bool,
 
     // Stream send queue
-    pub(crate) stream_send_queue: heapless::Vec<StreamSendEntry, 16>,
+    pub(crate) stream_send_queue: heapless::Vec<StreamSendEntry<STREAM_BUF>, SEND_QUEUE>,
 
     // Stream receive buffers (simple, indexed by position)
-    pub(crate) stream_recv_bufs: [Option<StreamRecvBuf>; MAX_STREAMS],
+    pub(crate) stream_recv_bufs: [Option<StreamRecvBuf<STREAM_BUF>>; MAX_STREAMS],
 
     // PATH_RESPONSE pending data (RFC 9000 §8.2.2)
     pub(crate) pending_path_response: Option<[u8; 8]>,
@@ -371,8 +390,8 @@ pub struct Connection<
     pub(crate) address_validated: bool,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
 where
     C::Hkdf: Default,
 {
@@ -594,7 +613,7 @@ where
 
         // Limit data to available capacity
         let max_send = (send.max_data - send.offset) as usize;
-        let send_len = data.len().min(max_send).min(1024);
+        let send_len = data.len().min(max_send).min(STREAM_BUF);
 
         if send_len == 0 && !fin {
             return Ok(0);
@@ -607,7 +626,7 @@ where
         let mut entry = StreamSendEntry {
             stream_id,
             offset,
-            data: [0u8; 1024],
+            data: [0u8; STREAM_BUF],
             len: send_len,
             fin,
         };
@@ -769,7 +788,7 @@ where
             if self.stream_recv_bufs[idx].is_none() {
                 self.stream_recv_bufs[idx] = Some(StreamRecvBuf {
                     stream_id,
-                    data: [0u8; 1024],
+                    data: [0u8; STREAM_BUF],
                     len: 0,
                     read_offset: 0,
                     fin_received: false,
@@ -800,7 +819,7 @@ where
                 // We need to skip the bytes we already have.
                 let skip = (buf.next_offset - offset) as usize;
                 let new_data = &data[skip..];
-                let copy_len = new_data.len().min(1024 - buf.len);
+                let copy_len = new_data.len().min(STREAM_BUF - buf.len);
                 buf.data[buf.len..buf.len + copy_len].copy_from_slice(&new_data[..copy_len]);
                 buf.len += copy_len;
                 buf.next_offset += copy_len as u64;
@@ -2244,5 +2263,105 @@ mod tests {
                 "server should send an ACK for the client's Initial"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stack footprint audit
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn size_of_connection_and_fields() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+        use crate::crypto::DirectionalKeys;
+        use crate::crypto::rustcrypto::{Aes128GcmAead, AesHeaderProtection};
+        use crate::connection::keys::{ConnectionKeys, KeyUpdateState};
+        use crate::connection::recv::CryptoReassemblyBuf;
+        use crate::tls::handshake::TlsEngine;
+        use crate::tls::transport_params::TransportParams;
+        use crate::transport::congestion::CongestionController;
+        use crate::transport::flow_control::FlowController;
+        use crate::transport::loss::LossDetector;
+        use crate::transport::recovery::SentPacketTracker;
+        use crate::transport::stream::StreamMap;
+
+        // Default configuration
+        type ConnDefault = Connection<Aes128GcmProvider>;
+        // Minimal embedded configuration
+        type ConnMinimal = Connection<Aes128GcmProvider, 4, 32, 2, 256, 4, 2048>;
+
+        let total_default = core::mem::size_of::<ConnDefault>();
+        let total_minimal = core::mem::size_of::<ConnMinimal>();
+
+        std::eprintln!("=== Connection stack footprint comparison ===");
+        std::eprintln!();
+        std::eprintln!("Default  (Connection<P>):                                  {} bytes ({:.1} KiB)", total_default, total_default as f64 / 1024.0);
+        std::eprintln!("Minimal  (Connection<P, 4, 32, 2, 256, 4, 2048>):          {} bytes ({:.1} KiB)", total_minimal, total_minimal as f64 / 1024.0);
+        std::eprintln!("Savings: {} bytes ({:.1} KiB, {:.0}%)", total_default - total_minimal, (total_default - total_minimal) as f64 / 1024.0, (1.0 - total_minimal as f64 / total_default as f64) * 100.0);
+        std::eprintln!();
+
+        std::eprintln!("--- Field-level breakdown (default config) ---");
+        std::eprintln!("  state (ConnectionState): {} bytes", core::mem::size_of::<ConnectionState>());
+        std::eprintln!("  role (Role): {} bytes", core::mem::size_of::<crate::tls::handshake::Role>());
+        std::eprintln!("  crypto (Aes128GcmProvider): {} bytes", core::mem::size_of::<Aes128GcmProvider>());
+        std::eprintln!("  keys (ConnectionKeys<Aes128GcmProvider>): {} bytes", core::mem::size_of::<ConnectionKeys<Aes128GcmProvider>>());
+        std::eprintln!("  tls (TlsEngine<Aes128GcmProvider>): {} bytes", core::mem::size_of::<TlsEngine<Aes128GcmProvider>>());
+        std::eprintln!("  streams (StreamMap<32>): {} bytes", core::mem::size_of::<StreamMap<32>>());
+        std::eprintln!("  sent_tracker (SentPacketTracker<128>): {} bytes", core::mem::size_of::<SentPacketTracker<128>>());
+        std::eprintln!("  loss_detector (LossDetector): {} bytes", core::mem::size_of::<LossDetector>());
+        std::eprintln!("  congestion (CongestionController): {} bytes", core::mem::size_of::<CongestionController>());
+        std::eprintln!("  flow_control (FlowController): {} bytes", core::mem::size_of::<FlowController>());
+        std::eprintln!("  crypto_reasm ([CryptoReassemblyBuf<4096>; 3]): {} bytes", core::mem::size_of::<[CryptoReassemblyBuf<4096>; 3]>());
+        std::eprintln!("    single CryptoReassemblyBuf<4096>: {} bytes", core::mem::size_of::<CryptoReassemblyBuf<4096>>());
+        std::eprintln!("    single CryptoReassemblyBuf<2048>: {} bytes", core::mem::size_of::<CryptoReassemblyBuf<2048>>());
+        std::eprintln!("  crypto_send_offset ([u64; 3]): {} bytes", core::mem::size_of::<[u64; 3]>());
+        std::eprintln!("  pending_crypto ([heapless::Vec<u8, 2048>; 3]): {} bytes", core::mem::size_of::<[heapless::Vec<u8, 2048>; 3]>());
+        std::eprintln!("    single heapless::Vec<u8, 2048>: {} bytes", core::mem::size_of::<heapless::Vec<u8, 2048>>());
+        std::eprintln!("  pending_crypto_level ([Level; 3]): {} bytes", core::mem::size_of::<[crate::crypto::Level; 3]>());
+        std::eprintln!("  local_cids (heapless::Vec<ConnectionId, 4>): {} bytes", core::mem::size_of::<heapless::Vec<ConnectionId, 4>>());
+        std::eprintln!("    single ConnectionId: {} bytes", core::mem::size_of::<ConnectionId>());
+        std::eprintln!("  remote_cid (ConnectionId): {} bytes", core::mem::size_of::<ConnectionId>());
+        std::eprintln!("  next_pn ([u64; 3]): {} bytes", core::mem::size_of::<[u64; 3]>());
+        std::eprintln!("  largest_recv_pn ([Option<u64>; 3]): {} bytes", core::mem::size_of::<[Option<u64>; 3]>());
+        std::eprintln!("  recv_pn_tracker ([RecvPnTracker; 3]): {} bytes", core::mem::size_of::<[RecvPnTracker; 3]>());
+        std::eprintln!("    single RecvPnTracker: {} bytes", core::mem::size_of::<RecvPnTracker>());
+        std::eprintln!("  ack_eliciting_received ([bool; 3]): {} bytes", core::mem::size_of::<[bool; 3]>());
+        std::eprintln!("  local_params (TransportParams): {} bytes", core::mem::size_of::<TransportParams>());
+        std::eprintln!("  peer_params (Option<TransportParams>): {} bytes", core::mem::size_of::<Option<TransportParams>>());
+        std::eprintln!("  events (heapless::Deque<Event, 16>): {} bytes", core::mem::size_of::<heapless::Deque<Event, 16>>());
+        std::eprintln!("    single Event: {} bytes", core::mem::size_of::<Event>());
+        std::eprintln!("  close_frame (Option<(u64, heapless::Vec<u8, 64>)>): {} bytes", core::mem::size_of::<Option<(u64, heapless::Vec<u8, 64>)>>());
+        std::eprintln!("  idle_timeout (Option<u64>): {} bytes", core::mem::size_of::<Option<u64>>());
+        std::eprintln!("  last_activity (Instant/u64): {} bytes", core::mem::size_of::<crate::transport::Instant>());
+        std::eprintln!("  need_handshake_done (bool): {} bytes", core::mem::size_of::<bool>());
+        std::eprintln!("  stream_send_queue (heapless::Vec<StreamSendEntry<1024>, 16>): {} bytes", core::mem::size_of::<heapless::Vec<StreamSendEntry<1024>, 16>>());
+        std::eprintln!("    single StreamSendEntry<1024>: {} bytes", core::mem::size_of::<StreamSendEntry<1024>>());
+        std::eprintln!("    single StreamSendEntry<256>: {} bytes", core::mem::size_of::<StreamSendEntry<256>>());
+        std::eprintln!("  stream_recv_bufs ([Option<StreamRecvBuf<1024>>; 32]): {} bytes", core::mem::size_of::<[Option<StreamRecvBuf<1024>>; 32]>());
+        std::eprintln!("    single Option<StreamRecvBuf<1024>>: {} bytes", core::mem::size_of::<Option<StreamRecvBuf<1024>>>());
+        std::eprintln!("    single StreamRecvBuf<1024>: {} bytes", core::mem::size_of::<StreamRecvBuf<1024>>());
+        std::eprintln!("    single StreamRecvBuf<256>: {} bytes", core::mem::size_of::<StreamRecvBuf<256>>());
+        std::eprintln!("  pending_path_response (Option<[u8; 8]>): {} bytes", core::mem::size_of::<Option<[u8; 8]>>());
+        std::eprintln!("  anti_amplification_bytes_received (usize): {} bytes", core::mem::size_of::<usize>());
+        std::eprintln!("  anti_amplification_bytes_sent (usize): {} bytes", core::mem::size_of::<usize>());
+        std::eprintln!("  address_validated (bool): {} bytes", core::mem::size_of::<bool>());
+        std::eprintln!();
+
+        std::eprintln!("--- Parameterized buffer size impact ---");
+        std::eprintln!("  stream_send_queue (Vec<StreamSendEntry<256>, 4>): {} bytes", core::mem::size_of::<heapless::Vec<StreamSendEntry<256>, 4>>());
+        std::eprintln!("  stream_recv_bufs ([Option<StreamRecvBuf<256>>; 4]): {} bytes", core::mem::size_of::<[Option<StreamRecvBuf<256>>; 4]>());
+        std::eprintln!("  crypto_reasm ([CryptoReassemblyBuf<2048>; 3]): {} bytes", core::mem::size_of::<[CryptoReassemblyBuf<2048>; 3]>());
+        std::eprintln!();
+
+        std::eprintln!("--- Nested type details ---");
+        std::eprintln!("  DirectionalKeys<Aes128GcmAead, AesHeaderProtection>: {} bytes", core::mem::size_of::<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>());
+        std::eprintln!("  Option<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>: {} bytes", core::mem::size_of::<Option<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>>());
+        std::eprintln!("  KeyUpdateState<Aes128GcmProvider>: {} bytes", core::mem::size_of::<KeyUpdateState<Aes128GcmProvider>>());
+        std::eprintln!("  Aes128GcmAead: {} bytes", core::mem::size_of::<Aes128GcmAead>());
+        std::eprintln!("  AesHeaderProtection: {} bytes", core::mem::size_of::<AesHeaderProtection>());
+        std::eprintln!("  StreamState (transport::stream): {} bytes", core::mem::size_of::<crate::transport::stream::StreamState>());
+        std::eprintln!("  Option<StreamState>: {} bytes", core::mem::size_of::<Option<crate::transport::stream::StreamState>>());
+        std::eprintln!("  SentPacket: {} bytes", core::mem::size_of::<crate::transport::recovery::SentPacket>());
+        std::eprintln!("  Option<SentPacket>: {} bytes", core::mem::size_of::<Option<crate::transport::recovery::SentPacket>>());
     }
 }
