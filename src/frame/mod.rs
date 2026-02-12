@@ -1,7 +1,7 @@
-/// QUIC frame codec (RFC 9000 sections 12.4, 19).
-///
-/// Pure encode/decode -- no I/O, no state machines.  Frame data fields borrow
-/// from the caller-provided buffer (zero-copy).
+//! QUIC frame codec (RFC 9000 sections 12.4, 19).
+//!
+//! Pure encode/decode -- no I/O, no state machines.  Frame data fields borrow
+//! from the caller-provided buffer (zero-copy).
 
 use crate::error::{Error, TransportError};
 use crate::varint::{decode_varint, encode_varint};

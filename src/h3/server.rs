@@ -3,7 +3,7 @@
 //! Wraps a QUIC [`Connection`] as an HTTP/3 server capable of receiving
 //! requests and sending responses.
 
-use crate::connection::{Connection, ConnectionConfig, DefaultConfig, Transmit};
+use crate::connection::{Connection, Transmit};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
 use crate::Instant;
@@ -15,16 +15,22 @@ use super::connection::{H3Connection, H3Event};
 // ---------------------------------------------------------------------------
 
 /// An HTTP/3 server built on top of a QUIC connection.
-pub struct H3Server<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> {
-    inner: H3Connection<C, Cfg>,
+pub struct H3Server<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize = 32,
+    const SENT_PER_SPACE: usize = 128,
+    const MAX_CIDS: usize = 4,
+> {
+    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>,
 }
 
-impl<C: CryptoProvider, Cfg: ConnectionConfig> H3Server<C, Cfg>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
     /// Wrap a QUIC connection as an HTTP/3 server.
-    pub fn new(quic: Connection<C, Cfg>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>) -> Self {
         Self {
             inner: H3Connection::new(quic),
         }

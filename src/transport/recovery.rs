@@ -25,6 +25,12 @@ pub struct SentPacketTracker<const N: usize = 128> {
     count: usize,
 }
 
+impl<const N: usize> Default for SentPacketTracker<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> SentPacketTracker<N> {
     pub fn new() -> Self {
         Self {
@@ -130,13 +136,13 @@ impl<const N: usize> SentPacketTracker<N> {
     /// Remove a packet (after declaring it lost or acked).
     pub fn remove(&mut self, level: Level, pn: u64) -> Option<SentPacket> {
         for slot in self.entries.iter_mut() {
-            if let Some(pkt) = slot {
-                if pkt.level == level && pkt.pn == pn {
-                    let p = *pkt;
-                    *slot = None;
-                    self.count -= 1;
-                    return Some(p);
-                }
+            if let Some(pkt) = slot
+                && pkt.level == level && pkt.pn == pn
+            {
+                let p = *pkt;
+                *slot = None;
+                self.count -= 1;
+                return Some(p);
             }
         }
         None
@@ -145,11 +151,11 @@ impl<const N: usize> SentPacketTracker<N> {
     /// Drop all packets in a packet number space.
     pub fn drop_space(&mut self, level: Level) {
         for slot in self.entries.iter_mut() {
-            if let Some(pkt) = slot {
-                if pkt.level == level {
-                    *slot = None;
-                    self.count -= 1;
-                }
+            if let Some(pkt) = slot
+                && pkt.level == level
+            {
+                *slot = None;
+                self.count -= 1;
             }
         }
     }

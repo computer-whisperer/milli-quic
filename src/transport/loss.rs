@@ -68,9 +68,7 @@ impl LossDetector {
     pub fn update_rtt(&mut self, latest_rtt: u64, ack_delay: u64, handshake_confirmed: bool) {
         self.latest_rtt = latest_rtt;
 
-        if self.min_rtt == u64::MAX {
-            self.min_rtt = latest_rtt;
-        } else if latest_rtt < self.min_rtt {
+        if self.min_rtt == u64::MAX || latest_rtt < self.min_rtt {
             self.min_rtt = latest_rtt;
         }
 
@@ -95,11 +93,7 @@ impl LossDetector {
                 };
 
                 // EWMA update.
-                let rttvar_sample = if srtt > adjusted_rtt {
-                    srtt - adjusted_rtt
-                } else {
-                    adjusted_rtt - srtt
-                };
+                let rttvar_sample = srtt.abs_diff(adjusted_rtt);
                 self.rttvar = (3 * self.rttvar + rttvar_sample) / 4;
                 self.smoothed_rtt = Some((7 * srtt + adjusted_rtt) / 8);
             }

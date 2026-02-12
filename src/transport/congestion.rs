@@ -55,10 +55,10 @@ impl CongestionController {
         self.remove_from_flight(bytes);
 
         // Don't increase cwnd if the packet was sent during a previous recovery period.
-        if let Some(recovery_start) = self.recovery_start_time {
-            if sent_time <= recovery_start {
-                return;
-            }
+        if let Some(recovery_start) = self.recovery_start_time
+            && sent_time <= recovery_start
+        {
+            return;
         }
 
         if self.in_slow_start() {

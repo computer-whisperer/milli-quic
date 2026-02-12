@@ -4,7 +4,7 @@
 //! the HTTP/3 client ([`super::client::H3Client`]) and server
 //! ([`super::server::H3Server`]).
 
-use crate::connection::{Connection, ConnectionConfig, DefaultConfig, Event};
+use crate::connection::{Connection, Event};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
 use crate::h3::frame::{decode_h3_frame, encode_h3_frame, H3Frame};
@@ -68,8 +68,13 @@ impl RequestStreamState {
 // ---------------------------------------------------------------------------
 
 /// State shared between H3 client and server.
-pub struct H3Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> {
-    pub(crate) quic: Connection<C, Cfg>,
+pub struct H3Connection<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize = 32,
+    const SENT_PER_SPACE: usize = 128,
+    const MAX_CIDS: usize = 4,
+> {
+    pub(crate) quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>,
 
     // Control streams
     pub(crate) local_control_stream: Option<u64>,
@@ -102,12 +107,13 @@ pub struct H3Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig
     pub(crate) pending_uni_streams: heapless::Vec<u64, 16>,
 }
 
-impl<C: CryptoProvider, Cfg: ConnectionConfig> H3Connection<C, Cfg>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
     /// Create a new H3Connection wrapping an underlying QUIC connection.
-    pub fn new(quic: Connection<C, Cfg>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>) -> Self {
         Self {
             quic,
             local_control_stream: None,
@@ -415,15 +421,14 @@ where
         }
 
         // If we received a FIN with the last read, mark it.
-        if fin {
-            if let Some(rs) = self
+        if fin
+            && let Some(rs) = self
                 .request_streams
                 .iter_mut()
                 .find(|rs| rs.stream_id == stream_id)
-            {
-                rs.fin_received = true;
-                let _ = self.h3_events.push_back(H3Event::Finished(stream_id));
-            }
+        {
+            rs.fin_received = true;
+            let _ = self.h3_events.push_back(H3Event::Finished(stream_id));
         }
 
         Ok(())

@@ -10,6 +10,12 @@ pub struct TranscriptHash {
     hasher: Sha256,
 }
 
+impl Default for TranscriptHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TranscriptHash {
     /// Create a new empty transcript hash.
     pub fn new() -> Self {

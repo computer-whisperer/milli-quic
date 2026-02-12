@@ -34,8 +34,8 @@ pub fn build_certificate_verify_content(
     let mut off = 0;
 
     // 64 bytes of 0x20
-    for i in 0..64 {
-        content[i] = 0x20;
+    for item in content.iter_mut().take(64) {
+        *item = 0x20;
     }
     off += 64;
 
@@ -286,12 +286,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    for i in 0..=(haystack.len() - needle.len()) {
-        if haystack[i..i + needle.len()] == *needle {
-            return Some(i);
-        }
-    }
-    None
+    (0..=(haystack.len() - needle.len())).find(|&i| haystack[i..i + needle.len()] == *needle)
 }
 
 #[cfg(test)]

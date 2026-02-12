@@ -8,12 +8,69 @@
 //! regardless of the negotiated cipher suite. The initial key fields
 //! therefore use concrete AES types instead of the generic `CryptoProvider`.
 
-use crate::crypto::{CryptoProvider, DirectionalKeys, Level};
+use crate::crypto::{Aead, CryptoProvider, DirectionalKeys, Level};
 use crate::error::Error;
 use crate::tls::DerivedKeys;
 
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 use crate::crypto::rustcrypto::{Aes128GcmAead, AesHeaderProtection};
+
+/// State for QUIC Key Update (RFC 9001 section 6).
+///
+/// Tracks traffic secrets so we can derive next-generation keys, and holds
+/// the previous read key for decrypting packets from the old key phase
+/// during a transition period.
+///
+/// Per RFC 9001 section 6, header protection keys do NOT change during
+/// key updates. Only the AEAD key and IV are rotated. We store the
+/// original HP key material so we can reconstruct the HP objects for
+/// new `DirectionalKeys` instances.
+pub struct KeyUpdateState<C: CryptoProvider> {
+    /// Current key phase bit (0 or 1). Flips on each key update.
+    pub key_phase: u8,
+    /// Current send traffic secret (needed to derive next generation).
+    pub send_secret: [u8; 48],
+    /// Current recv traffic secret (needed to derive next generation).
+    pub recv_secret: [u8; 48],
+    /// Length of the traffic secrets (32 for SHA-256, 48 for SHA-384).
+    pub secret_len: usize,
+    /// Original send HP key bytes (never changes after initial installation).
+    pub send_hp_key: [u8; 32],
+    /// Original recv HP key bytes (never changes after initial installation).
+    pub recv_hp_key: [u8; 32],
+    /// Length of HP key (16 for AES, 32 for ChaCha20).
+    pub hp_key_len: usize,
+    /// Previous-generation read AEAD key, for decrypting packets still
+    /// encrypted with the old key phase during a transition.
+    pub prev_recv_key: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
+    /// Whether we have received a packet with the new key phase from the peer
+    /// (i.e., the current key update is confirmed). A new key update MUST NOT
+    /// be initiated until this is true.
+    pub update_confirmed: bool,
+}
+
+impl<C: CryptoProvider> Default for KeyUpdateState<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: CryptoProvider> KeyUpdateState<C> {
+    /// Create a new key update state (not yet initialized).
+    pub fn new() -> Self {
+        Self {
+            key_phase: 0,
+            send_secret: [0u8; 48],
+            recv_secret: [0u8; 48],
+            secret_len: 0,
+            send_hp_key: [0u8; 32],
+            recv_hp_key: [0u8; 32],
+            hp_key_len: 0,
+            prev_recv_key: None,
+            update_confirmed: true, // No pending update initially
+        }
+    }
+}
 
 /// All keys for a QUIC connection, separated by level and direction.
 pub struct ConnectionKeys<C: CryptoProvider> {
@@ -31,6 +88,14 @@ pub struct ConnectionKeys<C: CryptoProvider> {
     pub handshake_recv: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
     pub app_send: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
     pub app_recv: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
+    /// Key update state for 1-RTT keys (RFC 9001 section 6).
+    pub key_update: KeyUpdateState<C>,
+}
+
+impl<C: CryptoProvider> Default for ConnectionKeys<C> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<C: CryptoProvider> ConnectionKeys<C> {
@@ -47,6 +112,7 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             handshake_recv: None,
             app_send: None,
             app_recv: None,
+            key_update: KeyUpdateState::new(),
         }
     }
 
@@ -118,6 +184,37 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             Level::Application => {
                 self.app_send = Some(send_keys);
                 self.app_recv = Some(recv_keys);
+                // Save traffic secrets for key update derivation (RFC 9001 section 6)
+                self.key_update.send_secret[..derived.secret_len]
+                    .copy_from_slice(&derived.send_secret[..derived.secret_len]);
+                self.key_update.recv_secret[..derived.secret_len]
+                    .copy_from_slice(&derived.recv_secret[..derived.secret_len]);
+                self.key_update.secret_len = derived.secret_len;
+                self.key_update.key_phase = 0;
+                self.key_update.update_confirmed = true;
+
+                // Save the initial HP key bytes. Per RFC 9001 section 6, header
+                // protection keys do NOT change during key updates.
+                let hp_key_len = core::cmp::max(C::Aead::KEY_LEN, 16);
+                let mut send_hp = [0u8; 32];
+                let mut recv_hp = [0u8; 32];
+                crate::crypto::key_schedule::hkdf_expand_label(
+                    &hkdf,
+                    &derived.send_secret[..derived.secret_len],
+                    b"quic hp",
+                    &[],
+                    &mut send_hp[..hp_key_len],
+                )?;
+                crate::crypto::key_schedule::hkdf_expand_label(
+                    &hkdf,
+                    &derived.recv_secret[..derived.secret_len],
+                    b"quic hp",
+                    &[],
+                    &mut recv_hp[..hp_key_len],
+                )?;
+                self.key_update.send_hp_key = send_hp;
+                self.key_update.recv_hp_key = recv_hp;
+                self.key_update.hp_key_len = hp_key_len;
             }
             Level::Initial => {
                 // Initial keys are derived via derive_initial() with AES-128-GCM.
@@ -207,6 +304,236 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             Level::Initial => false,
             _ => self.recv_keys(level).is_some(),
         }
+    }
+
+    /// Get the current key phase bit (0 or 1) for 1-RTT packets.
+    pub fn key_phase(&self) -> u8 {
+        self.key_update.key_phase
+    }
+
+    /// Check if a key update can be initiated.
+    ///
+    /// A key update MUST NOT be initiated before the previous one is confirmed
+    /// (i.e., we have received a packet with the new key phase from the peer).
+    /// Also requires that application keys are installed.
+    pub fn can_initiate_key_update(&self) -> bool {
+        self.app_send.is_some()
+            && self.app_recv.is_some()
+            && self.key_update.update_confirmed
+            && self.key_update.secret_len > 0
+    }
+
+    /// Derive a `DirectionalKeys` for key update, keeping the original HP key.
+    ///
+    /// Per RFC 9001 section 6, header protection keys do NOT change during key
+    /// updates. This derives only the AEAD key and IV from the new secret, then
+    /// reconstructs the HP object from the stored original HP key bytes.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn derive_key_update_keys(
+        &self,
+        provider: &C,
+        secret: &[u8],
+        hp_key: &[u8],
+    ) -> Result<DirectionalKeys<C::Aead, C::HeaderProtection>, Error> {
+        let hkdf = provider.hkdf();
+
+        let mut key_buf = [0u8; 32];
+        let mut iv = [0u8; 12];
+        let key_len = C::Aead::KEY_LEN;
+
+        crate::crypto::key_schedule::hkdf_expand_label(
+            &hkdf, secret, b"quic key", &[], &mut key_buf[..key_len],
+        )?;
+        crate::crypto::key_schedule::hkdf_expand_label(
+            &hkdf, secret, b"quic iv", &[], &mut iv,
+        )?;
+
+        let aead = provider.aead(&key_buf[..key_len])?;
+        // Re-create HP from the ORIGINAL HP key (unchanged across key updates)
+        let header_protection = provider.header_protection(hp_key)?;
+
+        Ok(DirectionalKeys {
+            aead,
+            header_protection,
+            iv,
+        })
+    }
+
+    /// Perform a key update: derive next-generation application keys.
+    ///
+    /// This rotates:
+    ///   current recv -> prev_recv (for decrypting late packets from old phase)
+    ///   new send/recv keys derived from updated traffic secrets
+    ///   key_phase bit flipped
+    ///
+    /// Per RFC 9001 section 6.1:
+    ///   new_secret = HKDF-Expand-Label(current_secret, "quic ku", "", Hash.length)
+    ///
+    /// Per RFC 9001 section 6, header protection keys do NOT change.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub fn perform_key_update(&mut self, provider: &C) -> Result<(), Error> {
+        if !self.can_initiate_key_update() {
+            return Err(Error::Transport(crate::error::TransportError::KeyUpdateError));
+        }
+
+        let hkdf = provider.hkdf();
+        let secret_len = self.key_update.secret_len;
+        let hp_key_len = self.key_update.hp_key_len;
+
+        // Derive next-generation send secret
+        let mut new_send_secret = [0u8; 48];
+        crate::crypto::key_schedule::derive_next_application_secret(
+            &hkdf,
+            &self.key_update.send_secret[..secret_len],
+            &mut new_send_secret[..secret_len],
+        )?;
+
+        // Derive next-generation recv secret
+        let mut new_recv_secret = [0u8; 48];
+        crate::crypto::key_schedule::derive_next_application_secret(
+            &hkdf,
+            &self.key_update.recv_secret[..secret_len],
+            &mut new_recv_secret[..secret_len],
+        )?;
+
+        // Derive new directional keys with ORIGINAL HP keys preserved
+        let new_send_keys = self.derive_key_update_keys(
+            provider,
+            &new_send_secret[..secret_len],
+            &self.key_update.send_hp_key[..hp_key_len],
+        )?;
+        let new_recv_keys = self.derive_key_update_keys(
+            provider,
+            &new_recv_secret[..secret_len],
+            &self.key_update.recv_hp_key[..hp_key_len],
+        )?;
+
+        // Rotate: current recv -> prev_recv
+        let old_recv = self.app_recv.take();
+        self.key_update.prev_recv_key = old_recv;
+
+        // Install new keys
+        self.app_send = Some(new_send_keys);
+        self.app_recv = Some(new_recv_keys);
+
+        // Update secrets
+        self.key_update.send_secret[..secret_len]
+            .copy_from_slice(&new_send_secret[..secret_len]);
+        self.key_update.recv_secret[..secret_len]
+            .copy_from_slice(&new_recv_secret[..secret_len]);
+
+        // Flip key phase
+        self.key_update.key_phase ^= 1;
+
+        // Mark as not yet confirmed (waiting for peer acknowledgment)
+        self.key_update.update_confirmed = false;
+
+        Ok(())
+    }
+
+    /// Handle reception of a packet with a different key phase from the peer.
+    ///
+    /// This derives the next-generation recv key, attempts to decrypt with it,
+    /// and if successful, rotates keys. The caller should use this when the
+    /// key_phase bit in a received short header differs from `self.key_phase`.
+    ///
+    /// Returns the new recv directional keys for the caller to attempt decryption.
+    /// If decryption succeeds, the caller must call `confirm_peer_key_update`.
+    ///
+    /// HP keys are preserved (RFC 9001 section 6: HP keys don't change).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub fn derive_next_recv_keys(
+        &self,
+        provider: &C,
+    ) -> Result<DirectionalKeys<C::Aead, C::HeaderProtection>, Error> {
+        let hkdf = provider.hkdf();
+        let secret_len = self.key_update.secret_len;
+        let hp_key_len = self.key_update.hp_key_len;
+        if secret_len == 0 {
+            return Err(Error::Crypto);
+        }
+
+        // Derive next recv secret
+        let mut new_recv_secret = [0u8; 48];
+        crate::crypto::key_schedule::derive_next_application_secret(
+            &hkdf,
+            &self.key_update.recv_secret[..secret_len],
+            &mut new_recv_secret[..secret_len],
+        )?;
+
+        self.derive_key_update_keys(
+            provider,
+            &new_recv_secret[..secret_len],
+            &self.key_update.recv_hp_key[..hp_key_len],
+        )
+    }
+
+    /// Confirm a peer-initiated key update after successful decryption.
+    ///
+    /// This completes the key rotation: installs the new recv keys,
+    /// derives and installs new send keys, flips the key phase, and
+    /// moves the old recv key to prev_recv.
+    ///
+    /// HP keys are preserved (RFC 9001 section 6: HP keys don't change).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub fn confirm_peer_key_update(
+        &mut self,
+        provider: &C,
+        new_recv_keys: DirectionalKeys<C::Aead, C::HeaderProtection>,
+    ) -> Result<(), Error> {
+        let hkdf = provider.hkdf();
+        let secret_len = self.key_update.secret_len;
+        let hp_key_len = self.key_update.hp_key_len;
+
+        // Derive updated send and recv secrets
+        let mut new_send_secret = [0u8; 48];
+        crate::crypto::key_schedule::derive_next_application_secret(
+            &hkdf,
+            &self.key_update.send_secret[..secret_len],
+            &mut new_send_secret[..secret_len],
+        )?;
+
+        let mut new_recv_secret = [0u8; 48];
+        crate::crypto::key_schedule::derive_next_application_secret(
+            &hkdf,
+            &self.key_update.recv_secret[..secret_len],
+            &mut new_recv_secret[..secret_len],
+        )?;
+
+        // Derive new send keys with ORIGINAL HP key preserved
+        let new_send_keys = self.derive_key_update_keys(
+            provider,
+            &new_send_secret[..secret_len],
+            &self.key_update.send_hp_key[..hp_key_len],
+        )?;
+
+        // Rotate: current recv -> prev_recv
+        let old_recv = self.app_recv.take();
+        self.key_update.prev_recv_key = old_recv;
+
+        // Install new keys
+        self.app_send = Some(new_send_keys);
+        self.app_recv = Some(new_recv_keys);
+
+        // Update secrets
+        self.key_update.send_secret[..secret_len]
+            .copy_from_slice(&new_send_secret[..secret_len]);
+        self.key_update.recv_secret[..secret_len]
+            .copy_from_slice(&new_recv_secret[..secret_len]);
+
+        // Flip key phase
+        self.key_update.key_phase ^= 1;
+
+        // Peer-initiated key update is immediately confirmed
+        self.key_update.update_confirmed = true;
+
+        Ok(())
+    }
+
+    /// Get the previous-generation recv keys, for decrypting late packets
+    /// that were encrypted with the old key phase.
+    pub fn prev_recv_keys(&self) -> Option<&DirectionalKeys<C::Aead, C::HeaderProtection>> {
+        self.key_update.prev_recv_key.as_ref()
     }
 }
 
@@ -352,5 +679,351 @@ mod tests {
         let nonce = recv.nonce(0);
         let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
         assert_eq!(&buf[..pt_len], plaintext);
+    }
+
+    // =====================================================================
+    // Key Update tests (RFC 9001 section 6)
+    // =====================================================================
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    mod key_update_tests {
+        use super::*;
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        /// Helper: install fake application keys with known secrets.
+        fn make_keys_with_app(
+            send_secret: &[u8; 32],
+            recv_secret: &[u8; 32],
+        ) -> ConnectionKeys<Aes128GcmProvider> {
+            let provider = Aes128GcmProvider;
+            let mut keys = ConnectionKeys::<Aes128GcmProvider>::new();
+
+            let mut ss = [0u8; 48];
+            ss[..32].copy_from_slice(send_secret);
+            let mut rs = [0u8; 48];
+            rs[..32].copy_from_slice(recv_secret);
+
+            let derived = DerivedKeys {
+                level: Level::Application,
+                send_secret: ss,
+                recv_secret: rs,
+                secret_len: 32,
+            };
+            keys.install_derived(&provider, &derived).unwrap();
+            keys
+        }
+
+        #[test]
+        fn key_phase_starts_at_zero() {
+            let keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+            assert_eq!(keys.key_phase(), 0);
+        }
+
+        #[test]
+        fn can_initiate_key_update_after_app_keys_installed() {
+            let keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+            assert!(keys.can_initiate_key_update());
+        }
+
+        #[test]
+        fn cannot_initiate_without_app_keys() {
+            let keys = ConnectionKeys::<Aes128GcmProvider>::new();
+            assert!(!keys.can_initiate_key_update());
+        }
+
+        #[test]
+        fn perform_key_update_flips_phase() {
+            let provider = Aes128GcmProvider;
+            let mut keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+            assert_eq!(keys.key_phase(), 0);
+
+            keys.perform_key_update(&provider).unwrap();
+            assert_eq!(keys.key_phase(), 1);
+        }
+
+        #[test]
+        fn perform_key_update_rotates_recv_to_prev() {
+            let provider = Aes128GcmProvider;
+            let mut keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+
+            // Before key update: no prev recv key
+            assert!(keys.prev_recv_keys().is_none());
+
+            // Save the old recv IV for comparison
+            let old_recv_iv = keys.app_recv.as_ref().unwrap().iv;
+
+            keys.perform_key_update(&provider).unwrap();
+
+            // After key update: prev recv key has the old IV
+            let prev = keys.prev_recv_keys().unwrap();
+            assert_eq!(prev.iv, old_recv_iv);
+
+            // New recv key has a different IV
+            let new_recv_iv = keys.app_recv.as_ref().unwrap().iv;
+            assert_ne!(new_recv_iv, old_recv_iv);
+        }
+
+        #[test]
+        fn second_key_update_blocked_until_confirmed() {
+            let provider = Aes128GcmProvider;
+            let mut keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+
+            keys.perform_key_update(&provider).unwrap();
+            assert!(!keys.key_update.update_confirmed);
+
+            // Second update should fail
+            let result = keys.perform_key_update(&provider);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn second_key_update_succeeds_after_confirmed() {
+            let provider = Aes128GcmProvider;
+            let mut keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+
+            keys.perform_key_update(&provider).unwrap();
+            assert_eq!(keys.key_phase(), 1);
+
+            // Simulate peer confirmation
+            keys.key_update.update_confirmed = true;
+
+            keys.perform_key_update(&provider).unwrap();
+            assert_eq!(keys.key_phase(), 0); // Flipped back
+        }
+
+        #[test]
+        fn key_update_produces_different_keys() {
+            let provider = Aes128GcmProvider;
+            let mut keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+
+            let old_send_iv = keys.app_send.as_ref().unwrap().iv;
+            let old_recv_iv = keys.app_recv.as_ref().unwrap().iv;
+
+            keys.perform_key_update(&provider).unwrap();
+
+            let new_send_iv = keys.app_send.as_ref().unwrap().iv;
+            let new_recv_iv = keys.app_recv.as_ref().unwrap().iv;
+
+            assert_ne!(old_send_iv, new_send_iv);
+            assert_ne!(old_recv_iv, new_recv_iv);
+        }
+
+        #[test]
+        fn key_update_encrypt_decrypt_roundtrip() {
+            let provider = Aes128GcmProvider;
+
+            // Client and server have complementary keys
+            let send_secret = [0xAA; 32];
+            let recv_secret = [0xBB; 32];
+
+            // Client: send=AA, recv=BB
+            let mut client_keys = make_keys_with_app(&send_secret, &recv_secret);
+            // Server: send=BB, recv=AA (swapped)
+            let mut server_keys = make_keys_with_app(&recv_secret, &send_secret);
+
+            // Before key update: client encrypts, server decrypts
+            let plaintext = b"hello before key update";
+            let aad = b"header";
+            let mut buf = [0u8; 128];
+            buf[..plaintext.len()].copy_from_slice(plaintext);
+
+            let send = client_keys.app_send.as_ref().unwrap();
+            let nonce = send.nonce(0);
+            let ct_len = send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+
+            let recv = server_keys.app_recv.as_ref().unwrap();
+            let nonce = recv.nonce(0);
+            let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            assert_eq!(&buf[..pt_len], plaintext);
+
+            // Client initiates key update
+            client_keys.perform_key_update(&provider).unwrap();
+            // Server also performs matching key update (peer-initiated)
+            server_keys.perform_key_update(&provider).unwrap();
+
+            // After key update: client encrypts with new keys, server decrypts
+            let plaintext2 = b"hello after key update";
+            buf = [0u8; 128];
+            buf[..plaintext2.len()].copy_from_slice(plaintext2);
+
+            let send = client_keys.app_send.as_ref().unwrap();
+            let nonce = send.nonce(1);
+            let ct_len = send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext2.len()).unwrap();
+
+            let recv = server_keys.app_recv.as_ref().unwrap();
+            let nonce = recv.nonce(1);
+            let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            assert_eq!(&buf[..pt_len], plaintext2);
+        }
+
+        #[test]
+        fn old_phase_packet_decrypts_with_prev_key() {
+            let provider = Aes128GcmProvider;
+
+            let send_secret = [0xCC; 32];
+            let recv_secret = [0xDD; 32];
+
+            let mut keys = make_keys_with_app(&send_secret, &recv_secret);
+
+            // Encrypt a packet with the current (generation 0) recv key
+            let plaintext = b"old phase packet";
+            let aad = b"header";
+            let mut buf = [0u8; 128];
+            buf[..plaintext.len()].copy_from_slice(plaintext);
+
+            // The "remote" side would use their send key which is our recv secret
+            let recv = keys.app_recv.as_ref().unwrap();
+            let nonce = recv.nonce(42);
+            // Encrypt using what would be the sender's key (which matches our recv key)
+            let ct_len = recv.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+
+            // Now perform a key update
+            keys.perform_key_update(&provider).unwrap();
+
+            // The old key should now be in prev_recv
+            let prev = keys.prev_recv_keys().unwrap();
+            let nonce = prev.nonce(42);
+            let pt_len = prev.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            assert_eq!(&buf[..pt_len], plaintext);
+        }
+
+        #[test]
+        fn derive_next_recv_keys_matches_peer_send() {
+            let provider = Aes128GcmProvider;
+
+            let client_send = [0xEE; 32];
+            let client_recv = [0xFF; 32];
+
+            // Client has send=EE, recv=FF
+            let client_keys = make_keys_with_app(&client_send, &client_recv);
+            // Server has send=FF, recv=EE
+            let mut server_keys = make_keys_with_app(&client_recv, &client_send);
+
+            // Server performs key update (this updates server's send and recv)
+            server_keys.perform_key_update(&provider).unwrap();
+
+            // Client derives next recv keys (which should match server's new send keys)
+            let next_recv = client_keys.derive_next_recv_keys(&provider).unwrap();
+
+            // Test: server encrypts with new send key, client decrypts with derived next recv
+            let plaintext = b"peer key update test";
+            let aad = b"hdr";
+            let mut buf = [0u8; 128];
+            buf[..plaintext.len()].copy_from_slice(plaintext);
+
+            let server_send = server_keys.app_send.as_ref().unwrap();
+            let nonce = server_send.nonce(0);
+            let ct_len = server_send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+
+            let nonce = next_recv.nonce(0);
+            let pt_len = next_recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            assert_eq!(&buf[..pt_len], plaintext);
+        }
+
+        #[test]
+        fn confirm_peer_key_update_rotates_correctly() {
+            let provider = Aes128GcmProvider;
+
+            let client_send = [0x11; 32];
+            let client_recv = [0x22; 32];
+
+            let mut client_keys = make_keys_with_app(&client_send, &client_recv);
+            let mut server_keys = make_keys_with_app(&client_recv, &client_send);
+
+            // Server initiates key update
+            server_keys.perform_key_update(&provider).unwrap();
+            assert_eq!(server_keys.key_phase(), 1);
+
+            // Client detects the key phase change and derives next recv keys
+            let next_recv = client_keys.derive_next_recv_keys(&provider).unwrap();
+            // After successful decryption, client confirms the peer key update
+            client_keys.confirm_peer_key_update(&provider, next_recv).unwrap();
+
+            // Client's key phase should now be 1 (matching server)
+            assert_eq!(client_keys.key_phase(), 1);
+            // Client update is immediately confirmed (peer-initiated)
+            assert!(client_keys.key_update.update_confirmed);
+            // Previous recv key should exist
+            assert!(client_keys.prev_recv_keys().is_some());
+
+            // Now both sides should be able to communicate with the new keys
+            let plaintext = b"after peer key update";
+            let aad = b"hdr";
+            let mut buf = [0u8; 128];
+            buf[..plaintext.len()].copy_from_slice(plaintext);
+
+            let send = server_keys.app_send.as_ref().unwrap();
+            let nonce = send.nonce(0);
+            let ct_len = send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+
+            let recv = client_keys.app_recv.as_ref().unwrap();
+            let nonce = recv.nonce(0);
+            let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            assert_eq!(&buf[..pt_len], plaintext);
+        }
+
+        #[test]
+        fn secrets_are_updated_after_key_update() {
+            let provider = Aes128GcmProvider;
+            let mut keys = make_keys_with_app(&[0xAA; 32], &[0xBB; 32]);
+
+            let old_send_secret = keys.key_update.send_secret;
+            let old_recv_secret = keys.key_update.recv_secret;
+
+            keys.perform_key_update(&provider).unwrap();
+
+            // Secrets must have changed
+            assert_ne!(
+                &keys.key_update.send_secret[..32],
+                &old_send_secret[..32]
+            );
+            assert_ne!(
+                &keys.key_update.recv_secret[..32],
+                &old_recv_secret[..32]
+            );
+        }
+
+        #[test]
+        fn multiple_key_updates_chain_correctly() {
+            let provider = Aes128GcmProvider;
+
+            let client_send = [0xAA; 32];
+            let client_recv = [0xBB; 32];
+
+            let mut client_keys = make_keys_with_app(&client_send, &client_recv);
+            let mut server_keys = make_keys_with_app(&client_recv, &client_send);
+
+            // Perform 3 rounds of key updates
+            for expected_phase in [1u8, 0, 1] {
+                client_keys.perform_key_update(&provider).unwrap();
+                server_keys.perform_key_update(&provider).unwrap();
+
+                assert_eq!(client_keys.key_phase(), expected_phase);
+                assert_eq!(server_keys.key_phase(), expected_phase);
+
+                // Verify encryption/decryption still works each round
+                let plaintext = b"round data";
+                let aad = b"hdr";
+                let mut buf = [0u8; 128];
+                buf[..plaintext.len()].copy_from_slice(plaintext);
+
+                let send = client_keys.app_send.as_ref().unwrap();
+                let nonce = send.nonce(0);
+                let ct_len = send.aead.seal_in_place(
+                    &nonce, aad, &mut buf, plaintext.len(),
+                ).unwrap();
+
+                let recv = server_keys.app_recv.as_ref().unwrap();
+                let nonce = recv.nonce(0);
+                let pt_len = recv.aead.open_in_place(
+                    &nonce, aad, &mut buf, ct_len,
+                ).unwrap();
+                assert_eq!(&buf[..pt_len], plaintext);
+
+                // Simulate confirmation for next round
+                client_keys.key_update.update_confirmed = true;
+                server_keys.key_update.update_confirmed = true;
+            }
+        }
     }
 }

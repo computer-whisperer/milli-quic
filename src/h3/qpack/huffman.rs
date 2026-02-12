@@ -1,8 +1,8 @@
-/// QPACK/HPACK Huffman encoding and decoding (RFC 7541 Appendix B).
-///
-/// Implements the 257-symbol (256 bytes + EOS) Huffman code used by HPACK and
-/// QPACK for compressing header string literals.  All data structures are
-/// static const arrays -- no heap allocation is required.
+//! QPACK/HPACK Huffman encoding and decoding (RFC 7541 Appendix B).
+//!
+//! Implements the 257-symbol (256 bytes + EOS) Huffman code used by HPACK and
+//! QPACK for compressing header string literals.  All data structures are
+//! static const arrays -- no heap allocation is required.
 
 use crate::error::Error;
 
@@ -302,7 +302,7 @@ static HUFF_TABLE: [HuffSym; 257] = [
 /// larger.  The approach here uses a compact 256-entry lookup for short codes
 /// (5-8 bits) and falls back to linear scan for longer codes.  This is fine
 /// for an embedded/no_std context.
-
+///
 /// Decode a Huffman-encoded byte string.
 ///
 /// Reads Huffman-coded bits from `src`, writes decoded bytes into `buf`.
@@ -487,7 +487,7 @@ pub fn encoded_len(src: &[u8]) -> usize {
         total_bits += HUFF_TABLE[byte as usize].len as usize;
     }
     // Round up to the next byte boundary (padding)
-    (total_bits + 7) / 8
+    total_bits.div_ceil(8)
 }
 
 // ---------------------------------------------------------------------------

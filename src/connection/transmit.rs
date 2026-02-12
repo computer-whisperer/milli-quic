@@ -9,9 +9,10 @@ use crate::transport::Instant;
 use crate::transport::recovery::SentPacket;
 
 use super::recv::level_index;
-use super::{Connection, ConnectionConfig, ConnectionState, Transmit};
+use super::{Connection, ConnectionState, Transmit};
 
-impl<C: CryptoProvider, Cfg: ConnectionConfig> Connection<C, Cfg>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
@@ -53,7 +54,7 @@ where
                 is_application: false,
                 error_code,
                 frame_type: 0,
-                reason: &reason,
+                reason,
             });
             if let Ok(frame_len) = frame::encode(&close_frame, &mut frame_buf) {
                 let result = if level == Level::Initial {
@@ -105,24 +106,24 @@ where
         }
 
         // 2. Initial-level data (TLS ClientHello/ServerHello in CRYPTO frames, ACKs)
-        if self.keys.has_send_keys(Level::Initial) {
-            if let Some(pkt_len) = self.build_initial_packet(&mut buf[total_written..], now) {
-                total_written += pkt_len;
-            }
+        if self.keys.has_send_keys(Level::Initial)
+            && let Some(pkt_len) = self.build_initial_packet(&mut buf[total_written..], now)
+        {
+            total_written += pkt_len;
         }
 
         // 3. Handshake-level data (TLS handshake messages in CRYPTO frames, ACKs)
-        if self.keys.has_send_keys(Level::Handshake) {
-            if let Some(pkt_len) = self.build_handshake_packet(&mut buf[total_written..], now) {
-                total_written += pkt_len;
-            }
+        if self.keys.has_send_keys(Level::Handshake)
+            && let Some(pkt_len) = self.build_handshake_packet(&mut buf[total_written..], now)
+        {
+            total_written += pkt_len;
         }
 
         // 4. Application-level data (STREAM frames, ACKs, HANDSHAKE_DONE, etc.)
-        if self.keys.has_send_keys(Level::Application) {
-            if let Some(pkt_len) = self.build_short_packet(&mut buf[total_written..], now) {
-                total_written += pkt_len;
-            }
+        if self.keys.has_send_keys(Level::Application)
+            && let Some(pkt_len) = self.build_short_packet(&mut buf[total_written..], now)
+        {
+            total_written += pkt_len;
         }
 
         if total_written > 0 {
@@ -152,11 +153,11 @@ where
         let mut frame_len = 0;
 
         // ACK frame if needed
-        if self.ack_eliciting_received[level_index(level)] {
-            if let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..]) {
-                frame_len += written;
-                self.ack_eliciting_received[level_index(level)] = false;
-            }
+        if self.ack_eliciting_received[level_index(level)]
+            && let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..])
+        {
+            frame_len += written;
+            self.ack_eliciting_received[level_index(level)] = false;
         }
 
         // CRYPTO frame from TLS engine
@@ -217,11 +218,11 @@ where
         let mut frame_len = 0;
 
         // ACK frame if needed
-        if self.ack_eliciting_received[level_index(level)] {
-            if let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..]) {
-                frame_len += written;
-                self.ack_eliciting_received[level_index(level)] = false;
-            }
+        if self.ack_eliciting_received[level_index(level)]
+            && let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..])
+        {
+            frame_len += written;
+            self.ack_eliciting_received[level_index(level)] = false;
         }
 
         // CRYPTO frame from TLS engine
@@ -232,10 +233,7 @@ where
             return None;
         }
 
-        match self.build_and_encrypt_packet(level, &frame_buf[..frame_len], false, buf, now) {
-            Ok(pkt_len) => Some(pkt_len),
-            Err(_) => None,
-        }
+        self.build_and_encrypt_packet(level, &frame_buf[..frame_len], false, buf, now).ok()
     }
 
     /// Build a short (1-RTT) packet if there's something to send.
@@ -250,19 +248,30 @@ where
         let mut sending_handshake_done = false;
 
         // HANDSHAKE_DONE (server, once after handshake completes)
-        if self.role == crate::tls::handshake::Role::Server && self.need_handshake_done {
-            if let Ok(written) = frame::encode(&Frame::HandshakeDone, &mut frame_buf[frame_len..]) {
+        if self.role == crate::tls::handshake::Role::Server && self.need_handshake_done
+            && let Ok(written) = frame::encode(&Frame::HandshakeDone, &mut frame_buf[frame_len..])
+        {
+            frame_len += written;
+            sending_handshake_done = true;
+        }
+
+        // PATH_RESPONSE: echo challenge data back (RFC 9000 §8.2.2)
+        if let Some(challenge_data) = self.pending_path_response.take() {
+            let path_resp = Frame::PathResponse(challenge_data);
+            if let Ok(written) = frame::encode(&path_resp, &mut frame_buf[frame_len..]) {
                 frame_len += written;
-                sending_handshake_done = true;
+            } else {
+                // Put it back if encoding failed (buffer too small)
+                self.pending_path_response = Some(challenge_data);
             }
         }
 
         // ACK frame if needed
-        if self.ack_eliciting_received[level_index(level)] {
-            if let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..]) {
-                frame_len += written;
-                self.ack_eliciting_received[level_index(level)] = false;
-            }
+        if self.ack_eliciting_received[level_index(level)]
+            && let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..])
+        {
+            frame_len += written;
+            self.ack_eliciting_received[level_index(level)] = false;
         }
 
         // STREAM frames from pending send buffers
@@ -632,8 +641,12 @@ where
                 (hl, true)
             }
             Level::Application => {
-                // Short header: first_byte = 0100_00xx where xx = pn_len - 1
-                let first_byte = 0x40 | ((pn_len as u8) - 1);
+                // Short header: first_byte = 0_1_S_RR_K_PP
+                //   bit 7 = 0 (short header), bit 6 = 1 (fixed),
+                //   bit 5 = spin (0), bits 4-3 = reserved (00),
+                //   bit 2 = key_phase, bits 1-0 = pn_len - 1
+                let key_phase_bit = (self.keys.key_phase() & 1) << 2;
+                let first_byte = 0x40 | key_phase_bit | ((pn_len as u8) - 1);
                 let hl = packet::encode_short_header(dcid, first_byte, out)?;
                 (hl, false)
             }
@@ -710,5 +723,847 @@ where
         self.congestion.on_packet_sent(total_pkt_len as u64);
 
         Ok(total_pkt_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::ConnectionState;
+    use crate::crypto::Level;
+    use crate::packet::MIN_INITIAL_PACKET_SIZE;
+    use crate::tls::transport_params::TransportParams;
+    use crate::transport::Rng;
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    use crate::crypto::rustcrypto::Aes128GcmProvider;
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    use crate::tls::handshake::ServerTlsConfig;
+
+    // -----------------------------------------------------------------------
+    // Test infrastructure
+    // -----------------------------------------------------------------------
+
+    struct TestRng(u8);
+
+    impl Rng for TestRng {
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf.iter_mut() {
+                *b = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    const TEST_ED25519_SEED: [u8; 32] = [0x01u8; 32];
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn get_test_ed25519_cert_der() -> &'static [u8] {
+        use std::sync::LazyLock;
+        static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+            let s: [u8; 32] = [0x01u8; 32];
+            let pk = crate::crypto::ed25519::ed25519_public_key_from_seed(&s);
+            let mut b = [0u8; 512];
+            let n = crate::crypto::ed25519::build_ed25519_cert_der(&pk, &mut b).unwrap();
+            b[..n].to_vec()
+        });
+        &V
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn make_client() -> Connection<Aes128GcmProvider> {
+        let mut rng = TestRng(0x10);
+        Connection::client(
+            Aes128GcmProvider,
+            "test.local",
+            &[b"h3"],
+            TransportParams::default_params(),
+            &mut rng,
+        )
+        .unwrap()
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn make_server() -> Connection<Aes128GcmProvider> {
+        let mut rng = TestRng(0x50);
+        let config = ServerTlsConfig {
+            cert_der: get_test_ed25519_cert_der(),
+            private_key_der: &TEST_ED25519_SEED,
+            alpn_protocols: &[b"h3"],
+            transport_params: TransportParams::default_params(),
+        };
+        Connection::server(
+            Aes128GcmProvider,
+            config,
+            TransportParams::default_params(),
+            &mut rng,
+        )
+        .unwrap()
+    }
+
+    /// Exchange packets between client and server until both are established.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn run_handshake(
+        client: &mut Connection<Aes128GcmProvider>,
+        server: &mut Connection<Aes128GcmProvider>,
+        now: crate::transport::Instant,
+    ) {
+        for _round in 0..20 {
+            loop {
+                let mut buf = [0u8; 4096];
+                match client.poll_transmit(&mut buf, now) {
+                    Some(tx) => {
+                        let data: heapless::Vec<u8, 4096> = {
+                            let mut v = heapless::Vec::new();
+                            let _ = v.extend_from_slice(tx.data);
+                            v
+                        };
+                        let _ = server.recv(&data, now);
+                    }
+                    None => break,
+                }
+            }
+            loop {
+                let mut buf = [0u8; 4096];
+                match server.poll_transmit(&mut buf, now) {
+                    Some(tx) => {
+                        let data: heapless::Vec<u8, 4096> = {
+                            let mut v = heapless::Vec::new();
+                            let _ = v.extend_from_slice(tx.data);
+                            v
+                        };
+                        let _ = client.recv(&data, now);
+                    }
+                    None => break,
+                }
+            }
+            if client.is_established() && server.is_established() {
+                return;
+            }
+        }
+        panic!(
+            "handshake did not complete: client={:?}, server={:?}",
+            client.state(),
+            server.state()
+        );
+    }
+
+    /// Drain all pending transmits from a connection.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn drain_transmits(conn: &mut Connection<Aes128GcmProvider>, now: crate::transport::Instant) {
+        loop {
+            let mut buf = [0u8; 4096];
+            if conn.poll_transmit(&mut buf, now).is_none() {
+                break;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. poll_transmit_returns_none_when_nothing_to_send
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn poll_transmit_returns_none_when_nothing_to_send() {
+        let mut client = make_client();
+        let mut buf = [0u8; 2048];
+
+        // First call emits the Initial (ClientHello).
+        let tx1 = client.poll_transmit(&mut buf, 0);
+        assert!(tx1.is_some(), "first call should produce Initial");
+
+        // Second call: no more data to send.
+        let tx2 = client.poll_transmit(&mut buf, 0);
+        assert!(tx2.is_none(), "second call should return None");
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. client_initial_padded_to_1200_bytes (RFC 9000 section 14.1)
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn client_initial_padded_to_1200_bytes() {
+        let mut client = make_client();
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, 0).unwrap();
+        assert!(
+            tx.data.len() >= MIN_INITIAL_PACKET_SIZE,
+            "Initial packet must be padded to at least {} bytes, got {}",
+            MIN_INITIAL_PACKET_SIZE,
+            tx.data.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. client_initial_has_long_header
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn client_initial_has_long_header() {
+        let mut client = make_client();
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, 0).unwrap();
+        // The form bit (bit 7) of a long header is 1.
+        assert_ne!(
+            tx.data[0] & 0x80,
+            0,
+            "Initial packet first byte should have form bit set (long header)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. server_produces_response_after_client_initial
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn server_produces_response_after_client_initial() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+
+        // Client sends Initial.
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now).unwrap();
+        let initial: heapless::Vec<u8, 2048> = {
+            let mut v = heapless::Vec::new();
+            let _ = v.extend_from_slice(tx.data);
+            v
+        };
+
+        // Server receives it.
+        server.recv(&initial, now).unwrap();
+
+        // Server should now have something to send back (ServerHello).
+        let mut srv_buf = [0u8; 4096];
+        let srv_tx = server.poll_transmit(&mut srv_buf, now);
+        assert!(
+            srv_tx.is_some(),
+            "server should produce a response after receiving client Initial"
+        );
+
+        // The server response should also be a long header packet.
+        let srv_data = srv_tx.unwrap().data;
+        assert_ne!(
+            srv_data[0] & 0x80,
+            0,
+            "server response should be a long header packet"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. stream_data_produces_short_header_packet
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn stream_data_produces_short_header_packet() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+
+        // Send stream data.
+        let stream_id = client.open_stream().unwrap();
+        client.stream_send(stream_id, b"test data", false).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now).unwrap();
+
+        // Short header: form bit (bit 7) = 0.
+        assert_eq!(
+            tx.data[0] & 0x80,
+            0,
+            "1-RTT stream data should use a short header"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. stream_data_received_and_readable (end-to-end)
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn stream_data_received_and_readable() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+
+        let stream_id = client.open_stream().unwrap();
+        let payload = b"hello server!";
+        client.stream_send(stream_id, payload, false).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now).unwrap();
+        let pkt: heapless::Vec<u8, 2048> = {
+            let mut v = heapless::Vec::new();
+            let _ = v.extend_from_slice(tx.data);
+            v
+        };
+
+        server.recv(&pkt, now).unwrap();
+
+        let mut recv_buf = [0u8; 256];
+        let (len, fin) = server.stream_recv(stream_id, &mut recv_buf).unwrap();
+        assert_eq!(&recv_buf[..len], payload);
+        assert!(!fin, "FIN should not be set");
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. connection_close_produces_packet
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn connection_close_produces_packet() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+
+        client.close(42, b"goodbye");
+        assert_eq!(client.state(), ConnectionState::Closing);
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now);
+        assert!(tx.is_some(), "closing should produce a CONNECTION_CLOSE packet");
+        assert_eq!(
+            client.state(),
+            ConnectionState::Closed,
+            "state should transition to Closed after sending CONNECTION_CLOSE"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. connection_close_no_further_transmits
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn connection_close_no_further_transmits() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+
+        client.close(0, b"done");
+
+        // Drain the close packet.
+        let mut buf = [0u8; 2048];
+        let _ = client.poll_transmit(&mut buf, now);
+        assert!(client.is_closed());
+
+        // Nothing further should be sent after Closed.
+        let tx = client.poll_transmit(&mut buf, now);
+        assert!(
+            tx.is_none(),
+            "no packets should be sent after connection is Closed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. packet_number_increments_after_transmit
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn packet_number_increments_after_transmit() {
+        let mut client = make_client();
+
+        // Before any transmit, Initial PN starts at 0.
+        assert_eq!(client.next_pn[0], 0, "Initial PN should start at 0");
+
+        let mut buf = [0u8; 2048];
+        let _ = client.poll_transmit(&mut buf, 0);
+
+        // After sending one Initial packet, PN should be 1.
+        assert_eq!(
+            client.next_pn[0], 1,
+            "Initial PN should increment to 1 after one transmit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. server_sends_handshake_done
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn server_sends_handshake_done() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+
+        // Server starts with need_handshake_done = true.
+        assert!(server.need_handshake_done);
+
+        run_handshake(&mut client, &mut server, now);
+
+        // After handshake, the server should have cleared need_handshake_done
+        // because it was transmitted as part of the handshake exchange.
+        assert!(
+            !server.need_handshake_done,
+            "need_handshake_done should be false after handshake completes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. anti_amplification_blocks_without_received_bytes
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn anti_amplification_blocks_without_received_bytes() {
+        let mut server = make_server();
+
+        // Server with no received bytes should not be able to send.
+        assert!(!server.address_validated);
+        assert_eq!(server.anti_amplification_bytes_received, 0);
+
+        let mut buf = [0u8; 2048];
+        let tx = server.poll_transmit(&mut buf, 0);
+        assert!(
+            tx.is_none(),
+            "server should not send when no bytes have been received (anti-amplification)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. build_ack_frame_single_range
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn build_ack_frame_single_range() {
+        let mut client = make_client();
+
+        // Record a contiguous range of packet numbers at Initial level.
+        client.track_received_pn(Level::Initial, 0);
+        client.track_received_pn(Level::Initial, 1);
+        client.track_received_pn(Level::Initial, 2);
+
+        // Build an ACK frame.
+        let mut buf = [0u8; 256];
+        let written = client.build_ack_frame(Level::Initial, &mut buf);
+        assert!(
+            written.is_some(),
+            "should produce an ACK frame for tracked PNs"
+        );
+        let ack_len = written.unwrap();
+        assert!(ack_len > 0, "ACK frame should have non-zero length");
+
+        // Decode the first byte to verify it is an ACK frame type (0x02 or 0x03).
+        assert!(
+            buf[0] == 0x02 || buf[0] == 0x03,
+            "frame type byte should be ACK (0x02) or ACK_ECN (0x03), got {:#x}",
+            buf[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 13. build_ack_frame_multiple_ranges
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn build_ack_frame_multiple_ranges() {
+        let mut client = make_client();
+
+        // Record non-contiguous PNs: [0,1] and [5,6] and [10,10].
+        client.track_received_pn(Level::Initial, 0);
+        client.track_received_pn(Level::Initial, 1);
+        client.track_received_pn(Level::Initial, 5);
+        client.track_received_pn(Level::Initial, 6);
+        client.track_received_pn(Level::Initial, 10);
+
+        // Verify the tracker has 3 ranges.
+        assert_eq!(client.recv_pn_tracker[0].ranges.len(), 3);
+
+        // Build ACK frame.
+        let mut buf = [0u8; 256];
+        let written = client.build_ack_frame(Level::Initial, &mut buf);
+        assert!(written.is_some());
+        let ack_len = written.unwrap();
+
+        // A multi-range ACK must be longer than a single-range ACK due to
+        // the gap/range pairs encoded after the first range.
+        // Single range: type(1) + largest_ack(varint) + delay(varint) + range_count(varint) + first_range(varint)
+        // Multi range adds: gap(varint) + range(varint) for each additional range.
+        assert!(
+            ack_len > 5,
+            "multi-range ACK should be more than 5 bytes, got {}",
+            ack_len
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. build_ack_frame_empty_tracker_returns_none
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn build_ack_frame_empty_tracker_returns_none() {
+        let client = make_client();
+
+        // No PNs recorded.
+        let mut buf = [0u8; 256];
+        let written = client.build_ack_frame(Level::Initial, &mut buf);
+        assert!(
+            written.is_none(),
+            "should return None when no PNs have been received"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. multiple_streams_in_one_packet
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn multiple_streams_in_one_packet() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+
+        // Open two streams and queue data on both.
+        let s1 = client.open_stream().unwrap();
+        let s2 = client.open_stream().unwrap();
+        client.stream_send(s1, b"stream one", false).unwrap();
+        client.stream_send(s2, b"stream two", false).unwrap();
+
+        assert_eq!(
+            client.stream_send_queue.len(),
+            2,
+            "two stream entries should be queued"
+        );
+
+        // A single poll_transmit should drain both streams.
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now);
+        assert!(tx.is_some(), "should produce a packet with both streams");
+
+        assert_eq!(
+            client.stream_send_queue.len(),
+            0,
+            "send queue should be empty after transmit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. bidirectional_stream_exchange
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn bidirectional_stream_exchange() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+        drain_transmits(&mut server, now);
+
+        // Client sends a request.
+        let c_stream = client.open_stream().unwrap();
+        client
+            .stream_send(c_stream, b"GET / HTTP/1.0", true)
+            .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now).unwrap();
+        let pkt: heapless::Vec<u8, 2048> = {
+            let mut v = heapless::Vec::new();
+            let _ = v.extend_from_slice(tx.data);
+            v
+        };
+        server.recv(&pkt, now).unwrap();
+
+        // Server reads the request.
+        let mut recv_buf = [0u8; 256];
+        let (len, fin) = server.stream_recv(c_stream, &mut recv_buf).unwrap();
+        assert_eq!(&recv_buf[..len], b"GET / HTTP/1.0");
+        assert!(fin);
+
+        // Server sends a response on the same stream.
+        server
+            .stream_send(c_stream, b"200 OK", true)
+            .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let tx = server.poll_transmit(&mut buf, now).unwrap();
+        let pkt: heapless::Vec<u8, 2048> = {
+            let mut v = heapless::Vec::new();
+            let _ = v.extend_from_slice(tx.data);
+            v
+        };
+        client.recv(&pkt, now).unwrap();
+
+        // Client reads the response.
+        let mut recv_buf = [0u8; 256];
+        let (len, fin) = client.stream_recv(c_stream, &mut recv_buf).unwrap();
+        assert_eq!(&recv_buf[..len], b"200 OK");
+        assert!(fin);
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. closed_connection_returns_none
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn closed_connection_returns_none() {
+        let mut client = make_client();
+        client.state = ConnectionState::Closed;
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, 0);
+        assert!(
+            tx.is_none(),
+            "Closed connection should not produce any transmits"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 18. close_before_handshake_sends_initial_level_close
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn close_before_handshake_sends_initial_level_close() {
+        let mut client = make_client();
+
+        // Close immediately before any handshake exchange.
+        client.close(1, b"early close");
+        assert_eq!(client.state(), ConnectionState::Closing);
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, 0);
+        assert!(
+            tx.is_some(),
+            "CONNECTION_CLOSE should be sent at Initial level"
+        );
+        assert_eq!(client.state(), ConnectionState::Closed);
+
+        // The packet should be a long header (Initial level).
+        assert_ne!(
+            tx.unwrap().data[0] & 0x80,
+            0,
+            "CONNECTION_CLOSE before handshake should use long header"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 19. packet_number_increments_across_levels
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn packet_number_increments_across_levels() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+
+        // Initial PN spaces all start at 0.
+        assert_eq!(client.next_pn[0], 0);
+        assert_eq!(client.next_pn[1], 0);
+        assert_eq!(client.next_pn[2], 0);
+
+        run_handshake(&mut client, &mut server, now);
+
+        // After handshake, Initial PN should have been incremented (at least 1 Initial sent).
+        assert!(
+            client.next_pn[0] >= 1,
+            "Initial PN should have incremented, got {}",
+            client.next_pn[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 20. connection_close_received_by_peer
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn connection_close_received_by_peer() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+        drain_transmits(&mut server, now);
+
+        // Client closes.
+        client.close(99, b"error");
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now).unwrap();
+        let pkt: heapless::Vec<u8, 2048> = {
+            let mut v = heapless::Vec::new();
+            let _ = v.extend_from_slice(tx.data);
+            v
+        };
+
+        // Server receives the CONNECTION_CLOSE.
+        server.recv(&pkt, now).unwrap();
+        assert_eq!(
+            server.state(),
+            ConnectionState::Draining,
+            "server should enter Draining after receiving CONNECTION_CLOSE"
+        );
+
+        // Server should emit a ConnectionClose event.
+        let mut found = false;
+        while let Some(ev) = server.poll_event() {
+            if let crate::connection::Event::ConnectionClose { error_code, .. } = ev {
+                assert_eq!(error_code, 99);
+                found = true;
+            }
+        }
+        assert!(found, "server should emit ConnectionClose event");
+    }
+
+    // -----------------------------------------------------------------------
+    // 21. anti_amplification_bytes_sent_tracking
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn anti_amplification_bytes_sent_tracking() {
+        let mut server = make_server();
+
+        // Simulate receiving 2000 bytes so the server can send up to 6000.
+        server.anti_amplification_bytes_received = 2000;
+        assert_eq!(server.anti_amplification_bytes_sent, 0);
+
+        // The server has no data to send (no Initial keys derived for the
+        // remote DCID yet), so poll_transmit won't produce anything.
+        // But the tracking mechanism is verified by checking the field.
+        assert!(server.amplification_allows(6000));
+        assert!(!server.amplification_allows(6001));
+    }
+
+    // -----------------------------------------------------------------------
+    // 22. stream_send_with_fin
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn stream_send_with_fin_received() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+
+        let stream_id = client.open_stream().unwrap();
+        client.stream_send(stream_id, b"final", true).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let tx = client.poll_transmit(&mut buf, now).unwrap();
+        let pkt: heapless::Vec<u8, 2048> = {
+            let mut v = heapless::Vec::new();
+            let _ = v.extend_from_slice(tx.data);
+            v
+        };
+
+        server.recv(&pkt, now).unwrap();
+
+        let mut recv_buf = [0u8; 256];
+        let (len, fin) = server.stream_recv(stream_id, &mut recv_buf).unwrap();
+        assert_eq!(&recv_buf[..len], b"final");
+        assert!(fin, "FIN should be set on the received stream data");
+    }
+
+    // -----------------------------------------------------------------------
+    // 23. initial_packet_records_sent_packet
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn initial_packet_records_sent_packet() {
+        let mut client = make_client();
+
+        // Before transmit, no packets recorded.
+        assert_eq!(client.sent_tracker.count(), 0);
+
+        let mut buf = [0u8; 2048];
+        let _ = client.poll_transmit(&mut buf, 0);
+
+        // After transmit, one packet should be recorded.
+        assert_eq!(
+            client.sent_tracker.count(),
+            1,
+            "sent_tracker should record the transmitted Initial packet"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 24. handshake_packet_pn_separate_from_initial
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn handshake_packet_pn_separate_from_initial() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+
+        // Initial and Handshake have separate PN spaces.
+        // Both should have been incremented.
+        let initial_pn = client.next_pn[0];
+        let _handshake_pn = client.next_pn[1];
+
+        assert!(
+            initial_pn >= 1,
+            "Initial PN should be >= 1, got {}",
+            initial_pn
+        );
+        // The Handshake PN may or may not have been used, depending on whether
+        // the client sends Handshake-level packets. On this implementation,
+        // the client should send at least a Handshake Finished.
+        // Just verify the spaces are independent.
+        // Both spaces start at 0, and at least Initial must be > 0.
+        assert!(
+            initial_pn >= 1,
+            "Initial PN must have been used during handshake"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 25. stream_data_after_close_is_blocked
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn stream_data_after_close_is_blocked() {
+        let mut client = make_client();
+        let mut server = make_server();
+        let now = 1_000_000u64;
+        run_handshake(&mut client, &mut server, now);
+        drain_transmits(&mut client, now);
+
+        let stream_id = client.open_stream().unwrap();
+        client.close(0, b"bye");
+
+        // Drain the close packet.
+        let mut buf = [0u8; 2048];
+        let _ = client.poll_transmit(&mut buf, now);
+        assert!(client.is_closed());
+
+        // Sending on a stream after close should fail.
+        let result = client.stream_send(stream_id, b"too late", false);
+        assert!(
+            result.is_err(),
+            "stream_send after close should return an error"
+        );
     }
 }

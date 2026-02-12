@@ -1,6 +1,6 @@
-/// QPACK static table (RFC 9204 Appendix A).
-///
-/// 99 pre-defined header field entries, indexed 0 through 98.
+//! QPACK static table (RFC 9204 Appendix A).
+//!
+//! 99 pre-defined header field entries, indexed 0 through 98.
 
 /// A single entry in the static table.
 #[derive(Debug, Clone, Copy)]

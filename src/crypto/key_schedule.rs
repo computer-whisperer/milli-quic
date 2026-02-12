@@ -89,6 +89,21 @@ pub fn derive_packet_keys<H: Hkdf>(
     Ok(())
 }
 
+/// Derive the next-generation application traffic secret for QUIC Key Update.
+///
+/// Per RFC 9001 section 6.1, the updated secret is derived as:
+///   new_secret = HKDF-Expand-Label(current_secret, "quic ku", "", Hash.length)
+///
+/// The caller should then derive new packet protection keys from `new_secret`
+/// using [`derive_packet_keys`] or [`derive_directional_keys`].
+pub fn derive_next_application_secret<H: Hkdf>(
+    hkdf: &H,
+    current_secret: &[u8],
+    new_secret: &mut [u8],
+) -> Result<(), Error> {
+    hkdf_expand_label(hkdf, current_secret, b"quic ku", &[], new_secret)
+}
+
 /// Derive complete `DirectionalKeys` from a traffic secret using a `CryptoProvider`.
 pub fn derive_directional_keys<C: CryptoProvider>(
     provider: &C,
@@ -272,5 +287,59 @@ mod tests {
             .open_in_place(&nonce, aad, &mut buf, ct_len)
             .unwrap();
         assert_eq!(&buf[..pt_len], plaintext);
+    }
+
+    // ---- Key Update derivation (RFC 9001 section 6.1) ----
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn derive_next_application_secret_produces_different_secret() {
+        let hkdf = HkdfSha256;
+        let current_secret = hex!("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
+
+        let mut new_secret = [0u8; 32];
+        derive_next_application_secret(&hkdf, &current_secret, &mut new_secret).unwrap();
+
+        // Must be different from the original
+        assert_ne!(new_secret, current_secret);
+        // Must not be all zeros
+        assert_ne!(new_secret, [0u8; 32]);
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn derive_next_application_secret_is_deterministic() {
+        let hkdf = HkdfSha256;
+        let current_secret = [0x42u8; 32];
+
+        let mut new_secret1 = [0u8; 32];
+        let mut new_secret2 = [0u8; 32];
+        derive_next_application_secret(&hkdf, &current_secret, &mut new_secret1).unwrap();
+        derive_next_application_secret(&hkdf, &current_secret, &mut new_secret2).unwrap();
+
+        assert_eq!(new_secret1, new_secret2);
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn derive_next_application_secret_chain() {
+        // Verify that chaining key updates produces distinct secrets at each generation
+        let hkdf = HkdfSha256;
+        let gen0 = [0xAA; 32];
+        let mut gen1 = [0u8; 32];
+        let mut gen2 = [0u8; 32];
+        let mut gen3 = [0u8; 32];
+
+        derive_next_application_secret(&hkdf, &gen0, &mut gen1).unwrap();
+        derive_next_application_secret(&hkdf, &gen1, &mut gen2).unwrap();
+        derive_next_application_secret(&hkdf, &gen2, &mut gen3).unwrap();
+
+        // All four generations must be distinct
+        assert_ne!(gen0, gen1);
+        assert_ne!(gen1, gen2);
+        assert_ne!(gen2, gen3);
+        assert_ne!(gen0, gen2);
+        assert_ne!(gen0, gen3);
+        assert_ne!(gen1, gen3);
     }
 }

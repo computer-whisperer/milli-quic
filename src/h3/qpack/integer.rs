@@ -1,9 +1,9 @@
-/// QPACK/HPACK integer encoding (RFC 7541 Section 5.1).
-///
-/// This is a prefix-based integer encoding that is distinct from the QUIC
-/// variable-length integer format.  An integer is packed into the low N bits
-/// of a byte; if the value does not fit, the remaining value is encoded as a
-/// series of 7-bit continuation bytes.
+//! QPACK/HPACK integer encoding (RFC 7541 Section 5.1).
+//!
+//! This is a prefix-based integer encoding that is distinct from the QUIC
+//! variable-length integer format.  An integer is packed into the low N bits
+//! of a byte; if the value does not fit, the remaining value is encoded as a
+//! series of 7-bit continuation bytes.
 
 use crate::error::Error;
 

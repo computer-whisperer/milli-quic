@@ -7,7 +7,7 @@ use crate::packet::{self, CoalescedPackets};
 use crate::tls::TlsSession;
 use crate::transport::Instant;
 
-use super::{Connection, ConnectionConfig, ConnectionState, Event};
+use super::{Connection, ConnectionState, Event};
 
 // ---------------------------------------------------------------------------
 // CRYPTO frame reassembly buffer
@@ -167,7 +167,8 @@ struct PacketResult {
     pn: u64,
 }
 
-impl<C: CryptoProvider, Cfg: ConnectionConfig> Connection<C, Cfg>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
@@ -186,8 +187,8 @@ where
         }
 
         // Iterate over coalesced packets in the datagram.
-        let mut iter = CoalescedPackets::new(datagram);
-        while let Some(pkt_result) = iter.next() {
+        let iter = CoalescedPackets::new(datagram);
+        for pkt_result in iter {
             let pkt_data = match pkt_result {
                 Ok(data) => data,
                 Err(_) => break, // malformed coalescing, stop
@@ -315,7 +316,7 @@ where
         Ok(PacketResult { ack_eliciting, level, pn })
     }
 
-    /// Process a short (1-RTT) packet.
+    /// Process a short (1-RTT) packet with key phase handling (RFC 9001 section 6).
     fn recv_short(&mut self, pkt_data: &[u8], now: Instant) -> Result<PacketResult, Error> {
         let dcid_len = if self.local_cids.is_empty() {
             0
@@ -328,7 +329,7 @@ where
         // For short header, pn_offset = hdr_len (1 + dcid_len)
         let pn_offset = hdr_len;
 
-        // Need recv keys for Application level
+        // Need recv keys for Application level (for header protection removal)
         let recv = self.keys.recv_keys(Level::Application).ok_or(Error::Crypto)?;
 
         // We need to work on a mutable copy for decryption
@@ -352,6 +353,9 @@ where
         buf[0] ^= mask[0] & 0x1f;
         let pn_len = ((buf[0] & 0x03) + 1) as usize;
 
+        // Extract key_phase bit from the unprotected first byte (bit 2 = 0x04)
+        let received_key_phase = (buf[0] >> 2) & 1;
+
         // Unmask PN bytes
         for i in 0..pn_len {
             buf[pn_offset + i] ^= mask[1 + i];
@@ -370,12 +374,11 @@ where
             return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
         }
 
-        // Decrypt payload
+        // Decrypt payload — key phase aware (RFC 9001 section 6)
         let payload_offset = pn_offset + pn_len;
         let payload_len = pkt_len - payload_offset;
 
         let aad = &buf[..payload_offset]; // header up to and including PN is the AAD
-        // We need a temporary copy of AAD since the buf will be mutated
         let mut aad_buf = [0u8; 128];
         if payload_offset > aad_buf.len() {
             return Err(Error::BufferTooSmall {
@@ -384,22 +387,103 @@ where
         }
         aad_buf[..payload_offset].copy_from_slice(aad);
 
-        let nonce = recv.nonce(pn);
-        let pt_len = recv.aead.open_in_place(
-            &nonce,
-            &aad_buf[..payload_offset],
-            &mut buf[payload_offset..],
-            payload_len,
-        )?;
+        let current_key_phase = self.keys.key_phase();
 
-        // Parse and dispatch frames
-        let ack_eliciting = self.dispatch_frames(&buf[payload_offset..payload_offset + pt_len], Level::Application, now)?;
+        if received_key_phase == current_key_phase {
+            // Key phase matches: decrypt with current key
+            let recv = self.keys.recv_keys(Level::Application).ok_or(Error::Crypto)?;
+            let nonce = recv.nonce(pn);
+            match recv.aead.open_in_place(
+                &nonce,
+                &aad_buf[..payload_offset],
+                &mut buf[payload_offset..],
+                payload_len,
+            ) {
+                Ok(pt_len) => {
+                    // If we initiated a key update and peer responds with our new phase,
+                    // that confirms our key update.
+                    if !self.keys.key_update.update_confirmed {
+                        self.keys.key_update.update_confirmed = true;
+                    }
 
-        Ok(PacketResult {
-            ack_eliciting,
-            level: Level::Application,
-            pn,
-        })
+                    let ack_eliciting = self.dispatch_frames(
+                        &buf[payload_offset..payload_offset + pt_len],
+                        Level::Application,
+                        now,
+                    )?;
+                    Ok(PacketResult {
+                        ack_eliciting,
+                        level: Level::Application,
+                        pn,
+                    })
+                }
+                Err(_) => {
+                    // Decryption with current key failed. Try previous key
+                    // (for delayed packets from before a key update we initiated).
+                    buf[..pkt_len].copy_from_slice(pkt_data);
+                    // Re-apply header unprotection
+                    buf[0] ^= mask[0] & 0x1f;
+                    for i in 0..pn_len {
+                        buf[pn_offset + i] ^= mask[1 + i];
+                    }
+
+                    if let Some(prev) = self.keys.prev_recv_keys() {
+                        let nonce = prev.nonce(pn);
+                        let pt_len = prev.aead.open_in_place(
+                            &nonce,
+                            &aad_buf[..payload_offset],
+                            &mut buf[payload_offset..],
+                            payload_len,
+                        )?;
+
+                        let ack_eliciting = self.dispatch_frames(
+                            &buf[payload_offset..payload_offset + pt_len],
+                            Level::Application,
+                            now,
+                        )?;
+                        return Ok(PacketResult {
+                            ack_eliciting,
+                            level: Level::Application,
+                            pn,
+                        });
+                    }
+
+                    Err(Error::Crypto)
+                }
+            }
+        } else {
+            // Key phase differs: peer has initiated a key update.
+            // Derive next-generation recv keys and try decryption.
+            #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+            {
+                let next_recv_keys = self.keys.derive_next_recv_keys(&self.crypto)?;
+                let nonce = next_recv_keys.nonce(pn);
+                let pt_len = next_recv_keys.aead.open_in_place(
+                    &nonce,
+                    &aad_buf[..payload_offset],
+                    &mut buf[payload_offset..],
+                    payload_len,
+                )?;
+
+                // Decryption succeeded: confirm the peer key update and rotate keys.
+                self.keys.confirm_peer_key_update(&self.crypto, next_recv_keys)?;
+
+                let ack_eliciting = self.dispatch_frames(
+                    &buf[payload_offset..payload_offset + pt_len],
+                    Level::Application,
+                    now,
+                )?;
+                Ok(PacketResult {
+                    ack_eliciting,
+                    level: Level::Application,
+                    pn,
+                })
+            }
+            #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+            {
+                Err(Error::Crypto)
+            }
+        }
     }
 
     // decrypt_and_process_long is replaced by the standalone decrypt_long_packet
@@ -436,7 +520,7 @@ where
     }
 
     /// Dispatch a single frame.
-    fn dispatch_frame(
+    pub(crate) fn dispatch_frame(
         &mut self,
         frame: Frame<'_>,
         level: Level,
@@ -595,8 +679,13 @@ where
                 // Accept and ignore for now
             }
 
-            Frame::PathChallenge(_) | Frame::PathResponse(_) => {
-                // Skip connection migration
+            Frame::PathChallenge(data) => {
+                // RFC 9000 §8.2.2: echo the 8-byte challenge data in a PATH_RESPONSE
+                self.pending_path_response = Some(data);
+            }
+
+            Frame::PathResponse(_) => {
+                // We don't currently initiate PATH_CHALLENGEs, so ignore responses.
             }
 
             Frame::DataBlocked(_)

@@ -1,11 +1,11 @@
-/// QUIC variable-length integer encoding (RFC 9000 §16).
-///
-/// | 2MSB | Length  | Usable Bits | Range                        |
-/// |------|---------|-------------|------------------------------|
-/// | 00   | 1 byte  | 6           | 0–63                         |
-/// | 01   | 2 bytes | 14          | 0–16383                      |
-/// | 10   | 4 bytes | 30          | 0–1073741823                 |
-/// | 11   | 8 bytes | 62          | 0–4611686018427387903        |
+//! QUIC variable-length integer encoding (RFC 9000 §16).
+//!
+//! | 2MSB | Length  | Usable Bits | Range                        |
+//! |------|---------|-------------|------------------------------|
+//! | 00   | 1 byte  | 6           | 0–63                         |
+//! | 01   | 2 bytes | 14          | 0–16383                      |
+//! | 10   | 4 bytes | 30          | 0–1073741823                 |
+//! | 11   | 8 bytes | 62          | 0–4611686018427387903        |
 
 use crate::error::Error;
 

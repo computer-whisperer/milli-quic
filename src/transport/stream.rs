@@ -159,6 +159,12 @@ pub struct StreamMap<const N: usize> {
 /// Default initial MAX_STREAM_DATA for locally-opened streams.
 const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 65536;
 
+impl<const N: usize> Default for StreamMap<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> StreamMap<N> {
     pub fn new() -> Self {
         Self {
@@ -339,10 +345,10 @@ impl<const N: usize> StreamMap<N> {
 
         // Set FIN offset if this frame carries FIN
         if fin {
-            if let Some(existing) = recv.fin_offset {
-                if existing != end {
-                    return Err(Error::Transport(TransportError::FinalSizeError));
-                }
+            if let Some(existing) = recv.fin_offset
+                && existing != end
+            {
+                return Err(Error::Transport(TransportError::FinalSizeError));
             }
             recv.fin_offset = Some(end);
             recv.state = RecvStreamState::SizeKnown;
@@ -359,10 +365,10 @@ impl<const N: usize> StreamMap<N> {
         }
 
         // Check if all data up to FIN has been received
-        if let Some(fin_off) = recv.fin_offset {
-            if recv.offset >= fin_off {
-                recv.state = RecvStreamState::DataRecvd;
-            }
+        if let Some(fin_off) = recv.fin_offset
+            && recv.offset >= fin_off
+        {
+            recv.state = RecvStreamState::DataRecvd;
         }
 
         // Auto-tune: if remaining window < 50% of max, bump next advertised limit
@@ -400,10 +406,10 @@ impl<const N: usize> StreamMap<N> {
         }
 
         // Validate final size consistency
-        if let Some(fin_off) = recv.fin_offset {
-            if fin_off != final_size {
-                return Err(Error::Transport(TransportError::FinalSizeError));
-            }
+        if let Some(fin_off) = recv.fin_offset
+            && fin_off != final_size
+        {
+            return Err(Error::Transport(TransportError::FinalSizeError));
         }
 
         recv.fin_offset = Some(final_size);
@@ -465,10 +471,10 @@ impl<const N: usize> StreamMap<N> {
     /// Remove terminal streams to free slots.
     pub fn gc(&mut self) {
         for slot in self.streams.iter_mut() {
-            if let Some(s) = slot {
-                if Self::stream_is_terminal(s) {
-                    *slot = None;
-                }
+            if let Some(s) = slot
+                && Self::stream_is_terminal(s)
+            {
+                *slot = None;
             }
         }
     }

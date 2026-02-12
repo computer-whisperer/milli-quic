@@ -1,8 +1,8 @@
-/// QPACK header compression codec (RFC 9204).
-///
-/// This implementation operates in **static-only mode** (`TABLE_SIZE = 0`):
-/// no dynamic table, no encoder/decoder streams.  This is fully
-/// RFC-compliant and sufficient for HTTP/3 interoperability.
+//! QPACK header compression codec (RFC 9204).
+//!
+//! This implementation operates in **static-only mode** (`TABLE_SIZE = 0`):
+//! no dynamic table, no encoder/decoder streams.  This is fully
+//! RFC-compliant and sufficient for HTTP/3 interoperability.
 
 pub mod huffman;
 pub mod integer;
@@ -17,6 +17,12 @@ use static_table::{LookupResult, STATIC_TABLE};
 
 /// QPACK encoder (static-only mode).
 pub struct QpackEncoder;
+
+impl Default for QpackEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl QpackEncoder {
     /// Create a new encoder.
@@ -148,6 +154,12 @@ impl QpackEncoder {
 
 /// QPACK decoder (static-only mode).
 pub struct QpackDecoder;
+
+impl Default for QpackDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl QpackDecoder {
     /// Create a new decoder.

@@ -380,13 +380,10 @@ where
 
         // Store the first certificate for potential verification
         self.server_cert_data.clear();
-        for entry in messages::iter_certificate_entries(cert.entries) {
-            let entry = entry?;
+        if let Some(entry_result) = messages::iter_certificate_entries(cert.entries).next() {
+            let entry = entry_result?;
             // Store first cert (the end-entity cert)
-            if self.server_cert_data.is_empty() {
-                let _ = self.server_cert_data.extend_from_slice(entry.cert_data);
-            }
-            break;
+            let _ = self.server_cert_data.extend_from_slice(entry.cert_data);
         }
 
         self.state = HandshakeState::WaitCertificateVerify;

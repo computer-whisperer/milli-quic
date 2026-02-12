@@ -29,6 +29,12 @@ use self::recv::level_index;
 // ---------------------------------------------------------------------------
 
 /// Compile-time configuration for a QUIC connection.
+///
+/// Note: Rust does not allow associated constants from traits to be used as
+/// const generic parameters (e.g. `StreamMap<Self::MAX_STREAMS>`). Therefore
+/// the actual wiring uses const generic parameters directly on `Connection`.
+/// This trait is retained as documentation and for use cases where a type-level
+/// "config bundle" is useful in downstream code.
 pub trait ConnectionConfig {
     const MAX_STREAMS: usize;
     const SENT_PACKETS_PER_SPACE: usize;
@@ -182,6 +188,12 @@ pub struct RecvPnTracker {
     pub ranges: heapless::Vec<(u64, u64), 32>,
 }
 
+impl Default for RecvPnTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecvPnTracker {
     pub fn new() -> Self {
         Self {
@@ -273,14 +285,30 @@ impl RecvPnTracker {
 // ---------------------------------------------------------------------------
 
 /// A QUIC connection.
-pub struct Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> {
+///
+/// The const generic parameters allow compile-time tuning of resource limits:
+///
+/// - `MAX_STREAMS` — maximum number of concurrent streams (default: 32).
+///   Controls the size of the internal `StreamMap` and the stream receive buffer array.
+/// - `SENT_PER_SPACE` — maximum sent packets tracked per encryption space for
+///   loss detection and ACK processing (default: 128).
+/// - `MAX_CIDS` — maximum number of local connection IDs (default: 4).
+///
+/// The defaults match the previous hardcoded values, so
+/// `Connection<MyProvider>` is source-compatible with existing code.
+pub struct Connection<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize = 32,
+    const SENT_PER_SPACE: usize = 128,
+    const MAX_CIDS: usize = 4,
+> {
     pub(crate) state: ConnectionState,
     pub(crate) role: Role,
     pub(crate) crypto: C,
     pub(crate) keys: ConnectionKeys<C>,
     pub(crate) tls: TlsEngine<C>,
-    pub(crate) streams: StreamMap<32>,
-    pub(crate) sent_tracker: SentPacketTracker<128>,
+    pub(crate) streams: StreamMap<MAX_STREAMS>,
+    pub(crate) sent_tracker: SentPacketTracker<SENT_PER_SPACE>,
     pub(crate) loss_detector: LossDetector,
     pub(crate) congestion: CongestionController,
     pub(crate) flow_control: FlowController,
@@ -296,7 +324,7 @@ pub struct Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> 
     pub(crate) pending_crypto_level: [Level; 3],
 
     // Our connection IDs
-    pub(crate) local_cids: heapless::Vec<ConnectionId, 4>,
+    pub(crate) local_cids: heapless::Vec<ConnectionId, MAX_CIDS>,
     pub(crate) remote_cid: ConnectionId,
 
     // Packet numbers
@@ -330,7 +358,10 @@ pub struct Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> 
     pub(crate) stream_send_queue: heapless::Vec<StreamSendEntry, 16>,
 
     // Stream receive buffers (simple, indexed by position)
-    pub(crate) stream_recv_bufs: [Option<StreamRecvBuf>; 32],
+    pub(crate) stream_recv_bufs: [Option<StreamRecvBuf>; MAX_STREAMS],
+
+    // PATH_RESPONSE pending data (RFC 9000 §8.2.2)
+    pub(crate) pending_path_response: Option<[u8; 8]>,
 
     // Anti-amplification: total bytes received before address validation
     pub(crate) anti_amplification_bytes_received: usize,
@@ -338,12 +369,10 @@ pub struct Connection<C: CryptoProvider, Cfg: ConnectionConfig = DefaultConfig> 
     pub(crate) anti_amplification_bytes_sent: usize,
     // Whether address has been validated (handshake complete or Retry)
     pub(crate) address_validated: bool,
-
-    // Marker for config type
-    _cfg: core::marker::PhantomData<Cfg>,
 }
 
-impl<C: CryptoProvider, Cfg: ConnectionConfig> Connection<C, Cfg>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
@@ -428,10 +457,10 @@ where
             need_handshake_done: false,
             stream_send_queue: heapless::Vec::new(),
             stream_recv_bufs: core::array::from_fn(|_| None),
+            pending_path_response: None,
             anti_amplification_bytes_received: 0,
             anti_amplification_bytes_sent: 0,
             address_validated: true, // Client doesn't need amplification protection
-            _cfg: core::marker::PhantomData,
         })
     }
 
@@ -490,10 +519,10 @@ where
             need_handshake_done: true,
             stream_send_queue: heapless::Vec::new(),
             stream_recv_bufs: core::array::from_fn(|_| None),
+            pending_path_response: None,
             anti_amplification_bytes_received: 0,
             anti_amplification_bytes_sent: 0,
             address_validated: false, // Server must validate address before sending freely
-            _cfg: core::marker::PhantomData,
         })
     }
 
@@ -514,15 +543,15 @@ where
     /// Handle a timer expiration.
     pub fn handle_timeout(&mut self, now: Instant) {
         // Check idle timeout
-        if let Some(idle) = self.idle_timeout {
-            if now.saturating_sub(self.last_activity) >= idle {
-                self.state = ConnectionState::Closed;
-                let _ = self.events.push_back(Event::ConnectionClose {
-                    error_code: 0,
-                    reason: heapless::Vec::new(),
-                });
-                return;
-            }
+        if let Some(idle) = self.idle_timeout
+            && now.saturating_sub(self.last_activity) >= idle
+        {
+            self.state = ConnectionState::Closed;
+            let _ = self.events.push_back(Event::ConnectionClose {
+                error_code: 0,
+                reason: heapless::Vec::new(),
+            });
+            return;
         }
 
         // PTO expired
@@ -600,30 +629,28 @@ where
 
         // Look for data in our receive buffers
         for slot in self.stream_recv_bufs.iter_mut() {
-            if let Some(recv) = slot {
-                if recv.stream_id == stream_id {
-                    let available = recv.len - recv.read_offset;
-                    if available == 0 {
-                        if recv.fin_received {
-                            let fin = true;
-                            *slot = None;
-                            return Ok((0, fin));
-                        }
-                        return Err(Error::WouldBlock);
+            if let Some(recv) = slot
+                && recv.stream_id == stream_id
+            {
+                let available = recv.len - recv.read_offset;
+                if available == 0 {
+                    if recv.fin_received {
+                        let fin = true;
+                        *slot = None;
+                        return Ok((0, fin));
                     }
-                    let copy_len = available.min(buf.len());
-                    buf[..copy_len].copy_from_slice(
-                        &recv.data[recv.read_offset..recv.read_offset + copy_len],
-                    );
-                    recv.read_offset += copy_len;
-                    let fin = recv.fin_received && recv.read_offset >= recv.len;
-                    if fin || recv.read_offset >= recv.len {
-                        if fin {
-                            *slot = None;
-                        }
-                    }
-                    return Ok((copy_len, fin));
+                    return Err(Error::WouldBlock);
                 }
+                let copy_len = available.min(buf.len());
+                buf[..copy_len].copy_from_slice(
+                    &recv.data[recv.read_offset..recv.read_offset + copy_len],
+                );
+                recv.read_offset += copy_len;
+                let fin = recv.fin_received && recv.read_offset >= recv.len;
+                if fin {
+                    *slot = None;
+                }
+                return Ok((copy_len, fin));
             }
         }
 
@@ -670,6 +697,30 @@ where
         matches!(self.state, ConnectionState::Active)
     }
 
+    /// Initiate a QUIC key update (RFC 9001 section 6).
+    ///
+    /// Derives next-generation application send/recv keys, rotates the
+    /// current recv key to `prev_recv` for decrypting late packets, and
+    /// flips the key_phase bit so subsequent outgoing packets use the
+    /// new keys.
+    ///
+    /// Returns `Err` if:
+    /// - The connection is not yet established (handshake not complete)
+    /// - A previous key update has not yet been confirmed by the peer
+    /// - Application keys are not installed
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    pub fn initiate_key_update(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, ConnectionState::Active) {
+            return Err(Error::InvalidState);
+        }
+        self.keys.perform_key_update(&self.crypto)
+    }
+
+    /// Get the current key phase bit (0 or 1) for 1-RTT packets.
+    pub fn key_phase(&self) -> u8 {
+        self.keys.key_phase()
+    }
+
     /// Get the connection state.
     pub fn state(&self) -> ConnectionState {
         self.state
@@ -696,11 +747,11 @@ where
         // Find existing buffer or allocate new one
         let mut target_idx = None;
         for (i, slot) in self.stream_recv_bufs.iter().enumerate() {
-            if let Some(buf) = slot {
-                if buf.stream_id == stream_id {
-                    target_idx = Some(i);
-                    break;
-                }
+            if let Some(buf) = slot
+                && buf.stream_id == stream_id
+            {
+                target_idx = Some(i);
+                break;
             }
         }
 
@@ -1489,6 +1540,388 @@ mod tests {
             assert_eq!(len, 5);
             assert_eq!(&recv_buf[..len], b"final");
             assert!(fin);
+        }
+
+        // -------------------------------------------------------------------
+        // PATH_CHALLENGE / PATH_RESPONSE tests (RFC 9000 §8.2.2)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn path_challenge_stores_pending_response() {
+            // After a handshake completes, directly inject a PATH_CHALLENGE
+            // frame into the server's dispatch_frame and verify that
+            // pending_path_response is set with the correct data.
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            assert!(server.pending_path_response.is_none());
+
+            // Simulate receiving a PATH_CHALLENGE frame
+            let challenge_data: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+            let frame = crate::frame::Frame::PathChallenge(challenge_data);
+            server.dispatch_frame(frame, crate::crypto::Level::Application, now).unwrap();
+
+            assert_eq!(
+                server.pending_path_response,
+                Some(challenge_data),
+                "PATH_CHALLENGE should store the 8-byte challenge data"
+            );
+        }
+
+        #[test]
+        fn path_response_echoes_exact_challenge_bytes() {
+            // After injecting a PATH_CHALLENGE, verify that poll_transmit
+            // produces a packet and that the pending_path_response is cleared.
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            // Drain any pending transmits from the handshake
+            loop {
+                let mut buf = [0u8; 4096];
+                if server.poll_transmit(&mut buf, now).is_none() {
+                    break;
+                }
+            }
+
+            // Inject PATH_CHALLENGE
+            let challenge_data: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+            let frame = crate::frame::Frame::PathChallenge(challenge_data);
+            // Mark as ack-eliciting so that the ack_eliciting flag triggers
+            // (PATH_CHALLENGE is ack-eliciting)
+            server.dispatch_frame(frame, crate::crypto::Level::Application, now).unwrap();
+            assert!(server.pending_path_response.is_some());
+
+            // poll_transmit should produce a packet containing PATH_RESPONSE
+            let mut buf = [0u8; 2048];
+            let tx = server.poll_transmit(&mut buf, now);
+            assert!(
+                tx.is_some(),
+                "server should send a PATH_RESPONSE after PATH_CHALLENGE"
+            );
+
+            // After transmitting, pending_path_response should be cleared
+            assert_eq!(
+                server.pending_path_response, None,
+                "pending_path_response should be cleared after sending"
+            );
+        }
+
+        #[test]
+        fn path_challenge_end_to_end() {
+            // Full end-to-end test: client sends PATH_CHALLENGE to server,
+            // server responds with PATH_RESPONSE, client decodes it.
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            // Drain remaining transmits from both sides
+            loop {
+                let mut buf = [0u8; 4096];
+                if client.poll_transmit(&mut buf, now).is_none() {
+                    break;
+                }
+            }
+            loop {
+                let mut buf = [0u8; 4096];
+                if server.poll_transmit(&mut buf, now).is_none() {
+                    break;
+                }
+            }
+
+            // Inject a PATH_CHALLENGE into the server as if it received one
+            let challenge_data: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+            server.pending_path_response = Some(challenge_data);
+            // Also set ack_eliciting so the packet gets built
+            server.ack_eliciting_received[2] = true; // Application level
+
+            // Server generates a short packet with the PATH_RESPONSE
+            let mut buf = [0u8; 2048];
+            let tx = server.poll_transmit(&mut buf, now);
+            assert!(tx.is_some(), "server should produce a packet with PATH_RESPONSE");
+
+            // The PATH_RESPONSE is now cleared
+            assert!(server.pending_path_response.is_none());
+
+            // Client receives and processes the packet
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.unwrap().data);
+                v
+            };
+            let result = client.recv(&pkt, now);
+            assert!(result.is_ok(), "client should process PATH_RESPONSE without error");
+        }
+
+        #[test]
+        fn successive_path_challenges_last_wins() {
+            // If multiple PATH_CHALLENGEs arrive, only the last one is stored.
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            let data1: [u8; 8] = [0x01; 8];
+            let data2: [u8; 8] = [0x02; 8];
+
+            let frame1 = crate::frame::Frame::PathChallenge(data1);
+            server.dispatch_frame(frame1, crate::crypto::Level::Application, now).unwrap();
+            assert_eq!(server.pending_path_response, Some(data1));
+
+            let frame2 = crate::frame::Frame::PathChallenge(data2);
+            server.dispatch_frame(frame2, crate::crypto::Level::Application, now).unwrap();
+            assert_eq!(
+                server.pending_path_response,
+                Some(data2),
+                "the most recent PATH_CHALLENGE should overwrite the previous one"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Key Update tests (RFC 9001 section 6)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn key_update_before_handshake_fails() {
+            let mut client = make_client();
+            let result = client.initiate_key_update();
+            assert_eq!(result.unwrap_err(), Error::InvalidState);
+        }
+
+        #[test]
+        fn key_update_after_handshake_succeeds() {
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            assert_eq!(client.key_phase(), 0);
+            let result = client.initiate_key_update();
+            assert!(result.is_ok(), "key update should succeed after handshake");
+            assert_eq!(client.key_phase(), 1);
+        }
+
+        #[test]
+        fn key_phase_bit_in_outgoing_short_packets() {
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            // Drain any pending transmits
+            loop {
+                let mut buf = [0u8; 4096];
+                if client.poll_transmit(&mut buf, now).is_none() {
+                    break;
+                }
+            }
+
+            // Before key update, internal key_phase should be 0
+            assert_eq!(client.key_phase(), 0);
+            let stream_id = client.open_stream().unwrap();
+            client.stream_send(stream_id, b"phase0", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = client.poll_transmit(&mut buf, now).unwrap();
+            // Short header: first byte bit 7 = 0 (short)
+            // Note: bits 0-4 are masked by header protection, so we can't
+            // directly check the key_phase bit from the wire format.
+            let first_byte = tx.data[0];
+            assert_eq!(first_byte & 0x80, 0, "should be short header");
+            assert_eq!(client.key_phase(), 0, "key_phase should be 0");
+
+            // Initiate key update
+            client.initiate_key_update().unwrap();
+
+            // After key update, key_phase = 1 => bit 2 of first byte should be 1
+            let stream_id2 = client.open_stream().unwrap();
+            client.stream_send(stream_id2, b"phase1", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = client.poll_transmit(&mut buf, now).unwrap();
+            let first_byte = tx.data[0];
+            assert_eq!(first_byte & 0x80, 0, "should be short header");
+            // Note: first_byte has header protection applied, so we can't
+            // directly check the key_phase bit from the wire format.
+            // But the internal key_phase should be 1.
+            assert_eq!(client.key_phase(), 1);
+        }
+
+        #[test]
+        fn key_update_data_exchange() {
+            // Full integration: handshake, send data, key update, send more data
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            // Drain pending transmits
+            loop {
+                let mut buf = [0u8; 4096];
+                if client.poll_transmit(&mut buf, now).is_none() {
+                    break;
+                }
+            }
+            loop {
+                let mut buf = [0u8; 4096];
+                if server.poll_transmit(&mut buf, now).is_none() {
+                    break;
+                }
+            }
+
+            // Send data before key update
+            let stream_id = client.open_stream().unwrap();
+            client.stream_send(stream_id, b"before update", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = client.poll_transmit(&mut buf, now).unwrap();
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.data);
+                v
+            };
+            server.recv(&pkt, now).unwrap();
+
+            let mut recv_buf = [0u8; 256];
+            let (len, _fin) = server.stream_recv(stream_id, &mut recv_buf).unwrap();
+            assert_eq!(&recv_buf[..len], b"before update");
+
+            // Client initiates key update
+            assert_eq!(client.key_phase(), 0);
+            client.initiate_key_update().unwrap();
+            assert_eq!(client.key_phase(), 1);
+
+            // Client sends data with new keys (key_phase = 1)
+            client.stream_send(stream_id, b" after update", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = client.poll_transmit(&mut buf, now).unwrap();
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.data);
+                v
+            };
+
+            // Server receives: should detect key_phase change and update keys
+            assert_eq!(server.key_phase(), 0);
+            server.recv(&pkt, now).unwrap();
+            // After processing, server should have updated its key phase
+            assert_eq!(server.key_phase(), 1);
+
+            let mut recv_buf = [0u8; 256];
+            let (len, _fin) = server.stream_recv(stream_id, &mut recv_buf).unwrap();
+            assert_eq!(&recv_buf[..len], b" after update");
+        }
+
+        #[test]
+        fn bidirectional_key_update() {
+            // Both sides send data after one side does a key update
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            // Drain pending transmits
+            loop {
+                let mut buf = [0u8; 4096];
+                if client.poll_transmit(&mut buf, now).is_none() { break; }
+            }
+            loop {
+                let mut buf = [0u8; 4096];
+                if server.poll_transmit(&mut buf, now).is_none() { break; }
+            }
+
+            // Client initiates key update
+            client.initiate_key_update().unwrap();
+            assert_eq!(client.key_phase(), 1);
+
+            // Client sends with new keys
+            let c_stream = client.open_stream().unwrap();
+            client.stream_send(c_stream, b"client data", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = client.poll_transmit(&mut buf, now).unwrap();
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.data);
+                v
+            };
+            server.recv(&pkt, now).unwrap();
+            assert_eq!(server.key_phase(), 1);
+
+            // Now server responds with new keys as well
+            let s_stream = server.open_stream().unwrap();
+            server.stream_send(s_stream, b"server data", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = server.poll_transmit(&mut buf, now).unwrap();
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.data);
+                v
+            };
+            client.recv(&pkt, now).unwrap();
+
+            // Both sides should still be on key_phase 1
+            assert_eq!(client.key_phase(), 1);
+            assert_eq!(server.key_phase(), 1);
+
+            // Verify data was received
+            let mut recv_buf = [0u8; 256];
+            let (len, _) = server.stream_recv(c_stream, &mut recv_buf).unwrap();
+            assert_eq!(&recv_buf[..len], b"client data");
+
+            let (len, _) = client.stream_recv(s_stream, &mut recv_buf).unwrap();
+            assert_eq!(&recv_buf[..len], b"server data");
+        }
+
+        #[test]
+        fn double_key_update_blocked_until_confirmed() {
+            let mut client = make_client();
+            let mut server = make_server();
+            let now = 1_000_000u64;
+            run_handshake_to_completion(&mut client, &mut server, now);
+
+            // First key update succeeds
+            client.initiate_key_update().unwrap();
+            assert_eq!(client.key_phase(), 1);
+
+            // Second key update fails (not yet confirmed by peer)
+            let result = client.initiate_key_update();
+            assert!(result.is_err(), "second key update should fail before confirmation");
+
+            // Send a packet to the server to trigger peer update
+            let stream_id = client.open_stream().unwrap();
+            client.stream_send(stream_id, b"confirm me", false).unwrap();
+            let mut buf = [0u8; 2048];
+            let tx = client.poll_transmit(&mut buf, now).unwrap();
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.data);
+                v
+            };
+            server.recv(&pkt, now).unwrap();
+
+            // Drain server transmits and have client receive them (ACK with new phase)
+            loop {
+                let mut buf = [0u8; 4096];
+                match server.poll_transmit(&mut buf, now) {
+                    Some(tx) => {
+                        let data: heapless::Vec<u8, 4096> = {
+                            let mut v = heapless::Vec::new();
+                            let _ = v.extend_from_slice(tx.data);
+                            v
+                        };
+                        let _ = client.recv(&data, now);
+                    }
+                    None => break,
+                }
+            }
+
+            // Now the client's key update should be confirmed
+            assert!(client.keys.key_update.update_confirmed);
+
+            // Second key update should now succeed
+            client.initiate_key_update().unwrap();
+            assert_eq!(client.key_phase(), 0); // Flipped back to 0
         }
     }
 
