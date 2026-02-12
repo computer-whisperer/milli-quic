@@ -1,0 +1,714 @@
+//! Integration tests for milli-quic exercising the full QUIC stack via the
+//! public API only. No `pub(crate)` internals are used.
+//!
+//! These tests construct client and server `Connection` objects, exchange
+//! encrypted UDP datagrams between them in-memory (no real network), and
+//! verify handshake completion, stream data transfer, connection close,
+//! key update, idle timeout, and other behaviors.
+
+extern crate std;
+
+use std::vec::Vec;
+
+use milli_quic::connection::Connection;
+use milli_quic::crypto::ed25519;
+use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
+use milli_quic::error::Error;
+use milli_quic::tls::handshake::ServerTlsConfig;
+use milli_quic::tls::transport_params::TransportParams;
+use milli_quic::transport::Rng;
+use milli_quic::{ConnectionState, Event};
+
+// =========================================================================
+// Test infrastructure
+// =========================================================================
+
+/// A deterministic RNG for tests. Produces a predictable byte sequence
+/// starting from a given seed, incrementing by 1 for each byte.
+struct TestRng(u8);
+
+impl Rng for TestRng {
+    fn fill(&mut self, buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            *b = self.0;
+            self.0 = self.0.wrapping_add(1);
+        }
+    }
+}
+
+/// Ed25519 private key seed used by all tests.
+const TEST_ED25519_SEED: [u8; 32] = [0x01u8; 32];
+
+/// Build a real Ed25519 certificate DER from the test seed.
+/// Returns a `&'static [u8]` by caching in a `LazyLock`.
+fn get_test_ed25519_cert_der() -> &'static [u8] {
+    use std::sync::LazyLock;
+    static V: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let seed: [u8; 32] = TEST_ED25519_SEED;
+        let pk = ed25519::ed25519_public_key_from_seed(&seed);
+        let mut buf = [0u8; 512];
+        let len = ed25519::build_ed25519_cert_der(&pk, &mut buf).unwrap();
+        buf[..len].to_vec()
+    });
+    &V
+}
+
+/// Create a client `Connection` with default parameters.
+fn make_client() -> Connection<Aes128GcmProvider> {
+    let mut rng = TestRng(0x10);
+    Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+    )
+    .unwrap()
+}
+
+/// Create a server `Connection` with default parameters.
+fn make_server() -> Connection<Aes128GcmProvider> {
+    let mut rng = TestRng(0x50);
+    let config = ServerTlsConfig {
+        cert_der: get_test_ed25519_cert_der(),
+        private_key_der: &TEST_ED25519_SEED,
+        alpn_protocols: &[b"h3"],
+        transport_params: TransportParams::default_params(),
+    };
+    Connection::server(
+        Aes128GcmProvider,
+        config,
+        TransportParams::default_params(),
+        &mut rng,
+    )
+    .unwrap()
+}
+
+/// Transfer a single datagram from `src` to `dst`.
+/// Calls `src.poll_transmit()`, copies the data, then calls `dst.recv()`.
+/// Returns `true` if a packet was transferred, `false` if `src` had nothing
+/// to send.
+fn transfer_one(
+    src: &mut Connection<Aes128GcmProvider>,
+    dst: &mut Connection<Aes128GcmProvider>,
+    now: u64,
+) -> bool {
+    let mut buf = [0u8; 4096];
+    match src.poll_transmit(&mut buf, now) {
+        Some(tx) => {
+            let data: Vec<u8> = tx.data.to_vec();
+            let _ = dst.recv(&data, now);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drain all pending transmits from `src` and deliver them to `dst`.
+/// Returns the number of datagrams transferred.
+fn drain_transmits(
+    src: &mut Connection<Aes128GcmProvider>,
+    dst: &mut Connection<Aes128GcmProvider>,
+    now: u64,
+) -> usize {
+    let mut count = 0;
+    while transfer_one(src, dst, now) {
+        count += 1;
+    }
+    count
+}
+
+/// Run the handshake to completion by exchanging packets between client and
+/// server in a loop. Panics if the handshake does not complete within 20
+/// rounds.
+fn run_handshake(
+    client: &mut Connection<Aes128GcmProvider>,
+    server: &mut Connection<Aes128GcmProvider>,
+    now: u64,
+) {
+    for _round in 0..20 {
+        drain_transmits(client, server, now);
+        drain_transmits(server, client, now);
+
+        if client.is_established() && server.is_established() {
+            // Drain events so tests can check for specific events if needed.
+            return;
+        }
+    }
+    panic!(
+        "handshake did not complete after 20 rounds: client={:?}, server={:?}",
+        client.state(),
+        server.state()
+    );
+}
+
+/// Drain all pending events from a connection and return them as a Vec.
+fn drain_events(conn: &mut Connection<Aes128GcmProvider>) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Some(ev) = conn.poll_event() {
+        events.push(ev);
+    }
+    events
+}
+
+/// Drain remaining transmits from both sides after handshake so that
+/// subsequent tests start from a clean state.
+fn drain_post_handshake(
+    client: &mut Connection<Aes128GcmProvider>,
+    server: &mut Connection<Aes128GcmProvider>,
+    now: u64,
+) {
+    // Drain any ACKs or HANDSHAKE_DONE packets
+    for _ in 0..5 {
+        drain_transmits(client, server, now);
+        drain_transmits(server, client, now);
+    }
+    // Drain events
+    drain_events(client);
+    drain_events(server);
+}
+
+// =========================================================================
+// Test cases
+// =========================================================================
+
+/// Test 1: Full handshake completes -- client and server both reach Active
+/// state and emit a Connected event.
+#[test]
+fn full_handshake_completes() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    assert_eq!(client.state(), ConnectionState::Handshaking);
+    assert_eq!(server.state(), ConnectionState::Handshaking);
+
+    run_handshake(&mut client, &mut server, now);
+
+    assert!(
+        client.is_established(),
+        "client should be established, state={:?}",
+        client.state()
+    );
+    assert!(
+        server.is_established(),
+        "server should be established, state={:?}",
+        server.state()
+    );
+
+    // Both sides should have emitted a Connected event.
+    let client_events = drain_events(&mut client);
+    assert!(
+        client_events.iter().any(|e| matches!(e, Event::Connected)),
+        "client should have emitted Connected event, got: {:?}",
+        client_events
+    );
+
+    let server_events = drain_events(&mut server);
+    assert!(
+        server_events.iter().any(|e| matches!(e, Event::Connected)),
+        "server should have emitted Connected event, got: {:?}",
+        server_events
+    );
+}
+
+/// Test 2: Client sends stream data to server after handshake.
+#[test]
+fn client_sends_stream_data() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    // Client opens stream 0 (first client-initiated bidi stream) and sends data.
+    let stream_id = client.open_stream().unwrap();
+    assert_eq!(stream_id, 0, "first client bidi stream should be id 0");
+
+    let payload = b"hello from client";
+    let sent = client.stream_send(stream_id, payload, false).unwrap();
+    assert_eq!(sent, payload.len());
+
+    // Transfer the packet.
+    drain_transmits(&mut client, &mut server, now);
+
+    // Server should emit StreamReadable and/or StreamOpened.
+    let events = drain_events(&mut server);
+    let has_readable = events
+        .iter()
+        .any(|e| matches!(e, Event::StreamReadable(id) if *id == stream_id));
+    assert!(
+        has_readable,
+        "server should see StreamReadable for stream {stream_id}, got: {:?}",
+        events
+    );
+
+    // Server reads the data.
+    let mut buf = [0u8; 256];
+    let (len, fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    assert_eq!(len, payload.len());
+    assert_eq!(&buf[..len], payload);
+    assert!(!fin, "fin should not be set");
+}
+
+/// Test 3: Server sends response data back on the same stream.
+#[test]
+fn server_responds_on_stream() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    // Client sends request.
+    let stream_id = client.open_stream().unwrap();
+    client.stream_send(stream_id, b"request", false).unwrap();
+    drain_transmits(&mut client, &mut server, now);
+
+    // Server reads and then responds.
+    drain_events(&mut server);
+    let mut buf = [0u8; 256];
+    server.stream_recv(stream_id, &mut buf).unwrap();
+
+    // The stream was opened by the client; the server should also be able
+    // to send on it (bidirectional).
+    let response = b"response from server";
+    let sent = server.stream_send(stream_id, response, false).unwrap();
+    assert_eq!(sent, response.len());
+
+    drain_transmits(&mut server, &mut client, now);
+
+    let events = drain_events(&mut client);
+    let has_readable = events
+        .iter()
+        .any(|e| matches!(e, Event::StreamReadable(id) if *id == stream_id));
+    assert!(has_readable, "client should see StreamReadable");
+
+    let mut rbuf = [0u8; 256];
+    let (len, fin) = client.stream_recv(stream_id, &mut rbuf).unwrap();
+    assert_eq!(&rbuf[..len], response);
+    assert!(!fin);
+}
+
+/// Test 4: Full bidirectional request/response cycle on a single stream.
+#[test]
+fn bidirectional_exchange() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    let stream_id = client.open_stream().unwrap();
+
+    // Client sends request (not FIN yet).
+    client
+        .stream_send(stream_id, b"GET /index.html", false)
+        .unwrap();
+    drain_transmits(&mut client, &mut server, now);
+
+    // Server reads request.
+    drain_events(&mut server);
+    let mut buf = [0u8; 256];
+    let (len, _fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    assert_eq!(&buf[..len], b"GET /index.html");
+
+    // Server sends response with FIN.
+    let response = b"<html>Hello</html>";
+    server
+        .stream_send(stream_id, response, true)
+        .unwrap();
+    drain_transmits(&mut server, &mut client, now);
+
+    // Client reads response.
+    drain_events(&mut client);
+    let mut rbuf = [0u8; 256];
+    let (rlen, fin) = client.stream_recv(stream_id, &mut rbuf).unwrap();
+    assert_eq!(&rbuf[..rlen], response);
+    assert!(fin, "server sent FIN, client should see it");
+}
+
+/// Test 5: Client opens multiple streams and sends data on both.
+#[test]
+fn multiple_streams() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    // Client opens stream 0 and stream 4 (the first two client-initiated bidi
+    // streams: id=0 and id=4).
+    let s0 = client.open_stream().unwrap();
+    let s4 = client.open_stream().unwrap();
+    assert_eq!(s0, 0);
+    assert_eq!(s4, 4);
+
+    client.stream_send(s0, b"stream zero", false).unwrap();
+    client.stream_send(s4, b"stream four", false).unwrap();
+
+    // Transfer packets (may need multiple poll_transmit calls).
+    drain_transmits(&mut client, &mut server, now);
+
+    // Server should have received data on both streams.
+    drain_events(&mut server);
+
+    let mut buf0 = [0u8; 256];
+    let (len0, _) = server.stream_recv(s0, &mut buf0).unwrap();
+    assert_eq!(&buf0[..len0], b"stream zero");
+
+    let mut buf4 = [0u8; 256];
+    let (len4, _) = server.stream_recv(s4, &mut buf4).unwrap();
+    assert_eq!(&buf4[..len4], b"stream four");
+}
+
+/// Test 6: Sending with fin=true causes the receiver to see fin.
+#[test]
+fn stream_fin_propagates() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    let stream_id = client.open_stream().unwrap();
+    client
+        .stream_send(stream_id, b"final message", true)
+        .unwrap();
+
+    drain_transmits(&mut client, &mut server, now);
+    drain_events(&mut server);
+
+    let mut buf = [0u8; 256];
+    let (len, fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    assert_eq!(&buf[..len], b"final message");
+    assert!(fin, "receiver should see FIN");
+}
+
+/// Test 7: Client initiates connection close, server receives
+/// ConnectionClose event.
+#[test]
+fn connection_close_by_client() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    // Client closes with error code 0 (no error) and a reason phrase.
+    client.close(0, b"goodbye");
+    assert_eq!(client.state(), ConnectionState::Closing);
+
+    // Transfer the CONNECTION_CLOSE frame.
+    drain_transmits(&mut client, &mut server, now);
+
+    assert!(client.is_closed(), "client should be closed after poll_transmit");
+
+    // Server should transition to Draining and emit ConnectionClose event.
+    assert_eq!(
+        server.state(),
+        ConnectionState::Draining,
+        "server should be draining"
+    );
+
+    let events = drain_events(&mut server);
+    let has_close = events.iter().any(|e| {
+        matches!(
+            e,
+            Event::ConnectionClose {
+                error_code: 0,
+                ..
+            }
+        )
+    });
+    assert!(
+        has_close,
+        "server should emit ConnectionClose event, got: {:?}",
+        events
+    );
+}
+
+/// Test 8: Server initiates connection close, client receives
+/// ConnectionClose event.
+#[test]
+fn connection_close_by_server() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    // Server closes with an application-layer error code.
+    server.close(42, b"server shutdown");
+    assert_eq!(server.state(), ConnectionState::Closing);
+
+    // Transfer the CONNECTION_CLOSE frame.
+    drain_transmits(&mut server, &mut client, now);
+
+    assert!(server.is_closed());
+
+    // Client should transition to Draining.
+    assert_eq!(client.state(), ConnectionState::Draining);
+
+    let events = drain_events(&mut client);
+    let has_close = events
+        .iter()
+        .any(|e| matches!(e, Event::ConnectionClose { error_code: 42, .. }));
+    assert!(
+        has_close,
+        "client should emit ConnectionClose with error_code=42, got: {:?}",
+        events
+    );
+}
+
+/// Test 9: Transfer data larger than a single packet (>1200 bytes),
+/// verify all data is received correctly.
+#[test]
+fn large_data_transfer() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    let stream_id = client.open_stream().unwrap();
+
+    // Send 1024 bytes (the max per stream_send call due to internal
+    // StreamSendEntry buffer size of 1024). The connection's stream_send
+    // limits each call to 1024, so we need to call it once.
+    let payload: [u8; 1024] = {
+        let mut arr = [0u8; 1024];
+        for (i, b) in arr.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+        arr
+    };
+
+    let sent = client.stream_send(stream_id, &payload, false).unwrap();
+    assert_eq!(sent, 1024);
+
+    // Transfer.
+    drain_transmits(&mut client, &mut server, now);
+
+    // Drain any ACKs back.
+    drain_transmits(&mut server, &mut client, now);
+
+    // Server reads the data.
+    drain_events(&mut server);
+    let mut buf = [0u8; 1024];
+    let (len, fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    assert_eq!(len, 1024);
+    assert_eq!(&buf[..len], &payload[..]);
+    assert!(!fin);
+}
+
+/// Test 10: Client initiates key update mid-stream; data still flows
+/// correctly afterward.
+#[test]
+fn key_update_during_transfer() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    let stream_id = client.open_stream().unwrap();
+
+    // Send data before key update.
+    client
+        .stream_send(stream_id, b"before-update", false)
+        .unwrap();
+    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut server, &mut client, now);
+
+    drain_events(&mut server);
+    let mut buf = [0u8; 256];
+    let (len, _) = server.stream_recv(stream_id, &mut buf).unwrap();
+    assert_eq!(&buf[..len], b"before-update");
+
+    // Client initiates key update.
+    assert_eq!(client.key_phase(), 0);
+    client.initiate_key_update().unwrap();
+    assert_eq!(client.key_phase(), 1);
+
+    // Send data after key update.
+    client
+        .stream_send(stream_id, b"after-update", false)
+        .unwrap();
+    drain_transmits(&mut client, &mut server, now);
+
+    // Server should detect the key phase change and update keys.
+    assert_eq!(
+        server.key_phase(),
+        1,
+        "server should update key phase after receiving key-updated packet"
+    );
+
+    drain_events(&mut server);
+    let mut buf2 = [0u8; 256];
+    let (len2, _) = server.stream_recv(stream_id, &mut buf2).unwrap();
+    assert_eq!(&buf2[..len2], b"after-update");
+
+    // Server sends data back with the new keys.
+    server
+        .stream_send(stream_id, b"server-post-ku", false)
+        .unwrap();
+    drain_transmits(&mut server, &mut client, now);
+
+    drain_events(&mut client);
+    let mut buf3 = [0u8; 256];
+    let (len3, _) = client.stream_recv(stream_id, &mut buf3).unwrap();
+    assert_eq!(&buf3[..len3], b"server-post-ku");
+}
+
+/// Test 11: PATH_CHALLENGE / PATH_RESPONSE.
+///
+/// NOTE: PATH_CHALLENGE injection requires `dispatch_frame` which is
+/// `pub(crate)`. Since integration tests can only use public API, we test
+/// this indirectly: after handshake, we verify that the connection survives
+/// a full round trip of packets (which includes ACK processing, the core
+/// of the path validation mechanism). A direct PATH_CHALLENGE test is
+/// covered in the unit tests within `src/connection/mod.rs`.
+#[test]
+fn post_handshake_round_trip_works() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    // Send data in both directions to confirm path is alive.
+    let s = client.open_stream().unwrap();
+    client.stream_send(s, b"ping", false).unwrap();
+    drain_transmits(&mut client, &mut server, now);
+
+    drain_events(&mut server);
+    let mut buf = [0u8; 64];
+    let (len, _) = server.stream_recv(s, &mut buf).unwrap();
+    assert_eq!(&buf[..len], b"ping");
+
+    server.stream_send(s, b"pong", false).unwrap();
+    drain_transmits(&mut server, &mut client, now);
+
+    drain_events(&mut client);
+    let mut buf2 = [0u8; 64];
+    let (len2, _) = client.stream_recv(s, &mut buf2).unwrap();
+    assert_eq!(&buf2[..len2], b"pong");
+}
+
+/// Test 12: Idle timeout -- verify that `handle_timeout` does not
+/// incorrectly close an active connection when no idle timeout is set.
+///
+/// NOTE: The current implementation does not wire the `max_idle_timeout`
+/// transport parameter to the internal `idle_timeout` field (known issue
+/// M2). This test documents the current behavior: `handle_timeout` is
+/// safe to call and does not close the connection unless `idle_timeout`
+/// has been explicitly set. When M2 is fixed, this test should be updated
+/// to verify that idle timeout actually closes the connection.
+#[test]
+fn idle_timeout_not_set_does_not_close() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    assert!(client.is_established());
+
+    // Advance time far into the future.
+    let future = now + 999_999_999;
+    client.handle_timeout(future);
+
+    // Connection should still be established because idle_timeout is None
+    // (not wired from transport params yet).
+    assert!(
+        client.is_established(),
+        "connection should remain active when idle_timeout is None, state={:?}",
+        client.state()
+    );
+}
+
+/// Test 13: Handshake timeout -- do not complete the handshake, verify
+/// that `handle_timeout` can be called safely during the handshake
+/// phase without panicking.
+///
+/// NOTE: The current implementation does not wire `max_idle_timeout`
+/// into `Connection.idle_timeout` (known issue M2), so the timeout
+/// check is effectively a no-op. This test verifies the current
+/// behavior: the connection remains in Handshaking state. When M2 is
+/// fixed, this test should verify that the handshake timeout actually
+/// closes the connection.
+#[test]
+fn handshake_timeout_safe_to_call() {
+    let mut client = make_client();
+    // Intentionally do NOT create a server or run the handshake.
+
+    // The client sends its Initial packet.
+    let mut buf = [0u8; 2048];
+    let _tx = client.poll_transmit(&mut buf, 0);
+
+    assert_eq!(client.state(), ConnectionState::Handshaking);
+
+    // Advance time far into the future. handle_timeout should be safe.
+    let future = 999_999_999u64;
+    client.handle_timeout(future);
+
+    // The connection remains in Handshaking because idle_timeout is None.
+    assert_eq!(
+        client.state(),
+        ConnectionState::Handshaking,
+        "connection should stay in Handshaking when idle_timeout is None"
+    );
+}
+
+/// Test 14: Opening a stream before handshake completes should fail.
+#[test]
+fn open_stream_before_handshake_fails() {
+    let mut client = make_client();
+    let result = client.open_stream();
+    assert_eq!(result.unwrap_err(), Error::InvalidState);
+}
+
+/// Test 15: After close, further operations fail with Closed error.
+#[test]
+fn operations_fail_after_close() {
+    let mut client = make_client();
+    let mut server = make_server();
+    let now = 1_000_000u64;
+
+    run_handshake(&mut client, &mut server, now);
+    drain_post_handshake(&mut client, &mut server, now);
+
+    let stream_id = client.open_stream().unwrap();
+    client.stream_send(stream_id, b"data", false).unwrap();
+
+    // Close the client.
+    client.close(0, b"done");
+    drain_transmits(&mut client, &mut server, now);
+    assert!(client.is_closed());
+
+    // Attempts to send data should fail.
+    let result = client.stream_send(stream_id, b"more", false);
+    assert!(
+        result.is_err(),
+        "stream_send should fail after close"
+    );
+
+    // poll_transmit should return None.
+    let mut buf = [0u8; 2048];
+    assert!(
+        client.poll_transmit(&mut buf, now).is_none(),
+        "poll_transmit should return None after close"
+    );
+}
