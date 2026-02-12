@@ -75,9 +75,8 @@ pub struct H3Connection<
     const MAX_CIDS: usize = 4,
     const STREAM_BUF: usize = 1024,
     const SEND_QUEUE: usize = 16,
-    const CRYPTO_BUF: usize = 4096,
 > {
-    pub(crate) quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>,
+    pub(crate) quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
 
     // Control streams
     pub(crate) local_control_stream: Option<u64>,
@@ -110,13 +109,13 @@ pub struct H3Connection<
     pub(crate) pending_uni_streams: heapless::Vec<u64, 16>,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
-    H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
+    H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
 where
     C::Hkdf: Default,
 {
     /// Create a new H3Connection wrapping an underlying QUIC connection.
-    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>) -> Self {
         Self {
             quic,
             local_control_stream: None,
@@ -555,7 +554,7 @@ where
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 mod tests {
     use super::*;
-    use crate::connection::Connection;
+    use crate::connection::{Connection, HandshakePool};
     use crate::crypto::rustcrypto::Aes128GcmProvider;
     use crate::h3::client::H3Client;
     use crate::h3::server::H3Server;
@@ -587,7 +586,11 @@ mod tests {
         }
     }
 
-    fn make_quic_client() -> Connection<Aes128GcmProvider> {
+    fn make_pool() -> HandshakePool<Aes128GcmProvider, 2> {
+        HandshakePool::new()
+    }
+
+    fn make_quic_client(pool: &mut HandshakePool<Aes128GcmProvider, 2>) -> Connection<Aes128GcmProvider> {
         let mut rng = TestRng(0x10);
         Connection::client(
             Aes128GcmProvider,
@@ -595,11 +598,12 @@ mod tests {
             &[b"h3"],
             TransportParams::default_params(),
             &mut rng,
+            pool,
         )
         .unwrap()
     }
 
-    fn make_quic_server() -> Connection<Aes128GcmProvider> {
+    fn make_quic_server(pool: &mut HandshakePool<Aes128GcmProvider, 2>) -> Connection<Aes128GcmProvider> {
         let mut rng = TestRng(0x50);
         let config = ServerTlsConfig {
             cert_der: get_test_ed25519_cert_der(),
@@ -612,6 +616,7 @@ mod tests {
             config,
             TransportParams::default_params(),
             &mut rng,
+            pool,
         )
         .unwrap()
     }
@@ -621,16 +626,17 @@ mod tests {
         client: &mut Connection<Aes128GcmProvider>,
         server: &mut Connection<Aes128GcmProvider>,
         now: u64,
+        pool: &mut HandshakePool<Aes128GcmProvider, 2>,
     ) {
         for _round in 0..20 {
             // Client -> Server
             loop {
                 let mut buf = [0u8; 4096];
-                match client.poll_transmit(&mut buf, now) {
+                match client.poll_transmit(&mut buf, now, pool) {
                     Some(tx) => {
                         let mut data: heapless::Vec<u8, 4096> = heapless::Vec::new();
                         let _ = data.extend_from_slice(tx.data);
-                        let _ = server.recv(&data, now);
+                        let _ = server.recv(&data, now, pool);
                     }
                     None => break,
                 }
@@ -639,11 +645,11 @@ mod tests {
             // Server -> Client
             loop {
                 let mut buf = [0u8; 4096];
-                match server.poll_transmit(&mut buf, now) {
+                match server.poll_transmit(&mut buf, now, pool) {
                     Some(tx) => {
                         let mut data: heapless::Vec<u8, 4096> = heapless::Vec::new();
                         let _ = data.extend_from_slice(tx.data);
-                        let _ = client.recv(&data, now);
+                        let _ = client.recv(&data, now, pool);
                     }
                     None => break,
                 }
@@ -666,6 +672,7 @@ mod tests {
         client: &mut H3Client<Aes128GcmProvider>,
         server: &mut H3Server<Aes128GcmProvider>,
         now: u64,
+        pool: &mut HandshakePool<Aes128GcmProvider, 2>,
     ) {
         for _round in 0..10 {
             let mut any_sent = false;
@@ -673,11 +680,11 @@ mod tests {
             // Client -> Server
             loop {
                 let mut buf = [0u8; 4096];
-                match client.poll_transmit(&mut buf, now) {
+                match client.poll_transmit(&mut buf, now, pool) {
                     Some(tx) => {
                         let mut data: heapless::Vec<u8, 4096> = heapless::Vec::new();
                         let _ = data.extend_from_slice(tx.data);
-                        let _ = server.recv(&data, now);
+                        let _ = server.recv(&data, now, pool);
                         any_sent = true;
                     }
                     None => break,
@@ -687,11 +694,11 @@ mod tests {
             // Server -> Client
             loop {
                 let mut buf = [0u8; 4096];
-                match server.poll_transmit(&mut buf, now) {
+                match server.poll_transmit(&mut buf, now, pool) {
                     Some(tx) => {
                         let mut data: heapless::Vec<u8, 4096> = heapless::Vec::new();
                         let _ = data.extend_from_slice(tx.data);
-                        let _ = client.recv(&data, now);
+                        let _ = client.recv(&data, now, pool);
                         any_sent = true;
                     }
                     None => break,
@@ -710,9 +717,9 @@ mod tests {
 
     #[test]
     fn h3_client_creation() {
-        let quic = make_quic_client();
+        let mut pool = make_pool();
+        let quic = make_quic_client(&mut pool);
         let _client = H3Client::new(quic);
-        // Client is created. No panic = success.
     }
 
     // -----------------------------------------------------------------------
@@ -721,9 +728,9 @@ mod tests {
 
     #[test]
     fn h3_server_creation() {
-        let quic = make_quic_server();
+        let mut pool = make_pool();
+        let quic = make_quic_server(&mut pool);
         let _server = H3Server::new(quic);
-        // Server is created. No panic = success.
     }
 
     // -----------------------------------------------------------------------
@@ -732,7 +739,8 @@ mod tests {
 
     #[test]
     fn h3_connection_initial_state() {
-        let quic = make_quic_client();
+        let mut pool = make_pool();
+        let quic = make_quic_client(&mut pool);
         let h3 = H3Connection::new(quic);
         assert!(h3.local_control_stream.is_none());
         assert!(h3.peer_control_stream.is_none());
@@ -752,26 +760,10 @@ mod tests {
     #[test]
     fn settings_exchange() {
         let now = 1_000_000u64;
-        let mut quic_client = make_quic_client();
-        let mut quic_server = make_quic_server();
-        run_quic_handshake(&mut quic_client, &mut quic_server, now);
-
-        // Drain Connected events from the QUIC layer.
-        while quic_client.poll_event().is_some() {}
-        while quic_server.poll_event().is_some() {}
-
-        let client = H3Client::new(quic_client);
-        let server = H3Server::new(quic_server);
-
-        // The H3 layer needs to see the Connected event to set up streams.
-        // Since we already drained it, we need to manually trigger setup.
-        // Re-create with fresh connections that still have the Connected event.
-        drop(client);
-        drop(server);
-
-        let mut quic_client = make_quic_client();
-        let mut quic_server = make_quic_server();
-        run_quic_handshake(&mut quic_client, &mut quic_server, now);
+        let mut pool = make_pool();
+        let mut quic_client = make_quic_client(&mut pool);
+        let mut quic_server = make_quic_server(&mut pool);
+        run_quic_handshake(&mut quic_client, &mut quic_server, now, &mut pool);
 
         // DON'T drain events -- let the H3 wrappers see them.
         let mut client = H3Client::new(quic_client);
@@ -779,11 +771,11 @@ mod tests {
 
         // poll_event processes QUIC events -> sees Connected -> sets up H3 streams.
         // Then we exchange the H3 setup packets.
-        let _ = client.poll_event(); // triggers setup_h3_streams for client
-        let _ = server.poll_event(); // triggers setup_h3_streams for server
+        let _ = client.poll_event();
+        let _ = server.poll_event();
 
         // Exchange the control stream packets.
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Now poll events again to pick up the peer's SETTINGS.
         let mut client_connected = false;
@@ -803,7 +795,7 @@ mod tests {
             if client_connected && server_connected {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
 
         assert!(
@@ -823,9 +815,10 @@ mod tests {
     #[test]
     fn full_http3_request_response() {
         let now = 1_000_000u64;
-        let mut quic_client = make_quic_client();
-        let mut quic_server = make_quic_server();
-        run_quic_handshake(&mut quic_client, &mut quic_server, now);
+        let mut pool = make_pool();
+        let mut quic_client = make_quic_client(&mut pool);
+        let mut quic_server = make_quic_server(&mut pool);
+        run_quic_handshake(&mut quic_client, &mut quic_server, now, &mut pool);
 
         let mut client = H3Client::new(quic_client);
         let mut server = H3Server::new(quic_server);
@@ -835,7 +828,7 @@ mod tests {
         let _ = server.poll_event();
 
         // Exchange H3 control stream setup.
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Client sends GET request.
         let stream_id = client.send_request("GET", "/", "test.local", &[]).unwrap();
@@ -844,7 +837,7 @@ mod tests {
         client.send_body(stream_id, &[], true).unwrap();
 
         // Exchange packets so server receives the request.
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Server should see Headers event.
         let mut got_headers = false;
@@ -859,7 +852,7 @@ mod tests {
             if got_headers {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
         assert!(got_headers, "server should receive H3Event::Headers");
 
@@ -889,7 +882,7 @@ mod tests {
             .unwrap();
 
         // Exchange packets so client receives the response.
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Client should see Headers event.
         let mut got_response_headers = false;
@@ -909,7 +902,7 @@ mod tests {
             if got_response_headers && got_response_data {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
         assert!(
             got_response_headers,
@@ -942,9 +935,10 @@ mod tests {
     #[test]
     fn multiple_requests() {
         let now = 1_000_000u64;
-        let mut quic_client = make_quic_client();
-        let mut quic_server = make_quic_server();
-        run_quic_handshake(&mut quic_client, &mut quic_server, now);
+        let mut pool = make_pool();
+        let mut quic_client = make_quic_client(&mut pool);
+        let mut quic_server = make_quic_server(&mut pool);
+        run_quic_handshake(&mut quic_client, &mut quic_server, now, &mut pool);
 
         let mut client = H3Client::new(quic_client);
         let mut server = H3Server::new(quic_server);
@@ -952,7 +946,7 @@ mod tests {
         // Trigger H3 setup.
         let _ = client.poll_event();
         let _ = server.poll_event();
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Send two requests.
         let stream1 = client.send_request("GET", "/page1", "test.local", &[]).unwrap();
@@ -965,7 +959,7 @@ mod tests {
         assert_ne!(stream1, stream2);
 
         // Exchange packets.
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Server should receive headers for both streams.
         let mut header_streams: heapless::Vec<u64, 4> = heapless::Vec::new();
@@ -978,7 +972,7 @@ mod tests {
             if header_streams.len() >= 2 {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
 
         assert!(
@@ -1024,14 +1018,10 @@ mod tests {
 
     #[test]
     fn client_poll_event_empty_initially() {
-        let quic = make_quic_client();
+        let mut pool = make_pool();
+        let quic = make_quic_client(&mut pool);
         let mut client = H3Client::new(quic);
-        // No QUIC events (connection not established), so no H3 events.
-        // (poll_event may process quic events but there are none meaningful yet)
-        // We just check it doesn't panic and returns None eventually.
         let _ev = client.poll_event();
-        // No assertion on the value since the initial poll_transmit
-        // hasn't happened yet; just verify no panic.
     }
 
     // -----------------------------------------------------------------------
@@ -1040,7 +1030,8 @@ mod tests {
 
     #[test]
     fn server_poll_event_empty_initially() {
-        let quic = make_quic_server();
+        let mut pool = make_pool();
+        let quic = make_quic_server(&mut pool);
         let mut server = H3Server::new(quic);
         let _ev = server.poll_event();
     }
@@ -1052,16 +1043,17 @@ mod tests {
     #[test]
     fn request_with_custom_headers() {
         let now = 1_000_000u64;
-        let mut quic_client = make_quic_client();
-        let mut quic_server = make_quic_server();
-        run_quic_handshake(&mut quic_client, &mut quic_server, now);
+        let mut pool = make_pool();
+        let mut quic_client = make_quic_client(&mut pool);
+        let mut quic_server = make_quic_server(&mut pool);
+        run_quic_handshake(&mut quic_client, &mut quic_server, now, &mut pool);
 
         let mut client = H3Client::new(quic_client);
         let mut server = H3Server::new(quic_server);
 
         let _ = client.poll_event();
         let _ = server.poll_event();
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Send request with custom headers.
         let stream_id = client
@@ -1081,7 +1073,7 @@ mod tests {
         client.send_body(stream_id, body, true).unwrap();
 
         // Exchange.
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Server receives.
         let mut got_headers = false;
@@ -1094,7 +1086,7 @@ mod tests {
             if got_headers {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
         assert!(got_headers, "server should receive request headers");
     }

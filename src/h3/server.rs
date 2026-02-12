@@ -3,7 +3,7 @@
 //! Wraps a QUIC [`Connection`] as an HTTP/3 server capable of receiving
 //! requests and sending responses.
 
-use crate::connection::{Connection, Transmit};
+use crate::connection::{Connection, HandshakePoolAccess, Transmit};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
 use crate::Instant;
@@ -22,18 +22,17 @@ pub struct H3Server<
     const MAX_CIDS: usize = 4,
     const STREAM_BUF: usize = 1024,
     const SEND_QUEUE: usize = 16,
-    const CRYPTO_BUF: usize = 4096,
 > {
-    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>,
+    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
-    H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
+    H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
 where
     C::Hkdf: Default,
 {
     /// Wrap a QUIC connection as an HTTP/3 server.
-    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>) -> Self {
         Self {
             inner: H3Connection::new(quic),
         }
@@ -106,17 +105,18 @@ where
     // ------------------------------------------------------------------
 
     /// Process an incoming UDP datagram.
-    pub fn recv(&mut self, datagram: &[u8], now: Instant) -> Result<(), Error> {
-        self.inner.quic.recv(datagram, now)
+    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], now: Instant, pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+        self.inner.quic.recv(datagram, now, pool)
     }
 
     /// Build the next outgoing UDP datagram.
-    pub fn poll_transmit<'a>(
+    pub fn poll_transmit<'a, const CRYPTO_BUF: usize>(
         &mut self,
         buf: &'a mut [u8],
         now: Instant,
+        pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
     ) -> Option<Transmit<'a>> {
-        self.inner.quic.poll_transmit(buf, now)
+        self.inner.quic.poll_transmit(buf, now, pool)
     }
 
     /// Get the next timer deadline.

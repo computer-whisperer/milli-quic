@@ -11,6 +11,7 @@ extern crate std;
 use std::vec::Vec;
 
 use milli_quic::connection::Connection;
+use milli_quic::connection::HandshakePool;
 use milli_quic::crypto::ed25519;
 use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
 use milli_quic::error::Error;
@@ -53,8 +54,13 @@ fn get_test_ed25519_cert_der() -> &'static [u8] {
     &V
 }
 
+/// Create a handshake pool for tests.
+fn make_pool() -> HandshakePool<Aes128GcmProvider, 4> {
+    HandshakePool::new()
+}
+
 /// Create a client `Connection` with default parameters.
-fn make_client() -> Connection<Aes128GcmProvider> {
+fn make_client(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
     let mut rng = TestRng(0x10);
     Connection::client(
         Aes128GcmProvider,
@@ -62,12 +68,13 @@ fn make_client() -> Connection<Aes128GcmProvider> {
         &[b"h3"],
         TransportParams::default_params(),
         &mut rng,
+        pool,
     )
     .unwrap()
 }
 
 /// Create a server `Connection` with default parameters.
-fn make_server() -> Connection<Aes128GcmProvider> {
+fn make_server(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
     let mut rng = TestRng(0x50);
     let config = ServerTlsConfig {
         cert_der: get_test_ed25519_cert_der(),
@@ -80,6 +87,7 @@ fn make_server() -> Connection<Aes128GcmProvider> {
         config,
         TransportParams::default_params(),
         &mut rng,
+        pool,
     )
     .unwrap()
 }
@@ -92,12 +100,13 @@ fn transfer_one(
     src: &mut Connection<Aes128GcmProvider>,
     dst: &mut Connection<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) -> bool {
     let mut buf = [0u8; 4096];
-    match src.poll_transmit(&mut buf, now) {
+    match src.poll_transmit(&mut buf, now, pool) {
         Some(tx) => {
             let data: Vec<u8> = tx.data.to_vec();
-            let _ = dst.recv(&data, now);
+            let _ = dst.recv(&data, now, pool);
             true
         }
         None => false,
@@ -110,9 +119,10 @@ fn drain_transmits(
     src: &mut Connection<Aes128GcmProvider>,
     dst: &mut Connection<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) -> usize {
     let mut count = 0;
-    while transfer_one(src, dst, now) {
+    while transfer_one(src, dst, now, pool) {
         count += 1;
     }
     count
@@ -125,10 +135,11 @@ fn run_handshake(
     client: &mut Connection<Aes128GcmProvider>,
     server: &mut Connection<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
     for _round in 0..20 {
-        drain_transmits(client, server, now);
-        drain_transmits(server, client, now);
+        drain_transmits(client, server, now, pool);
+        drain_transmits(server, client, now, pool);
 
         if client.is_established() && server.is_established() {
             // Drain events so tests can check for specific events if needed.
@@ -157,11 +168,12 @@ fn drain_post_handshake(
     client: &mut Connection<Aes128GcmProvider>,
     server: &mut Connection<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
     // Drain any ACKs or HANDSHAKE_DONE packets
     for _ in 0..5 {
-        drain_transmits(client, server, now);
-        drain_transmits(server, client, now);
+        drain_transmits(client, server, now, pool);
+        drain_transmits(server, client, now, pool);
     }
     // Drain events
     drain_events(client);
@@ -176,14 +188,15 @@ fn drain_post_handshake(
 /// state and emit a Connected event.
 #[test]
 fn full_handshake_completes() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
     assert_eq!(client.state(), ConnectionState::Handshaking);
     assert_eq!(server.state(), ConnectionState::Handshaking);
 
-    run_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
 
     assert!(
         client.is_established(),
@@ -215,12 +228,13 @@ fn full_handshake_completes() {
 /// Test 2: Client sends stream data to server after handshake.
 #[test]
 fn client_sends_stream_data() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     // Client opens stream 0 (first client-initiated bidi stream) and sends data.
     let stream_id = client.open_stream().unwrap();
@@ -231,7 +245,7 @@ fn client_sends_stream_data() {
     assert_eq!(sent, payload.len());
 
     // Transfer the packet.
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     // Server should emit StreamReadable and/or StreamOpened.
     let events = drain_events(&mut server);
@@ -255,17 +269,18 @@ fn client_sends_stream_data() {
 /// Test 3: Server sends response data back on the same stream.
 #[test]
 fn server_responds_on_stream() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     // Client sends request.
     let stream_id = client.open_stream().unwrap();
     client.stream_send(stream_id, b"request", false).unwrap();
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     // Server reads and then responds.
     drain_events(&mut server);
@@ -278,7 +293,7 @@ fn server_responds_on_stream() {
     let sent = server.stream_send(stream_id, response, false).unwrap();
     assert_eq!(sent, response.len());
 
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     let events = drain_events(&mut client);
     let has_readable = events
@@ -295,12 +310,13 @@ fn server_responds_on_stream() {
 /// Test 4: Full bidirectional request/response cycle on a single stream.
 #[test]
 fn bidirectional_exchange() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
 
@@ -308,7 +324,7 @@ fn bidirectional_exchange() {
     client
         .stream_send(stream_id, b"GET /index.html", false)
         .unwrap();
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     // Server reads request.
     drain_events(&mut server);
@@ -321,7 +337,7 @@ fn bidirectional_exchange() {
     server
         .stream_send(stream_id, response, true)
         .unwrap();
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     // Client reads response.
     drain_events(&mut client);
@@ -334,12 +350,13 @@ fn bidirectional_exchange() {
 /// Test 5: Client opens multiple streams and sends data on both.
 #[test]
 fn multiple_streams() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     // Client opens stream 0 and stream 4 (the first two client-initiated bidi
     // streams: id=0 and id=4).
@@ -352,7 +369,7 @@ fn multiple_streams() {
     client.stream_send(s4, b"stream four", false).unwrap();
 
     // Transfer packets (may need multiple poll_transmit calls).
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     // Server should have received data on both streams.
     drain_events(&mut server);
@@ -369,19 +386,20 @@ fn multiple_streams() {
 /// Test 6: Sending with fin=true causes the receiver to see fin.
 #[test]
 fn stream_fin_propagates() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
     client
         .stream_send(stream_id, b"final message", true)
         .unwrap();
 
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
     drain_events(&mut server);
 
     let mut buf = [0u8; 256];
@@ -394,19 +412,20 @@ fn stream_fin_propagates() {
 /// ConnectionClose event.
 #[test]
 fn connection_close_by_client() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     // Client closes with error code 0 (no error) and a reason phrase.
     client.close(0, b"goodbye");
     assert_eq!(client.state(), ConnectionState::Closing);
 
     // Transfer the CONNECTION_CLOSE frame.
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     assert!(client.is_closed(), "client should be closed after poll_transmit");
 
@@ -438,19 +457,20 @@ fn connection_close_by_client() {
 /// ConnectionClose event.
 #[test]
 fn connection_close_by_server() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     // Server closes with an application-layer error code.
     server.close(42, b"server shutdown");
     assert_eq!(server.state(), ConnectionState::Closing);
 
     // Transfer the CONNECTION_CLOSE frame.
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     assert!(server.is_closed());
 
@@ -472,12 +492,13 @@ fn connection_close_by_server() {
 /// verify all data is received correctly.
 #[test]
 fn large_data_transfer() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
 
@@ -496,10 +517,10 @@ fn large_data_transfer() {
     assert_eq!(sent, 1024);
 
     // Transfer.
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     // Drain any ACKs back.
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     // Server reads the data.
     drain_events(&mut server);
@@ -514,12 +535,13 @@ fn large_data_transfer() {
 /// correctly afterward.
 #[test]
 fn key_update_during_transfer() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
 
@@ -527,8 +549,8 @@ fn key_update_during_transfer() {
     client
         .stream_send(stream_id, b"before-update", false)
         .unwrap();
-    drain_transmits(&mut client, &mut server, now);
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     drain_events(&mut server);
     let mut buf = [0u8; 256];
@@ -544,7 +566,7 @@ fn key_update_during_transfer() {
     client
         .stream_send(stream_id, b"after-update", false)
         .unwrap();
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     // Server should detect the key phase change and update keys.
     assert_eq!(
@@ -562,7 +584,7 @@ fn key_update_during_transfer() {
     server
         .stream_send(stream_id, b"server-post-ku", false)
         .unwrap();
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     drain_events(&mut client);
     let mut buf3 = [0u8; 256];
@@ -580,17 +602,18 @@ fn key_update_during_transfer() {
 /// covered in the unit tests within `src/connection/mod.rs`.
 #[test]
 fn post_handshake_round_trip_works() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     // Send data in both directions to confirm path is alive.
     let s = client.open_stream().unwrap();
     client.stream_send(s, b"ping", false).unwrap();
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
 
     drain_events(&mut server);
     let mut buf = [0u8; 64];
@@ -598,7 +621,7 @@ fn post_handshake_round_trip_works() {
     assert_eq!(&buf[..len], b"ping");
 
     server.stream_send(s, b"pong", false).unwrap();
-    drain_transmits(&mut server, &mut client, now);
+    drain_transmits(&mut server, &mut client, now, &mut pool);
 
     drain_events(&mut client);
     let mut buf2 = [0u8; 64];
@@ -617,12 +640,13 @@ fn post_handshake_round_trip_works() {
 /// to verify that idle timeout actually closes the connection.
 #[test]
 fn idle_timeout_not_set_does_not_close() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     assert!(client.is_established());
 
@@ -651,12 +675,13 @@ fn idle_timeout_not_set_does_not_close() {
 /// closes the connection.
 #[test]
 fn handshake_timeout_safe_to_call() {
-    let mut client = make_client();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
     // Intentionally do NOT create a server or run the handshake.
 
     // The client sends its Initial packet.
     let mut buf = [0u8; 2048];
-    let _tx = client.poll_transmit(&mut buf, 0);
+    let _tx = client.poll_transmit(&mut buf, 0, &mut pool);
 
     assert_eq!(client.state(), ConnectionState::Handshaking);
 
@@ -675,7 +700,8 @@ fn handshake_timeout_safe_to_call() {
 /// Test 14: Opening a stream before handshake completes should fail.
 #[test]
 fn open_stream_before_handshake_fails() {
-    let mut client = make_client();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
     let result = client.open_stream();
     assert_eq!(result.unwrap_err(), Error::InvalidState);
 }
@@ -683,19 +709,20 @@ fn open_stream_before_handshake_fails() {
 /// Test 15: After close, further operations fail with Closed error.
 #[test]
 fn operations_fail_after_close() {
-    let mut client = make_client();
-    let mut server = make_server();
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now);
-    drain_post_handshake(&mut client, &mut server, now);
+    run_handshake(&mut client, &mut server, now, &mut pool);
+    drain_post_handshake(&mut client, &mut server, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
     client.stream_send(stream_id, b"data", false).unwrap();
 
     // Close the client.
     client.close(0, b"done");
-    drain_transmits(&mut client, &mut server, now);
+    drain_transmits(&mut client, &mut server, now, &mut pool);
     assert!(client.is_closed());
 
     // Attempts to send data should fail.
@@ -708,7 +735,7 @@ fn operations_fail_after_close() {
     // poll_transmit should return None.
     let mut buf = [0u8; 2048];
     assert!(
-        client.poll_transmit(&mut buf, now).is_none(),
+        client.poll_transmit(&mut buf, now, &mut pool).is_none(),
         "poll_transmit should return None after close"
     );
 }

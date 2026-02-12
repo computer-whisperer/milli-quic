@@ -23,6 +23,7 @@ pub mod tls;
 
 pub mod connection;
 pub use connection::{
-    Connection, ConnectionConfig, ConnectionId, ConnectionState, DefaultConfig, Event, Transmit,
+    Connection, ConnectionConfig, ConnectionId, ConnectionState, DefaultConfig, Event,
+    HandshakeContext, HandshakePool, HandshakePoolAccess, Transmit,
 };
 pub use tls::handshake::Role;

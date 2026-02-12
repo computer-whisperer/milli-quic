@@ -7,6 +7,7 @@
 #![cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 
 use milli_quic::connection::Connection;
+use milli_quic::connection::HandshakePool;
 use milli_quic::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
 use milli_quic::h3::{H3Client, H3Event, H3Server};
@@ -42,7 +43,11 @@ impl Rng for TestRng {
     }
 }
 
-fn make_quic_client() -> Connection<Aes128GcmProvider> {
+fn make_pool() -> Box<HandshakePool<Aes128GcmProvider, 4>> {
+    Box::new(HandshakePool::new())
+}
+
+fn make_quic_client(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
     let mut rng = TestRng(0x10);
     Connection::client(
         Aes128GcmProvider,
@@ -50,11 +55,12 @@ fn make_quic_client() -> Connection<Aes128GcmProvider> {
         &[b"h3"],
         TransportParams::default_params(),
         &mut rng,
+        pool,
     )
     .unwrap()
 }
 
-fn make_quic_server() -> Connection<Aes128GcmProvider> {
+fn make_quic_server(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
     let mut rng = TestRng(0x50);
     let config = ServerTlsConfig {
         cert_der: get_test_ed25519_cert_der(),
@@ -67,6 +73,7 @@ fn make_quic_server() -> Connection<Aes128GcmProvider> {
         config,
         TransportParams::default_params(),
         &mut rng,
+        pool,
     )
     .unwrap()
 }
@@ -76,15 +83,16 @@ fn run_quic_handshake(
     client: &mut Connection<Aes128GcmProvider>,
     server: &mut Connection<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
     for _round in 0..20 {
         // Client -> Server
         loop {
             let mut buf = [0u8; 4096];
-            match client.poll_transmit(&mut buf, now) {
+            match client.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = server.recv(&data, now);
+                    let _ = server.recv(&data, now, pool);
                 }
                 None => break,
             }
@@ -93,10 +101,10 @@ fn run_quic_handshake(
         // Server -> Client
         loop {
             let mut buf = [0u8; 4096];
-            match server.poll_transmit(&mut buf, now) {
+            match server.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = client.recv(&data, now);
+                    let _ = client.recv(&data, now, pool);
                 }
                 None => break,
             }
@@ -119,6 +127,7 @@ fn exchange_h3_packets(
     client: &mut H3Client<Aes128GcmProvider>,
     server: &mut H3Server<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
     for _round in 0..10 {
         let mut any_sent = false;
@@ -126,10 +135,10 @@ fn exchange_h3_packets(
         // Client -> Server
         loop {
             let mut buf = [0u8; 4096];
-            match client.poll_transmit(&mut buf, now) {
+            match client.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = server.recv(&data, now);
+                    let _ = server.recv(&data, now, pool);
                     any_sent = true;
                 }
                 None => break,
@@ -139,10 +148,10 @@ fn exchange_h3_packets(
         // Server -> Client
         loop {
             let mut buf = [0u8; 4096];
-            match server.poll_transmit(&mut buf, now) {
+            match server.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = client.recv(&data, now);
+                    let _ = client.recv(&data, now, pool);
                     any_sent = true;
                 }
                 None => break,
@@ -158,16 +167,18 @@ fn exchange_h3_packets(
 /// Create an H3Client and H3Server with the QUIC handshake complete,
 /// H3 control streams set up, and H3Event::Connected exchanged on both sides.
 ///
-/// Returns (client, server, now).
+/// Returns (client, server, now, pool).
 fn setup_h3_pair() -> (
     H3Client<Aes128GcmProvider>,
     H3Server<Aes128GcmProvider>,
     u64,
+    Box<HandshakePool<Aes128GcmProvider, 4>>,
 ) {
     let now = 1_000_000u64;
-    let mut quic_client = make_quic_client();
-    let mut quic_server = make_quic_server();
-    run_quic_handshake(&mut quic_client, &mut quic_server, now);
+    let mut pool = make_pool();
+    let mut quic_client = make_quic_client(&mut pool);
+    let mut quic_server = make_quic_server(&mut pool);
+    run_quic_handshake(&mut quic_client, &mut quic_server, now, &mut pool);
 
     let mut client = H3Client::new(quic_client);
     let mut server = H3Server::new(quic_server);
@@ -177,7 +188,7 @@ fn setup_h3_pair() -> (
     let _ = server.poll_event();
 
     // Exchange control stream data (SETTINGS frames) between client and server.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Drain events so both sides see H3Event::Connected.
     let mut client_connected = false;
@@ -196,7 +207,7 @@ fn setup_h3_pair() -> (
         if client_connected && server_connected {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
 
     assert!(
@@ -208,7 +219,7 @@ fn setup_h3_pair() -> (
         "H3 setup: server did not receive H3Event::Connected"
     );
 
-    (client, server, now)
+    (client, server, now, pool)
 }
 
 /// Collect all H3Events from the client.
@@ -216,13 +227,14 @@ fn drain_client_events(
     client: &mut H3Client<Aes128GcmProvider>,
     server: &mut H3Server<Aes128GcmProvider>,
     now: u64,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) -> Vec<H3Event> {
     let mut events = Vec::new();
     for _ in 0..10 {
         while let Some(ev) = client.poll_event() {
             events.push(ev);
         }
-        exchange_h3_packets(client, server, now);
+        exchange_h3_packets(client, server, now, pool);
     }
     while let Some(ev) = client.poll_event() {
         events.push(ev);
@@ -242,7 +254,7 @@ fn drain_client_events(
 fn h3_handshake_completes() {
     // The setup_h3_pair helper already asserts that both sides receive
     // H3Event::Connected. If it doesn't panic, the handshake succeeded.
-    let (_client, _server, _now) = setup_h3_pair();
+    let (_client, _server, _now, _pool) = setup_h3_pair();
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +263,7 @@ fn h3_handshake_completes() {
 
 #[test]
 fn h3_get_request_response() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends a GET request.
     let stream_id = client
@@ -262,7 +274,7 @@ fn h3_get_request_response() {
     client.send_body(stream_id, &[], true).unwrap();
 
     // Exchange so the server receives the request.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Server should see a Headers event.
     let mut got_headers_stream = None;
@@ -275,7 +287,7 @@ fn h3_get_request_response() {
         if got_headers_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = got_headers_stream.expect("server should receive H3Event::Headers");
 
@@ -300,7 +312,7 @@ fn h3_get_request_response() {
     server.send_body(req_stream, body, true).unwrap();
 
     // Exchange so client receives the response.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Client should see Headers and Data events.
     let mut got_response_headers = false;
@@ -316,7 +328,7 @@ fn h3_get_request_response() {
         if got_response_headers {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     assert!(got_response_headers, "client should receive response Headers");
 
@@ -345,7 +357,7 @@ fn h3_get_request_response() {
 
 #[test]
 fn h3_post_with_body() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends a POST request with headers and a body.
     let stream_id = client
@@ -361,7 +373,7 @@ fn h3_post_with_body() {
     client.send_body(stream_id, req_body, true).unwrap();
 
     // Exchange so server receives request.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Server receives the request.
     let mut header_stream = None;
@@ -374,7 +386,7 @@ fn h3_post_with_body() {
         if header_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = header_stream.expect("server should receive request headers");
 
@@ -409,7 +421,7 @@ fn h3_post_with_body() {
 
 #[test]
 fn h3_multiple_requests() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends two GET requests on different streams.
     let stream1 = client
@@ -426,7 +438,7 @@ fn h3_multiple_requests() {
     assert_ne!(stream1, stream2, "two requests should use different streams");
 
     // Exchange so server receives both requests.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Server should see Headers events for both streams.
     let mut header_streams = Vec::new();
@@ -439,7 +451,7 @@ fn h3_multiple_requests() {
         if header_streams.len() >= 2 {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     assert!(
         header_streams.len() >= 2,
@@ -454,7 +466,7 @@ fn h3_multiple_requests() {
     }
 
     // Exchange so client receives both responses.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Client should see response headers for both.
     let mut response_streams = Vec::new();
@@ -467,7 +479,7 @@ fn h3_multiple_requests() {
         if response_streams.len() >= 2 {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     assert!(
         response_streams.len() >= 2,
@@ -482,7 +494,7 @@ fn h3_multiple_requests() {
 
 #[test]
 fn h3_large_response_body() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends GET request.
     let stream_id = client
@@ -490,7 +502,7 @@ fn h3_large_response_body() {
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Wait for server to receive request headers.
     let mut req_stream = None;
@@ -503,7 +515,7 @@ fn h3_large_response_body() {
         if req_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = req_stream.expect("server should receive request");
 
@@ -519,7 +531,7 @@ fn h3_large_response_body() {
     server.send_body(req_stream, &chunk2, true).unwrap();
 
     // Exchange so client receives everything.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Client reads response.
     let mut got_headers = false;
@@ -535,7 +547,7 @@ fn h3_large_response_body() {
         if got_headers && got_data {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     assert!(got_headers, "client should receive response headers");
 
@@ -558,7 +570,7 @@ fn h3_large_response_body() {
 
 #[test]
 fn h3_response_headers_correct() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends GET.
     let stream_id = client
@@ -566,7 +578,7 @@ fn h3_response_headers_correct() {
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Wait for server to receive headers.
     let mut req_stream = None;
@@ -579,7 +591,7 @@ fn h3_response_headers_correct() {
         if req_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = req_stream.expect("server should receive request");
 
@@ -597,7 +609,7 @@ fn h3_response_headers_correct() {
         .unwrap();
     server.send_body(req_stream, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Client reads response headers.
     let mut got_headers = false;
@@ -612,7 +624,7 @@ fn h3_response_headers_correct() {
         if got_headers {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     assert!(got_headers, "client should receive response headers");
 
@@ -649,9 +661,10 @@ fn h3_settings_exchanged() {
     // Perform the handshake manually (not using setup_h3_pair) so we can
     // observe the H3Event::Connected events ourselves.
     let now = 1_000_000u64;
-    let mut quic_client = make_quic_client();
-    let mut quic_server = make_quic_server();
-    run_quic_handshake(&mut quic_client, &mut quic_server, now);
+    let mut pool = make_pool();
+    let mut quic_client = make_quic_client(&mut pool);
+    let mut quic_server = make_quic_server(&mut pool);
+    run_quic_handshake(&mut quic_client, &mut quic_server, now, &mut pool);
 
     let mut client = H3Client::new(quic_client);
     let mut server = H3Server::new(quic_server);
@@ -661,7 +674,7 @@ fn h3_settings_exchanged() {
     let _ = server.poll_event();
 
     // Exchange the control stream packets carrying SETTINGS frames.
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Both sides should now emit H3Event::Connected, which signals
     // that peer SETTINGS have been received and processed.
@@ -681,7 +694,7 @@ fn h3_settings_exchanged() {
         if client_connected && server_connected {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
 
     assert!(
@@ -725,7 +738,7 @@ fn h3_goaway_event_variant() {
 
 #[test]
 fn h3_stream_fin_on_response() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends GET.
     let stream_id = client
@@ -733,7 +746,7 @@ fn h3_stream_fin_on_response() {
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Server receives request.
     let mut req_stream = None;
@@ -746,7 +759,7 @@ fn h3_stream_fin_on_response() {
         if req_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = req_stream.expect("server should receive request");
 
@@ -754,10 +767,10 @@ fn h3_stream_fin_on_response() {
     server.send_response(req_stream, 200, &[]).unwrap();
     server.send_body(req_stream, b"done", true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Client should eventually see Finished event for the stream.
-    let events = drain_client_events(&mut client, &mut server, now);
+    let events = drain_client_events(&mut client, &mut server, now, &mut pool);
     let got_headers = events
         .iter()
         .any(|ev| matches!(ev, H3Event::Headers(sid) if *sid == stream_id));
@@ -790,7 +803,7 @@ fn h3_stream_fin_on_response() {
 
 #[test]
 fn h3_empty_body_response() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends GET.
     let stream_id = client
@@ -798,7 +811,7 @@ fn h3_empty_body_response() {
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Server receives request.
     let mut req_stream = None;
@@ -811,7 +824,7 @@ fn h3_empty_body_response() {
         if req_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = req_stream.expect("server should receive request");
 
@@ -819,7 +832,7 @@ fn h3_empty_body_response() {
     server.send_response(req_stream, 200, &[]).unwrap();
     server.send_body(req_stream, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Client receives response.
     let mut got_headers = false;
@@ -834,7 +847,7 @@ fn h3_empty_body_response() {
         if got_headers {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     assert!(got_headers, "client should receive response headers");
 
@@ -856,7 +869,7 @@ fn h3_empty_body_response() {
 
 #[test]
 fn h3_request_headers_round_trip() {
-    let (mut client, mut server, now) = setup_h3_pair();
+    let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
     // Client sends a request with all pseudo-headers and custom headers.
     let stream_id = client
@@ -872,7 +885,7 @@ fn h3_request_headers_round_trip() {
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
-    exchange_h3_packets(&mut client, &mut server, now);
+    exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
     // Server receives the request.
     let mut req_stream = None;
@@ -885,7 +898,7 @@ fn h3_request_headers_round_trip() {
         if req_stream.is_some() {
             break;
         }
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
     let req_stream = req_stream.expect("server should receive request");
 
@@ -933,14 +946,14 @@ fn h3_server_responds_different_status_codes() {
         (404, b"404"),
         (500, b"500"),
     ] {
-        let (mut client, mut server, now) = setup_h3_pair();
+        let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
         let stream_id = client
             .send_request("GET", "/", "test.local", &[])
             .unwrap();
         client.send_body(stream_id, &[], true).unwrap();
 
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         let mut req_stream = None;
         for _ in 0..5 {
@@ -952,14 +965,14 @@ fn h3_server_responds_different_status_codes() {
             if req_stream.is_some() {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
         let req_stream = req_stream.expect("server should receive request");
 
         server.send_response(req_stream, code, &[]).unwrap();
         server.send_body(req_stream, &[], true).unwrap();
 
-        exchange_h3_packets(&mut client, &mut server, now);
+        exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         let mut got_headers = false;
         for _ in 0..5 {
@@ -973,7 +986,7 @@ fn h3_server_responds_different_status_codes() {
             if got_headers {
                 break;
             }
-            exchange_h3_packets(&mut client, &mut server, now);
+            exchange_h3_packets(&mut client, &mut server, now, &mut pool);
         }
         assert!(
             got_headers,

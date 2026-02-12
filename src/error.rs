@@ -112,6 +112,8 @@ pub enum Error {
     WouldBlock,
     /// Invalid state for the requested operation.
     InvalidState,
+    /// All handshake pool slots are in use.
+    HandshakePoolExhausted,
 }
 
 impl From<TransportError> for Error {
@@ -140,6 +142,7 @@ impl core::fmt::Display for Error {
             Error::Closed => write!(f, "connection closed"),
             Error::WouldBlock => write!(f, "would block"),
             Error::InvalidState => write!(f, "invalid state"),
+            Error::HandshakePoolExhausted => write!(f, "handshake pool exhausted"),
         }
     }
 }

@@ -248,6 +248,49 @@ where
         }
     }
 
+    /// Create a placeholder TLS engine for pool initialization.
+    ///
+    /// The resulting engine is not usable for handshakes — it must be
+    /// overwritten with a real client/server engine before use.
+    pub fn new_placeholder() -> Self {
+        let secret = [0u8; 32];
+        let random = [0u8; 32];
+        let private_key = x25519_dalek::StaticSecret::from(secret);
+        let public_key = x25519_dalek::PublicKey::from(&private_key);
+        let hkdf = C::Hkdf::default();
+        let key_schedule = TlsKeySchedule::new(&hkdf);
+
+        Self {
+            role: Role::Client,
+            state: HandshakeState::Start,
+            private_key,
+            public_key,
+            client_random: random,
+            cipher_suite: None,
+            key_schedule,
+            client_handshake_secret: [0u8; 32],
+            server_handshake_secret: [0u8; 32],
+            client_app_secret: [0u8; 32],
+            server_app_secret: [0u8; 32],
+            transcript: TranscriptHash::new(),
+            pending_write: heapless::Vec::new(),
+            pending_level: Level::Initial,
+            pending_write_hs: heapless::Vec::new(),
+            pending_keys: None,
+            server_name: heapless::String::new(),
+            alpn_protocols: &[],
+            transport_params: TransportParams::default_params(),
+            peer_transport_params: None,
+            negotiated_alpn: None,
+            pinned_certs: &[],
+            server_cert_data: heapless::Vec::new(),
+            server_cert_der: &[],
+            server_private_key_der: &[],
+            complete: false,
+            _crypto: core::marker::PhantomData,
+        }
+    }
+
     /// Update the CID-related transport parameters (original_destination_connection_id
     /// and initial_source_connection_id). Called by the Connection layer so these
     /// are included in the server's EncryptedExtensions.

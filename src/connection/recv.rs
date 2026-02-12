@@ -169,13 +169,18 @@ struct PacketResult {
     pn: u64,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const CRYPTO_BUF: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, CRYPTO_BUF>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
 where
     C::Hkdf: Default,
 {
     /// Process an incoming UDP datagram. May contain coalesced packets.
-    pub fn recv(&mut self, datagram: &[u8], now: Instant) -> Result<(), Error> {
+    ///
+    /// The `pool` parameter provides access to the shared handshake state.
+    /// For post-handshake connections (handshake_slot is None), handshake
+    /// processing is skipped but the pool parameter is still required
+    /// for the type signature.
+    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
         if matches!(self.state, ConnectionState::Closed) {
             return Err(Error::Closed);
         }
@@ -206,15 +211,15 @@ where
             let result = if is_long {
                 let pkt_type = (first_byte & 0x30) >> 4;
                 match pkt_type {
-                    0b00 => self.recv_initial(pkt_data, now),
-                    0b10 => self.recv_handshake(pkt_data, now),
+                    0b00 => self.recv_initial(pkt_data, now, pool),
+                    0b10 => self.recv_handshake(pkt_data, now, pool),
                     _ => {
                         // 0-RTT, Retry, Version Negotiation: skip for now
                         continue;
                     }
                 }
             } else {
-                self.recv_short(pkt_data, now)
+                self.recv_short(pkt_data, now, pool)
             };
 
             match result {
@@ -244,13 +249,13 @@ where
         }
 
         // After processing, check for TLS-derived keys
-        self.check_tls_keys()?;
+        self.check_tls_keys(pool)?;
 
         Ok(())
     }
 
     /// Process an Initial packet.
-    fn recv_initial(&mut self, pkt_data: &[u8], now: Instant) -> Result<PacketResult, Error> {
+    fn recv_initial<const CRYPTO_BUF: usize>(&mut self, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_initial_header(pkt_data)?;
 
         // If we are server and this is the first Initial, derive Initial keys from DCID
@@ -267,12 +272,14 @@ where
             // CID) on the TLS engine's transport params before the ClientHello is
             // processed, so they are included in EncryptedExtensions.
             if self.role == crate::tls::handshake::Role::Server {
-                let local_scid = if self.local_cids.is_empty() {
-                    &[]
-                } else {
-                    self.local_cids[0].as_slice()
-                };
-                self.tls.set_transport_param_cids(hdr.dcid, local_scid);
+                if let Some(slot) = self.handshake_slot {
+                    let local_scid = if self.local_cids.is_empty() {
+                        &[]
+                    } else {
+                        self.local_cids[0].as_slice()
+                    };
+                    pool.get_mut(slot).tls.set_transport_param_cids(hdr.dcid, local_scid);
+                }
             }
         }
 
@@ -293,17 +300,18 @@ where
                     pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
                 )?
             };
-            let ack_eliciting = self.dispatch_frames(&decrypted, level, now)?;
+            let ack_eliciting = self.dispatch_frames(&decrypted, level, now, pool)?;
             Ok(PacketResult { ack_eliciting, level, pn })
         }
         #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
         {
+            let _ = pool;
             Err(Error::Crypto)
         }
     }
 
     /// Process a Handshake packet.
-    fn recv_handshake(&mut self, pkt_data: &[u8], now: Instant) -> Result<PacketResult, Error> {
+    fn recv_handshake<const CRYPTO_BUF: usize>(&mut self, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_handshake_header(pkt_data)?;
 
         let level = Level::Handshake;
@@ -314,12 +322,12 @@ where
                 pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
             )?
         };
-        let ack_eliciting = self.dispatch_frames(&decrypted, level, now)?;
+        let ack_eliciting = self.dispatch_frames(&decrypted, level, now, pool)?;
         Ok(PacketResult { ack_eliciting, level, pn })
     }
 
     /// Process a short (1-RTT) packet with key phase handling (RFC 9001 section 6).
-    fn recv_short(&mut self, pkt_data: &[u8], now: Instant) -> Result<PacketResult, Error> {
+    fn recv_short<const CRYPTO_BUF: usize>(&mut self, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let dcid_len = if self.local_cids.is_empty() {
             0
         } else {
@@ -412,6 +420,7 @@ where
                         &buf[payload_offset..payload_offset + pt_len],
                         Level::Application,
                         now,
+                        pool,
                     )?;
                     Ok(PacketResult {
                         ack_eliciting,
@@ -442,6 +451,7 @@ where
                             &buf[payload_offset..payload_offset + pt_len],
                             Level::Application,
                             now,
+                            pool,
                         )?;
                         return Ok(PacketResult {
                             ack_eliciting,
@@ -474,6 +484,7 @@ where
                     &buf[payload_offset..payload_offset + pt_len],
                     Level::Application,
                     now,
+                    pool,
                 )?;
                 Ok(PacketResult {
                     ack_eliciting,
@@ -494,11 +505,12 @@ where
 
     /// Parse and dispatch all frames from decrypted payload.
     /// Returns true if any frame was ack-eliciting.
-    fn dispatch_frames(
+    fn dispatch_frames<const CRYPTO_BUF: usize>(
         &mut self,
         payload: &[u8],
         level: Level,
         now: Instant,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
     ) -> Result<bool, Error> {
         let mut ack_eliciting = false;
         let mut pos = 0;
@@ -515,18 +527,19 @@ where
                 }
             }
 
-            self.dispatch_frame(frame, level, now)?;
+            self.dispatch_frame(frame, level, now, pool)?;
         }
 
         Ok(ack_eliciting)
     }
 
     /// Dispatch a single frame.
-    pub(crate) fn dispatch_frame(
+    pub(crate) fn dispatch_frame<const CRYPTO_BUF: usize>(
         &mut self,
         frame: Frame<'_>,
         level: Level,
         now: Instant,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
     ) -> Result<(), Error> {
         match frame {
             Frame::Padding => {}
@@ -587,7 +600,7 @@ where
             }
 
             Frame::Crypto(crypto) => {
-                self.handle_crypto_frame(level, crypto.offset, crypto.data)?;
+                self.handle_crypto_frame(level, crypto.offset, crypto.data, pool)?;
             }
 
             Frame::Stream(stream) => {
@@ -707,12 +720,19 @@ where
     /// We buffer them and only deliver contiguous data to the TLS engine when
     /// we have at least one complete TLS handshake message (4-byte header +
     /// body).
-    fn handle_crypto_frame(
+    fn handle_crypto_frame<const CRYPTO_BUF: usize>(
         &mut self,
         level: Level,
         offset: u64,
         data: &[u8],
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
     ) -> Result<(), Error> {
+        // If we no longer have a handshake slot, skip crypto processing.
+        let slot = match self.handshake_slot {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
         // Reject CRYPTO frames with very large offsets that could cause
         // resource exhaustion or overflow issues.
         const MAX_CRYPTO_OFFSET: u64 = 1 << 20; // 1 MiB
@@ -727,11 +747,12 @@ where
         let idx = level_index(level);
 
         // Insert into the reassembly buffer.
-        self.crypto_reasm[idx].insert(offset, data)?;
+        pool.get_mut(slot).crypto_reasm[idx].insert(offset, data)?;
 
         // Deliver complete TLS handshake messages from the contiguous frontier.
         loop {
-            let avail = self.crypto_reasm[idx].contiguous_len();
+            let ctx = pool.get_mut(slot);
+            let avail = ctx.crypto_reasm[idx].contiguous_len();
             if avail < 4 {
                 // Not enough data for a TLS handshake message header.
                 break;
@@ -739,12 +760,10 @@ where
 
             // Peek at the TLS handshake header to determine message length.
             let msg_len = {
-                let hdr = self.crypto_reasm[idx].contiguous_data();
+                let hdr = ctx.crypto_reasm[idx].contiguous_data();
                 // TLS handshake: 1 byte type + 3 bytes length
                 4 + ((hdr[1] as usize) << 16 | (hdr[2] as usize) << 8 | hdr[3] as usize)
             };
-
-
 
             if avail < msg_len {
                 // Incomplete TLS message — wait for more data.
@@ -758,17 +777,17 @@ where
                 return Err(Error::Tls);
             }
             tmp[..msg_len].copy_from_slice(
-                &self.crypto_reasm[idx].contiguous_data()[..msg_len],
+                &ctx.crypto_reasm[idx].contiguous_data()[..msg_len],
             );
 
             // Advance the reassembly buffer past this message.
-            self.crypto_reasm[idx].advance(msg_len);
+            ctx.crypto_reasm[idx].advance(msg_len);
 
             // Feed to the TLS engine.
-            self.tls.read_handshake(level, &tmp[..msg_len])?;
+            ctx.tls.read_handshake(level, &tmp[..msg_len])?;
 
             // Check for newly derived keys after each TLS message.
-            self.check_tls_keys()?;
+            self.check_tls_keys(pool)?;
         }
 
         Ok(())
@@ -776,8 +795,13 @@ where
 
     /// Check if TLS engine has produced new keys and install them.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn check_tls_keys(&mut self) -> Result<(), Error> {
-        while let Some(derived) = self.tls.derived_keys() {
+    fn check_tls_keys<const CRYPTO_BUF: usize>(&mut self, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+        let slot = match self.handshake_slot {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        while let Some(derived) = pool.get_mut(slot).tls.derived_keys() {
             let level = derived.level;
             self.keys.install_derived(&self.crypto, &derived)?;
 
@@ -798,10 +822,6 @@ where
                     if self.role == crate::tls::handshake::Role::Server
                         && matches!(self.state, ConnectionState::Handshaking)
                     {
-                        // Server considers handshake complete when it has app keys
-                        // (it already sent HANDSHAKE_DONE in poll_transmit)
-                        // but the transition to Active happens when the client's
-                        // Finished is received and app keys are derived
                         self.state = ConnectionState::Active;
                         self.address_validated = true;
                         let _ = self.events.push_back(Event::Connected);
@@ -815,7 +835,7 @@ where
             }
 
             // Store peer transport params if available
-            if let Some(peer_params) = self.tls.peer_transport_params() {
+            if let Some(peer_params) = pool.get_mut(slot).tls.peer_transport_params() {
                 // Update flow control with peer's limits
                 self.flow_control
                     .handle_max_data(peer_params.initial_max_data);
@@ -826,13 +846,67 @@ where
                 self.peer_params = Some(peer_params.clone());
             }
         }
+
+        // Release the handshake slot when the handshake is truly complete.
+        // For the server: release when Active (handshake confirmed).
+        // For the client: release once app keys are installed AND the TLS
+        // engine has written its Finished message (is_complete == true).
+        // We must NOT release earlier because the TLS engine still has the
+        // client Finished in its pending_write buffer that poll_transmit
+        // needs to flush. Releasing the slot resets the context and loses
+        // that data, causing the handshake to stall.
+        let can_release = if self.role == crate::tls::handshake::Role::Server {
+            matches!(self.state, ConnectionState::Active)
+        } else {
+            // Client: release once app keys are installed AND TLS is complete
+            // (i.e., client Finished has been written out via write_handshake).
+            self.keys.app_send.is_some()
+                && self.keys.app_recv.is_some()
+                && pool.get_mut(slot).tls.is_complete()
+        };
+
+        if can_release {
+            pool.release(slot);
+            self.handshake_slot = None;
+        }
+
         Ok(())
     }
 
     #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
-    fn check_tls_keys(&mut self) -> Result<(), Error> {
+    fn check_tls_keys<const CRYPTO_BUF: usize>(&mut self, _pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
         // Without crypto features, we can't install keys
         Ok(())
+    }
+
+    /// Release the handshake pool slot if the TLS handshake is fully complete.
+    ///
+    /// This is called from `poll_transmit` after flushing handshake-level
+    /// packets. For the client, the TLS engine is not "complete" until
+    /// `write_handshake` has been called and the Finished message has been
+    /// flushed. So the slot can only be released here, not in `recv()`.
+    pub(crate) fn maybe_release_handshake_slot<const CRYPTO_BUF: usize>(
+        &mut self,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) {
+        let slot = match self.handshake_slot {
+            Some(s) => s,
+            None => return,
+        };
+
+        let can_release = if self.role == crate::tls::handshake::Role::Server {
+            matches!(self.state, ConnectionState::Active)
+        } else {
+            // Client: release once app keys are installed AND TLS is complete.
+            self.keys.app_send.is_some()
+                && self.keys.app_recv.is_some()
+                && pool.get_mut(slot).tls.is_complete()
+        };
+
+        if can_release {
+            pool.release(slot);
+            self.handshake_slot = None;
+        }
     }
 }
 

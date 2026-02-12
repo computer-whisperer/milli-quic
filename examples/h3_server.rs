@@ -14,7 +14,7 @@ use std::io::Write;
 use std::net::UdpSocket;
 use std::time;
 
-use milli_quic::connection::Connection;
+use milli_quic::connection::{Connection, HandshakePool};
 use milli_quic::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
 use milli_quic::h3::server::H3Server;
@@ -105,14 +105,15 @@ fn main() {
     };
 
     let mut rng = StdRng::new();
-    let conn = Connection::<Aes128GcmProvider>::server(Aes128GcmProvider, tls_config, tp, &mut rng)
+    let mut pool = HandshakePool::<Aes128GcmProvider, 4>::new();
+    let conn = Connection::<Aes128GcmProvider>::server(Aes128GcmProvider, tls_config, tp, &mut rng, &mut pool)
         .expect("failed to create server Connection");
 
     let mut h3 = H3Server::new(conn);
 
     // Feed the first datagram.
     let now = to_micros(epoch, time::Instant::now());
-    if let Err(e) = h3.recv(&recv_buf[..first_len], now) {
+    if let Err(e) = h3.recv(&recv_buf[..first_len], now, &mut pool) {
         eprintln!("[conn] error processing first datagram: {e}");
     }
 
@@ -128,7 +129,7 @@ fn main() {
         // 1. Send any outgoing datagrams.
         let mut tx_buf = [0u8; 65535];
         loop {
-            match h3.poll_transmit(&mut tx_buf, now) {
+            match h3.poll_transmit(&mut tx_buf, now, &mut pool) {
                 Some(tx) => {
                     println!("[send] sending {} bytes to {client_addr}", tx.data.len());
                     let _ = writeln!(pkt_log, "SEND {} {}", tx.data.len(),
@@ -159,7 +160,7 @@ fn main() {
                         recv_buf[..len].iter().map(|b| format!("{b:02x}")).collect::<String>());
                     let _ = pkt_log.flush();
                     let now = to_micros(epoch, time::Instant::now());
-                    match h3.recv(&recv_buf[..len], now) {
+                    match h3.recv(&recv_buf[..len], now, &mut pool) {
                         Ok(()) => {},
                         Err(e) => eprintln!("[recv] error: {e}"),
                     }
