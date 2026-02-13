@@ -17,6 +17,9 @@ pub mod hpack;
 #[cfg(feature = "h2")]
 pub mod h2;
 
+#[cfg(feature = "http1")]
+pub mod http1;
+
 #[cfg(feature = "h3")]
 pub mod h3;
 

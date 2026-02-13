@@ -11,6 +11,7 @@ quic = []
 http = []
 h2 = ["http"]
 h3 = ["quic", "http"]
+http1 = ["http"]
 alloc = []
 std = []
 rustcrypto-chacha = ["quic", "dep:chacha20poly1305", "dep:chacha20", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
@@ -54,9 +55,11 @@ required-features = ["h2"]
 
 [[example]]
 name = "http1_server"
+required-features = ["http1"]
 
 [[example]]
 name = "http1_client"
+required-features = ["http1"]
 
 [[example]]
 name = "multi_server"
