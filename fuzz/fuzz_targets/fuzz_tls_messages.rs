@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use milli_quic::tls::messages;
+use milli_http::tls::messages;
 
 fuzz_target!(|data: &[u8]| {
     // Fuzz all TLS message parsers: should never panic on any input.

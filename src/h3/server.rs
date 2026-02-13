@@ -77,11 +77,11 @@ where
         headers: &[(&[u8], &[u8])],
     ) -> Result<(), Error> {
         // Format the status as a short string.
-        let status_str = format_status(status);
+        let status_str = crate::http::StatusCode(status).to_bytes();
 
         // Build the full header list: :status pseudo-header first, then extras.
         let mut all_headers: heapless::Vec<(&[u8], &[u8]), 20> = heapless::Vec::new();
-        let _ = all_headers.push((b":status", &status_str[..status_len(status)]));
+        let _ = all_headers.push((b":status", &status_str[..]));
 
         for &(name, value) in headers {
             let _ = all_headers.push((name, value));
@@ -130,22 +130,3 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Status code formatting helpers (no_std friendly)
-// ---------------------------------------------------------------------------
-
-/// Format an HTTP status code into a fixed-size byte array.
-///
-/// Returns an array large enough for any 3-digit status. The actual meaningful
-/// bytes span `[0..status_len(status)]`.
-fn format_status(status: u16) -> [u8; 3] {
-    let d0 = (status / 100) as u8;
-    let d1 = ((status / 10) % 10) as u8;
-    let d2 = (status % 10) as u8;
-    [b'0' + d0, b'0' + d1, b'0' + d2]
-}
-
-/// How many bytes does the formatted status occupy? Always 3 for HTTP status codes.
-const fn status_len(_status: u16) -> usize {
-    3
-}

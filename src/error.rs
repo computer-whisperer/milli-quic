@@ -91,6 +91,54 @@ impl H3Error {
     }
 }
 
+/// HTTP/2 error codes (RFC 9113 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+#[cfg(feature = "h2")]
+pub enum H2Error {
+    NoError = 0x0,
+    ProtocolError = 0x1,
+    InternalError = 0x2,
+    FlowControlError = 0x3,
+    SettingsTimeout = 0x4,
+    StreamClosed = 0x5,
+    FrameSizeError = 0x6,
+    RefusedStream = 0x7,
+    Cancel = 0x8,
+    CompressionError = 0x9,
+    ConnectError = 0xa,
+    EnhanceYourCalm = 0xb,
+    InadequateSecurity = 0xc,
+    Http11Required = 0xd,
+}
+
+#[cfg(feature = "h2")]
+impl H2Error {
+    pub const fn to_code(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0x0 => Some(Self::NoError),
+            0x1 => Some(Self::ProtocolError),
+            0x2 => Some(Self::InternalError),
+            0x3 => Some(Self::FlowControlError),
+            0x4 => Some(Self::SettingsTimeout),
+            0x5 => Some(Self::StreamClosed),
+            0x6 => Some(Self::FrameSizeError),
+            0x7 => Some(Self::RefusedStream),
+            0x8 => Some(Self::Cancel),
+            0x9 => Some(Self::CompressionError),
+            0xa => Some(Self::ConnectError),
+            0xb => Some(Self::EnhanceYourCalm),
+            0xc => Some(Self::InadequateSecurity),
+            0xd => Some(Self::Http11Required),
+            _ => None,
+        }
+    }
+}
+
 /// Top-level crate error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -98,6 +146,9 @@ pub enum Error {
     Transport(TransportError),
     /// HTTP/3 error.
     Http3(H3Error),
+    /// HTTP/2 error.
+    #[cfg(feature = "h2")]
+    Http2(H2Error),
     /// Cryptographic operation failed.
     Crypto,
     /// TLS handshake error.
@@ -128,11 +179,20 @@ impl From<H3Error> for Error {
     }
 }
 
+#[cfg(feature = "h2")]
+impl From<H2Error> for Error {
+    fn from(e: H2Error) -> Self {
+        Error::Http2(e)
+    }
+}
+
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Transport(e) => write!(f, "transport error: {e:?}"),
             Error::Http3(e) => write!(f, "HTTP/3 error: {e:?}"),
+            #[cfg(feature = "h2")]
+            Error::Http2(e) => write!(f, "HTTP/2 error: {e:?}"),
             Error::Crypto => write!(f, "cryptographic error"),
             Error::Tls => write!(f, "TLS error"),
             Error::BufferTooSmall { needed } => {

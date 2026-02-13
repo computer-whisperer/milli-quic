@@ -1,0 +1,131 @@
+//! HTTP/2 stream state machine (RFC 9113 §5.1).
+
+/// HTTP/2 stream states (RFC 9113 §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2StreamState {
+    Idle,
+    Open,
+    ReservedLocal,
+    ReservedRemote,
+    HalfClosedLocal,
+    HalfClosedRemote,
+    Closed,
+}
+
+/// An HTTP/2 stream.
+#[derive(Debug)]
+pub struct H2Stream {
+    pub id: u32,
+    pub state: H2StreamState,
+    pub send_window: i32,
+    pub recv_window: i32,
+    pub headers_data: heapless::Vec<u8, 4096>,
+    pub headers_received: bool,
+    pub data_buf: heapless::Vec<u8, 8192>,
+    pub data_available: bool,
+    pub fin_received: bool,
+    pub fin_sent: bool,
+}
+
+impl H2Stream {
+    pub fn new(id: u32, initial_send_window: i32, initial_recv_window: i32) -> Self {
+        Self {
+            id,
+            state: H2StreamState::Idle,
+            send_window: initial_send_window,
+            recv_window: initial_recv_window,
+            headers_data: heapless::Vec::new(),
+            headers_received: false,
+            data_buf: heapless::Vec::new(),
+            data_available: false,
+            fin_received: false,
+            fin_sent: false,
+        }
+    }
+
+    /// Transition to Open state (when HEADERS sent or received).
+    pub fn open(&mut self) {
+        if self.state == H2StreamState::Idle {
+            self.state = H2StreamState::Open;
+        }
+    }
+
+    /// Process an END_STREAM flag received from the peer.
+    pub fn recv_end_stream(&mut self) {
+        self.fin_received = true;
+        match self.state {
+            H2StreamState::Open => self.state = H2StreamState::HalfClosedRemote,
+            H2StreamState::HalfClosedLocal => self.state = H2StreamState::Closed,
+            _ => {}
+        }
+    }
+
+    /// Process an END_STREAM flag sent by us.
+    pub fn send_end_stream(&mut self) {
+        self.fin_sent = true;
+        match self.state {
+            H2StreamState::Open => self.state = H2StreamState::HalfClosedLocal,
+            H2StreamState::HalfClosedRemote => self.state = H2StreamState::Closed,
+            _ => {}
+        }
+    }
+
+    /// Whether the stream can receive data.
+    pub fn can_recv(&self) -> bool {
+        matches!(self.state, H2StreamState::Open | H2StreamState::HalfClosedLocal)
+    }
+
+    /// Whether the stream can send data.
+    pub fn can_send(&self) -> bool {
+        matches!(self.state, H2StreamState::Open | H2StreamState::HalfClosedRemote)
+    }
+
+    /// Reset this stream to Closed.
+    pub fn reset(&mut self) {
+        self.state = H2StreamState::Closed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_lifecycle_normal() {
+        let mut s = H2Stream::new(1, 65535, 65535);
+        assert_eq!(s.state, H2StreamState::Idle);
+
+        s.open();
+        assert_eq!(s.state, H2StreamState::Open);
+        assert!(s.can_send());
+        assert!(s.can_recv());
+
+        s.send_end_stream();
+        assert_eq!(s.state, H2StreamState::HalfClosedLocal);
+        assert!(!s.can_send());
+        assert!(s.can_recv());
+
+        s.recv_end_stream();
+        assert_eq!(s.state, H2StreamState::Closed);
+        assert!(!s.can_send());
+        assert!(!s.can_recv());
+    }
+
+    #[test]
+    fn stream_recv_first() {
+        let mut s = H2Stream::new(2, 65535, 65535);
+        s.open();
+        s.recv_end_stream();
+        assert_eq!(s.state, H2StreamState::HalfClosedRemote);
+        s.send_end_stream();
+        assert_eq!(s.state, H2StreamState::Closed);
+    }
+
+    #[test]
+    fn stream_reset() {
+        let mut s = H2Stream::new(1, 65535, 65535);
+        s.open();
+        s.reset();
+        assert_eq!(s.state, H2StreamState::Closed);
+    }
+}

@@ -1,0 +1,16 @@
+//! HTTP/2 protocol implementation (RFC 9113).
+//!
+//! A pure-codec HTTP/2 stack following the same calling convention as the
+//! existing QUIC Connection: `feed_data()` → `poll_output()` → `poll_event()`.
+
+pub mod frame;
+pub mod stream;
+pub mod flow_control;
+pub mod connection;
+pub mod server;
+pub mod client;
+
+pub use connection::{H2Connection, H2Event, H2Settings};
+pub use frame::{H2Frame, H2FrameHeader, H2Priority};
+pub use server::H2Server;
+pub use client::H2Client;

@@ -1,14 +1,16 @@
 [package]
-name = "milli-quic"
+name = "milli-http"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "A no_std QUIC + HTTP/3 implementation for embedded systems"
+description = "A no_std HTTP/1.1, HTTP/2, HTTP/3 + QUIC implementation for embedded systems"
 
 [features]
 default = ["quic", "h3", "rustcrypto-chacha"]
 quic = []
-h3 = ["quic"]
+http = []
+h2 = ["http"]
+h3 = ["quic", "http"]
 alloc = []
 std = []
 rustcrypto-chacha = ["quic", "dep:chacha20poly1305", "dep:chacha20", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
@@ -37,3 +39,29 @@ rand = "0.9"
 [[example]]
 name = "h3_server"
 required-features = ["h3", "rustcrypto-chacha"]
+
+[[example]]
+name = "h3_client"
+required-features = ["h3", "rustcrypto-chacha"]
+
+[[example]]
+name = "h2_server"
+required-features = ["h2"]
+
+[[example]]
+name = "h2_client"
+required-features = ["h2"]
+
+[[example]]
+name = "http1_server"
+
+[[example]]
+name = "http1_client"
+
+[[example]]
+name = "multi_server"
+required-features = ["h3", "h2", "rustcrypto-chacha"]
+
+[[example]]
+name = "omni_client"
+required-features = ["h3", "h2", "rustcrypto-chacha"]

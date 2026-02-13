@@ -1,19 +1,19 @@
 //! HTTP/3 integration tests exercising H3Server and H3Client end-to-end.
 //!
-//! These tests use the public API surface of `milli_quic::h3` to verify
+//! These tests use the public API surface of `milli_http::h3` to verify
 //! that the H3 client and server wrappers correctly handle handshakes,
 //! request/response flows, headers, bodies, and stream lifecycle.
 
 #![cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 
-use milli_quic::connection::Connection;
-use milli_quic::connection::HandshakePool;
-use milli_quic::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
-use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
-use milli_quic::h3::{H3Client, H3Event, H3Server};
-use milli_quic::tls::handshake::ServerTlsConfig;
-use milli_quic::tls::transport_params::TransportParams;
-use milli_quic::Rng;
+use milli_http::connection::Connection;
+use milli_http::connection::HandshakePool;
+use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
+use milli_http::crypto::rustcrypto::Aes128GcmProvider;
+use milli_http::h3::{H3Client, H3Event, H3Server};
+use milli_http::tls::handshake::ServerTlsConfig;
+use milli_http::tls::transport_params::TransportParams;
+use milli_http::Rng;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure

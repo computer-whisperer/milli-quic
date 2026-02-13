@@ -18,15 +18,15 @@ use std::io::Write;
 use std::net::UdpSocket;
 use std::time;
 
-use milli_quic::connection::{Connection, HandshakePool};
-use milli_quic::crypto::ecdsa_p256;
-use milli_quic::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
-use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
-use milli_quic::h3::server::H3Server;
-use milli_quic::h3::H3Event;
-use milli_quic::tls::handshake::ServerTlsConfig;
-use milli_quic::tls::transport_params::TransportParams;
-use milli_quic::Rng;
+use milli_http::connection::{Connection, HandshakePool};
+use milli_http::crypto::ecdsa_p256;
+use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
+use milli_http::crypto::rustcrypto::Aes128GcmProvider;
+use milli_http::h3::server::H3Server;
+use milli_http::h3::H3Event;
+use milli_http::tls::handshake::ServerTlsConfig;
+use milli_http::tls::transport_params::TransportParams;
+use milli_http::Rng;
 
 // ---------------------------------------------------------------------------
 // RNG wrapper around the `rand` crate

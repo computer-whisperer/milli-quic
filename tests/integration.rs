@@ -10,15 +10,15 @@ extern crate std;
 
 use std::vec::Vec;
 
-use milli_quic::connection::Connection;
-use milli_quic::connection::HandshakePool;
-use milli_quic::crypto::ed25519;
-use milli_quic::crypto::rustcrypto::Aes128GcmProvider;
-use milli_quic::error::Error;
-use milli_quic::tls::handshake::ServerTlsConfig;
-use milli_quic::tls::transport_params::TransportParams;
-use milli_quic::transport::Rng;
-use milli_quic::{ConnectionState, Event};
+use milli_http::connection::Connection;
+use milli_http::connection::HandshakePool;
+use milli_http::crypto::ed25519;
+use milli_http::crypto::rustcrypto::Aes128GcmProvider;
+use milli_http::error::Error;
+use milli_http::tls::handshake::ServerTlsConfig;
+use milli_http::tls::transport_params::TransportParams;
+use milli_http::transport::Rng;
+use milli_http::{ConnectionState, Event};
 
 // =========================================================================
 // Test infrastructure

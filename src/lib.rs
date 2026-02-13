@@ -8,6 +8,15 @@ pub mod error;
 pub mod frame;
 pub mod varint;
 
+#[cfg(feature = "http")]
+pub mod http;
+
+#[cfg(any(feature = "h3", feature = "h2"))]
+pub mod hpack;
+
+#[cfg(feature = "h2")]
+pub mod h2;
+
 #[cfg(feature = "h3")]
 pub mod h3;
 
