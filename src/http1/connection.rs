@@ -1371,4 +1371,269 @@ mod tests {
         assert_eq!(status_reason(b"500"), b"Internal Server Error");
         assert_eq!(status_reason(b"999"), b""); // Unknown → empty
     }
+
+    // ====== Wire-Format Compatibility Tests ======
+
+    #[test]
+    fn wire_curl_get_request() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.feed_data(
+            b"GET /index.html HTTP/1.1\r\n\
+              Host: example.com\r\n\
+              User-Agent: curl/8.0\r\n\
+              Accept: */*\r\n\
+              \r\n",
+        )
+        .unwrap();
+
+        let event = conn.poll_event().unwrap();
+        assert_eq!(event, Http1Event::Request { stream_id: 1 });
+        let event2 = conn.poll_event().unwrap();
+        assert_eq!(event2, Http1Event::Finished(1));
+
+        let mut method = heapless::Vec::<u8, 16>::new();
+        let mut path = heapless::Vec::<u8, 64>::new();
+        let mut host = heapless::Vec::<u8, 64>::new();
+        let mut ua = heapless::Vec::<u8, 64>::new();
+        let mut accept = heapless::Vec::<u8, 16>::new();
+        conn.recv_headers(1, |name, value| match name {
+            b":method" => {
+                let _ = method.extend_from_slice(value);
+            }
+            b":path" => {
+                let _ = path.extend_from_slice(value);
+            }
+            b"Host" => {
+                let _ = host.extend_from_slice(value);
+            }
+            b"User-Agent" => {
+                let _ = ua.extend_from_slice(value);
+            }
+            b"Accept" => {
+                let _ = accept.extend_from_slice(value);
+            }
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!(method.as_slice(), b"GET");
+        assert_eq!(path.as_slice(), b"/index.html");
+        assert_eq!(host.as_slice(), b"example.com");
+        assert_eq!(ua.as_slice(), b"curl/8.0");
+        assert_eq!(accept.as_slice(), b"*/*");
+    }
+
+    #[test]
+    fn wire_nginx_200_response() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        conn.current_stream_id = 1;
+        conn.feed_data(
+            b"HTTP/1.1 200 OK\r\n\
+              Server: nginx/1.24\r\n\
+              Content-Type: text/html\r\n\
+              Content-Length: 13\r\n\
+              \r\n\
+              <html></html>",
+        )
+        .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Headers(1));
+
+        let mut status = heapless::Vec::<u8, 16>::new();
+        let mut server = heapless::Vec::<u8, 32>::new();
+        let mut ctype = heapless::Vec::<u8, 32>::new();
+        conn.recv_headers(1, |name, value| match name {
+            b":status" => {
+                let _ = status.extend_from_slice(value);
+            }
+            b"Server" => {
+                let _ = server.extend_from_slice(value);
+            }
+            b"Content-Type" => {
+                let _ = ctype.extend_from_slice(value);
+            }
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!(status.as_slice(), b"200");
+        assert_eq!(server.as_slice(), b"nginx/1.24");
+        assert_eq!(ctype.as_slice(), b"text/html");
+
+        // Drain remaining events
+        while conn.poll_event().is_some() {}
+
+        let mut body = [0u8; 64];
+        let (n, fin) = conn.recv_body(1, &mut body).unwrap();
+        assert_eq!(&body[..n], b"<html></html>");
+        assert!(fin);
+    }
+
+    #[test]
+    fn wire_nginx_301_redirect() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        conn.current_stream_id = 1;
+        conn.feed_data(
+            b"HTTP/1.1 301 Moved Permanently\r\n\
+              Location: https://example.com/\r\n\
+              Content-Length: 0\r\n\
+              \r\n",
+        )
+        .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Headers(1));
+
+        let mut status = heapless::Vec::<u8, 16>::new();
+        let mut location = heapless::Vec::<u8, 64>::new();
+        conn.recv_headers(1, |name, value| match name {
+            b":status" => {
+                let _ = status.extend_from_slice(value);
+            }
+            b"Location" => {
+                let _ = location.extend_from_slice(value);
+            }
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!(status.as_slice(), b"301");
+        assert_eq!(location.as_slice(), b"https://example.com/");
+    }
+
+    #[test]
+    fn wire_chunked_response() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        conn.current_stream_id = 1;
+        conn.feed_data(
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              5\r\nhello\r\n0\r\n\r\n",
+        )
+        .unwrap();
+
+        let mut events = heapless::Vec::<Http1Event, 16>::new();
+        while let Some(ev) = conn.poll_event() {
+            let _ = events.push(ev);
+        }
+        assert!(events.contains(&Http1Event::Headers(1)));
+        assert!(events.contains(&Http1Event::Finished(1)));
+
+        conn.recv_headers(1, |_, _| {}).unwrap();
+
+        let mut body = [0u8; 64];
+        let (n, fin) = conn.recv_body(1, &mut body).unwrap();
+        assert_eq!(&body[..n], b"hello");
+        assert!(fin);
+    }
+
+    #[test]
+    fn wire_connection_close() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.feed_data(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+
+        let mut connection_hdr = heapless::Vec::<u8, 16>::new();
+        conn.recv_headers(1, |name, value| {
+            if name == b"Connection" {
+                let _ = connection_hdr.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+        assert_eq!(connection_hdr.as_slice(), b"close");
+    }
+
+    #[test]
+    fn wire_post_json() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.feed_data(
+            b"POST /api HTTP/1.1\r\n\
+              Host: api.example.com\r\n\
+              Content-Type: application/json\r\n\
+              Content-Length: 27\r\n\
+              \r\n\
+              {\"key\":\"value\",\"count\":42}\n",
+        )
+        .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+
+        let mut method = heapless::Vec::<u8, 16>::new();
+        let mut path = heapless::Vec::<u8, 64>::new();
+        let mut ctype = heapless::Vec::<u8, 64>::new();
+        conn.recv_headers(1, |name, value| match name {
+            b":method" => {
+                let _ = method.extend_from_slice(value);
+            }
+            b":path" => {
+                let _ = path.extend_from_slice(value);
+            }
+            b"Content-Type" => {
+                let _ = ctype.extend_from_slice(value);
+            }
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!(method.as_slice(), b"POST");
+        assert_eq!(path.as_slice(), b"/api");
+        assert_eq!(ctype.as_slice(), b"application/json");
+
+        // Drain remaining events
+        while conn.poll_event().is_some() {}
+
+        let mut body = [0u8; 64];
+        let (n, fin) = conn.recv_body(1, &mut body).unwrap();
+        assert_eq!(&body[..n], b"{\"key\":\"value\",\"count\":42}\n");
+        assert!(fin);
+    }
+
+    #[test]
+    fn wire_case_insensitive_headers() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.feed_data(
+            b"GET / HTTP/1.1\r\nHOST: example.com\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+
+        // Parser should accept uppercase HOST header
+        let mut host = heapless::Vec::<u8, 64>::new();
+        conn.recv_headers(1, |name, value| {
+            if eq_ignore_case(name, b"host") {
+                let _ = host.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+        assert_eq!(host.as_slice(), b"example.com");
+    }
+
+    #[test]
+    fn wire_server_response_encoding() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.current_stream_id = 1;
+
+        conn.send_headers(
+            1,
+            &[
+                (b":status", b"200"),
+                (b"Server", b"milli-http"),
+                (b"Content-Length", b"2"),
+            ],
+            false,
+        )
+        .unwrap();
+        conn.send_data(1, b"OK", true).unwrap();
+
+        let mut out = [0u8; 4096];
+        let data = conn.poll_output(&mut out).unwrap();
+        assert_eq!(
+            data,
+            b"HTTP/1.1 200 OK\r\nServer: milli-http\r\nContent-Length: 2\r\n\r\nOK"
+        );
+    }
 }

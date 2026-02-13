@@ -902,4 +902,161 @@ mod tests {
             debug: b"",
         });
     }
+
+    // ====== Wire-Format Decode Tests ======
+    // Each test decodes hand-crafted byte sequences matching RFC 9113 wire format,
+    // verifying our decoder against independently-constructed frames.
+
+    #[test]
+    fn wire_settings_frame_empty() {
+        // Empty SETTINGS: length=0, type=4, flags=0, stream=0
+        let wire: &[u8] = &[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 9);
+        assert_eq!(frame, H2Frame::Settings { ack: false, params: &[] });
+    }
+
+    #[test]
+    fn wire_settings_ack() {
+        // SETTINGS ACK: length=0, type=4, flags=1, stream=0
+        let wire: &[u8] = &[0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 9);
+        assert_eq!(frame, H2Frame::Settings { ack: true, params: &[] });
+    }
+
+    #[test]
+    fn wire_settings_with_params() {
+        // SETTINGS with INITIAL_WINDOW_SIZE(0x0004)=65535: length=6, type=4, flags=0, stream=0
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+            0x00, 0x04, 0x00, 0x00, 0xff, 0xff, // setting: id=4, value=65535
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 15);
+        assert_eq!(
+            frame,
+            H2Frame::Settings {
+                ack: false,
+                params: &[0x00, 0x04, 0x00, 0x00, 0xff, 0xff],
+            }
+        );
+    }
+
+    #[test]
+    fn wire_data_frame() {
+        // DATA on stream 1: length=5, type=0, flags=0, stream=1
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // header
+            b'h', b'e', b'l', b'l', b'o', // payload
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 14);
+        assert_eq!(
+            frame,
+            H2Frame::Data {
+                stream_id: 1,
+                payload: b"hello",
+                end_stream: false,
+            }
+        );
+    }
+
+    #[test]
+    fn wire_data_end_stream() {
+        // DATA+END_STREAM on stream 1: length=5, type=0, flags=1, stream=1
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // header
+            b'h', b'e', b'l', b'l', b'o', // payload
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 14);
+        assert_eq!(
+            frame,
+            H2Frame::Data {
+                stream_id: 1,
+                payload: b"hello",
+                end_stream: true,
+            }
+        );
+    }
+
+    #[test]
+    fn wire_headers_end_stream_end_headers() {
+        // HEADERS: length=3, type=1, flags=0x05 (END_STREAM|END_HEADERS), stream=1
+        // Payload: HPACK-encoded :method GET, :scheme http, :path /
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x03, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01, // header
+            0x82, 0x86, 0x84, // HPACK fragment
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 12);
+        assert_eq!(
+            frame,
+            H2Frame::Headers {
+                stream_id: 1,
+                fragment: &[0x82, 0x86, 0x84],
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wire_goaway_no_error() {
+        // GOAWAY: length=8, type=7, flags=0, stream=0
+        // last_stream_id=0, error_code=0
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x08, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+            0x00, 0x00, 0x00, 0x00, // last_stream_id
+            0x00, 0x00, 0x00, 0x00, // error_code
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 17);
+        assert_eq!(
+            frame,
+            H2Frame::GoAway {
+                last_stream_id: 0,
+                error_code: 0,
+                debug: &[],
+            }
+        );
+    }
+
+    #[test]
+    fn wire_window_update() {
+        // WINDOW_UPDATE: length=4, type=8, flags=0, stream=0, increment=65535
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+            0x00, 0x00, 0xff, 0xff, // increment
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 13);
+        assert_eq!(
+            frame,
+            H2Frame::WindowUpdate {
+                stream_id: 0,
+                increment: 65535,
+            }
+        );
+    }
+
+    #[test]
+    fn wire_ping() {
+        // PING: length=8, type=6, flags=0, stream=0, data=[1..8]
+        let wire: &[u8] = &[
+            0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // ping data
+        ];
+        let (frame, consumed) = decode_frame(wire).unwrap();
+        assert_eq!(consumed, 17);
+        assert_eq!(
+            frame,
+            H2Frame::Ping {
+                data: [1, 2, 3, 4, 5, 6, 7, 8],
+                ack: false,
+            }
+        );
+    }
 }

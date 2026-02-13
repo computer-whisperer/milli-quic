@@ -271,4 +271,32 @@ mod tests {
         assert_eq!(decoded, 1);
         assert_eq!(consumed, n2);
     }
+
+    // ====== RFC 7541 Appendix C.1 Wire-Format Tests ======
+
+    #[test]
+    fn rfc7541_c1_1_encode_10_prefix5() {
+        // RFC 7541 C.1.1: Encoding 10 using a 5-bit prefix.
+        // 10 < 31 (2^5 - 1), so it fits in a single byte: 0x0a.
+        let mut buf = [0u8; 16];
+        let n = encode_integer(10, 5, 0x00, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 0x0a);
+        let (decoded, consumed) = decode_integer(&[0x0a], 5).unwrap();
+        assert_eq!(decoded, 10);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn rfc7541_c1_2_encode_42_prefix8() {
+        // RFC 7541 C.1.2-style: Encoding 42 using an 8-bit prefix.
+        // 42 < 255 (2^8 - 1), so it fits in a single byte: 0x2a.
+        let mut buf = [0u8; 16];
+        let n = encode_integer(42, 8, 0x00, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 0x2a);
+        let (decoded, consumed) = decode_integer(&[0x2a], 8).unwrap();
+        assert_eq!(decoded, 42);
+        assert_eq!(consumed, 1);
+    }
 }

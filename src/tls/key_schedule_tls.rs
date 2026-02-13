@@ -335,4 +335,152 @@ mod tests {
             hex!("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
         );
     }
+
+    /// RFC 8448 §3: Handshake Secret from ECDHE shared secret.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn rfc8448_handshake_secret() {
+        use hex_literal::hex;
+        let hkdf = HkdfSha256;
+        let mut ks = TlsKeySchedule::new(&hkdf);
+        let shared_secret =
+            hex!("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+        ks.derive_handshake_secret(&hkdf, &shared_secret).unwrap();
+        assert_eq!(
+            ks.handshake_secret,
+            hex!("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+        );
+    }
+
+    /// RFC 8448 §3: Client and server handshake traffic secrets.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn rfc8448_handshake_traffic_secrets() {
+        use hex_literal::hex;
+        let hkdf = HkdfSha256;
+        let mut ks = TlsKeySchedule::new(&hkdf);
+        let shared_secret =
+            hex!("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+        ks.derive_handshake_secret(&hkdf, &shared_secret).unwrap();
+
+        let transcript_hash =
+            hex!("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+        let mut client_secret = [0u8; 32];
+        let mut server_secret = [0u8; 32];
+        ks.derive_handshake_traffic_secrets(
+            &hkdf,
+            &transcript_hash,
+            &mut client_secret,
+            &mut server_secret,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client_secret,
+            hex!("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")
+        );
+        assert_eq!(
+            server_secret,
+            hex!("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+        );
+    }
+
+    /// RFC 8448 §3: Master Secret derivation.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn rfc8448_master_secret() {
+        use hex_literal::hex;
+        let hkdf = HkdfSha256;
+        let mut ks = TlsKeySchedule::new(&hkdf);
+        let shared_secret =
+            hex!("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+        ks.derive_handshake_secret(&hkdf, &shared_secret).unwrap();
+        ks.derive_master_secret(&hkdf).unwrap();
+        assert_eq!(
+            ks.master_secret,
+            hex!("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")
+        );
+    }
+
+    /// RFC 8448 §3: Client and server application traffic secrets.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn rfc8448_app_traffic_secrets() {
+        use hex_literal::hex;
+        let hkdf = HkdfSha256;
+        let mut ks = TlsKeySchedule::new(&hkdf);
+        let shared_secret =
+            hex!("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+        ks.derive_handshake_secret(&hkdf, &shared_secret).unwrap();
+        ks.derive_master_secret(&hkdf).unwrap();
+
+        // Transcript-Hash(CH..server Finished) from RFC 8448 §3
+        let transcript_hash =
+            hex!("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+        let mut client_secret = [0u8; 32];
+        let mut server_secret = [0u8; 32];
+        ks.derive_app_traffic_secrets(
+            &hkdf,
+            &transcript_hash,
+            &mut client_secret,
+            &mut server_secret,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client_secret,
+            hex!("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5")
+        );
+        assert_eq!(
+            server_secret,
+            hex!("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643")
+        );
+    }
+
+    /// RFC 8448 §3: Server finished key derivation.
+    /// Validates HKDF-Expand-Label(server_hs_traffic, "finished", "", 32).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn rfc8448_server_finished() {
+        use hex_literal::hex;
+        let hkdf = HkdfSha256;
+
+        let server_hs_traffic =
+            hex!("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+        let mut finished_key = [0u8; 32];
+        TlsKeySchedule::derive_finished_key(&hkdf, &server_hs_traffic, &mut finished_key)
+            .unwrap();
+        assert_eq!(
+            finished_key,
+            hex!("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8")
+        );
+    }
+
+    /// RFC 8448 §3: Client finished key and verify_data.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn rfc8448_client_finished() {
+        use hex_literal::hex;
+        let hkdf = HkdfSha256;
+
+        let client_hs_traffic =
+            hex!("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
+        let mut finished_key = [0u8; 32];
+        TlsKeySchedule::derive_finished_key(&hkdf, &client_hs_traffic, &mut finished_key)
+            .unwrap();
+        assert_eq!(
+            finished_key,
+            hex!("b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4")
+        );
+
+        // Transcript-Hash(CH..server Finished) from RFC 8448 §3
+        let transcript_hash =
+            hex!("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+        let verify_data =
+            compute_finished_verify_data(&hkdf, &finished_key, &transcript_hash).unwrap();
+        assert_eq!(
+            verify_data,
+            hex!("a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61")
+        );
+    }
 }

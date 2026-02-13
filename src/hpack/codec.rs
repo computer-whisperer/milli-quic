@@ -397,4 +397,133 @@ mod tests {
         let buf = [0x80]; // index 0
         assert!(decoder.decode(&buf, |_, _| {}).is_err());
     }
+
+    // ====== RFC 7541 Wire-Format Decode Tests ======
+
+    #[test]
+    fn rfc7541_c2_1_literal_with_indexing() {
+        // RFC 7541 Appendix C.2.1: Literal Header Field with Incremental Indexing
+        // custom-key: custom-header
+        let input: &[u8] = &[
+            0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63,
+            0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72,
+        ];
+        let decoder = HpackDecoder::new();
+        let mut c = Collected {
+            entries: HVec::new(),
+        };
+        let consumed = decoder
+            .decode(input, |name, value| {
+                c.entries
+                    .push((
+                        HVec::from_slice(name).unwrap(),
+                        HVec::from_slice(value).unwrap(),
+                    ))
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(consumed, input.len());
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].0.as_slice(), b"custom-key");
+        assert_eq!(c.entries[0].1.as_slice(), b"custom-header");
+    }
+
+    #[test]
+    fn rfc7541_c2_2_literal_no_indexing() {
+        // RFC 7541 Appendix C.2.2: Literal Header Field without Indexing
+        // :path: /sample/path (name index 4 = :path)
+        let input: &[u8] = &[
+            0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x70, 0x61, 0x74, 0x68,
+        ];
+        let decoder = HpackDecoder::new();
+        let mut c = Collected {
+            entries: HVec::new(),
+        };
+        decoder
+            .decode(input, |name, value| {
+                c.entries
+                    .push((
+                        HVec::from_slice(name).unwrap(),
+                        HVec::from_slice(value).unwrap(),
+                    ))
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].0.as_slice(), b":path");
+        assert_eq!(c.entries[0].1.as_slice(), b"/sample/path");
+    }
+
+    #[test]
+    fn rfc7541_c2_3_literal_never_indexed() {
+        // RFC 7541 Appendix C.2.3: Literal Header Field Never Indexed
+        // password: secret
+        let input: &[u8] = &[
+            0x10, 0x08, 0x70, 0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0x06, 0x73, 0x65, 0x63,
+            0x72, 0x65, 0x74,
+        ];
+        let decoder = HpackDecoder::new();
+        let mut c = Collected {
+            entries: HVec::new(),
+        };
+        decoder
+            .decode(input, |name, value| {
+                c.entries
+                    .push((
+                        HVec::from_slice(name).unwrap(),
+                        HVec::from_slice(value).unwrap(),
+                    ))
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].0.as_slice(), b"password");
+        assert_eq!(c.entries[0].1.as_slice(), b"secret");
+    }
+
+    #[test]
+    fn rfc7541_c4_indexed_method_get() {
+        // Indexed representation: index 2 = :method GET
+        let input: &[u8] = &[0x82];
+        let decoder = HpackDecoder::new();
+        let mut c = Collected {
+            entries: HVec::new(),
+        };
+        decoder
+            .decode(input, |name, value| {
+                c.entries
+                    .push((
+                        HVec::from_slice(name).unwrap(),
+                        HVec::from_slice(value).unwrap(),
+                    ))
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].0.as_slice(), b":method");
+        assert_eq!(c.entries[0].1.as_slice(), b"GET");
+    }
+
+    #[test]
+    fn rfc7541_c4_indexed_status_200() {
+        // Indexed representation: index 8 = :status 200
+        let input: &[u8] = &[0x88];
+        let decoder = HpackDecoder::new();
+        let mut c = Collected {
+            entries: HVec::new(),
+        };
+        decoder
+            .decode(input, |name, value| {
+                c.entries
+                    .push((
+                        HVec::from_slice(name).unwrap(),
+                        HVec::from_slice(value).unwrap(),
+                    ))
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].0.as_slice(), b":status");
+        assert_eq!(c.entries[0].1.as_slice(), b"200");
+    }
 }
