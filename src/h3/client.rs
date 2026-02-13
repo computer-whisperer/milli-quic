@@ -49,6 +49,7 @@ where
         path: &str,
         authority: &str,
         headers: &[(&[u8], &[u8])],
+        end_stream: bool,
     ) -> Result<u64, Error> {
         // Open a new bidirectional request stream.
         let stream_id = self.inner.quic.open_stream()?;
@@ -66,7 +67,7 @@ where
             let _ = all_headers.push((name, value));
         }
 
-        self.inner.send_headers(stream_id, &all_headers)?;
+        self.inner.send_headers(stream_id, &all_headers, end_stream)?;
 
         // Track this as a request stream.
         let _ = self

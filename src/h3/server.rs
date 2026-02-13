@@ -75,6 +75,7 @@ where
         stream_id: u64,
         status: u16,
         headers: &[(&[u8], &[u8])],
+        end_stream: bool,
     ) -> Result<(), Error> {
         // Format the status as a short string.
         let status_str = crate::http::StatusCode(status).to_bytes();
@@ -87,7 +88,7 @@ where
             let _ = all_headers.push((name, value));
         }
 
-        self.inner.send_headers(stream_id, &all_headers)
+        self.inner.send_headers(stream_id, &all_headers, end_stream)
     }
 
     /// Send response body data.

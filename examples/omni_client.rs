@@ -233,7 +233,7 @@ fn run_h3(addr: &str) {
         }
 
         if !request_sent {
-            if let Ok(sid) = h3.send_request("GET", "/", "localhost", &[]) {
+            if let Ok(sid) = h3.send_request("GET", "/", "localhost", &[], false) {
                 h3.send_body(sid, &[], true).ok();
                 println!("[h3] sent GET /");
                 request_stream = Some(sid);

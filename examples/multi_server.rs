@@ -170,7 +170,7 @@ fn main() {
                             (b"content-type", b"text/html"),
                             (b"content-length", cl.as_bytes()),
                             (b"server", b"milli-http/0.1"),
-                        ]).ok();
+                        ], false).ok();
                         h3.send_body(sid, BODY, true).ok();
                         println!("[h3] sent response on stream {sid}");
                     }

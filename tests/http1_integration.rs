@@ -101,7 +101,7 @@ fn http1_get_request_response() {
     assert!(
         events
             .iter()
-            .any(|ev| matches!(ev, Http1Event::Request { .. })),
+            .any(|ev| matches!(ev, Http1Event::Headers(_))),
         "server should receive Request event"
     );
 
@@ -213,7 +213,7 @@ fn http1_post_with_body() {
 
     // Server receives request.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
 
     // Server reads headers.
     let mut method = Vec::new();
@@ -301,7 +301,7 @@ fn http1_keep_alive_sequential() {
         // Server receives request.
         let events = drain_events_server(&mut server);
         assert!(
-            events.iter().any(|ev| matches!(ev, Http1Event::Request { stream_id: sid } if *sid == i)),
+            events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == i)),
             "server should receive request {i}"
         );
 
@@ -378,7 +378,7 @@ fn http1_connection_close() {
 
     // Server receives request.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
 
     // Server reads headers — should see Connection: close.
     let mut connection_hdr = Vec::new();
@@ -436,7 +436,7 @@ fn http1_chunked_response() {
 
     // Server receives request.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
     server.recv_headers(1, |_, _| {}).unwrap();
 
     // Server sends chunked response by manually encoding chunks.
@@ -514,7 +514,7 @@ fn http1_large_body() {
 
     // Server receives request.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
 
     // Server reads headers.
     server.recv_headers(1, |_, _| {}).unwrap();
@@ -574,7 +574,7 @@ fn http1_multiple_headers() {
 
     // Server receives request.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
 
     // Server reads all headers.
     let mut accept = Vec::new();
@@ -661,7 +661,7 @@ fn http1_different_status_codes() {
         transfer_to_server(&mut client, &mut server);
 
         let events = drain_events_server(&mut server);
-        assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+        assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
         server.recv_headers(1, |_, _| {}).unwrap();
 
         server
@@ -705,7 +705,7 @@ fn http1_head_request() {
 
     // Server receives request.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { .. })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))));
 
     let mut method = Vec::new();
     server
@@ -785,7 +785,7 @@ fn http1_post_then_get_keep_alive() {
 
     // Server receives POST.
     let events = drain_events_server(&mut server);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Request { stream_id: 1 })));
+    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(1))));
 
     // Server consumes request headers + body.
     let mut method = Vec::new();
@@ -842,7 +842,7 @@ fn http1_post_then_get_keep_alive() {
     // Server receives GET on same connection.
     let events = drain_events_server(&mut server);
     assert!(
-        events.iter().any(|ev| matches!(ev, Http1Event::Request { stream_id: 2 })),
+        events.iter().any(|ev| matches!(ev, Http1Event::Headers(2))),
         "server should receive second request with stream_id 2"
     );
 

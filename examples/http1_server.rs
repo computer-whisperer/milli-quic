@@ -62,7 +62,7 @@ fn main() {
         // Process events.
         while let Some(event) = http1.poll_event() {
             match event {
-                Http1Event::Request { stream_id } => {
+                Http1Event::Headers(stream_id) => {
                     println!("[http1] request on stream {stream_id}");
 
                     http1.recv_headers(stream_id, |name, value| {

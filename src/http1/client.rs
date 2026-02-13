@@ -146,7 +146,7 @@ mod tests {
         let mut got_request = false;
         let mut request_sid = 0u32;
         while let Some(ev) = server.poll_event() {
-            if let Http1Event::Request { stream_id } = ev {
+            if let Http1Event::Headers(stream_id) = ev {
                 got_request = true;
                 request_sid = stream_id;
             }

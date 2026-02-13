@@ -508,6 +508,7 @@ where
         &mut self,
         stream_id: u64,
         headers: &[(&[u8], &[u8])],
+        end_stream: bool,
     ) -> Result<(), Error> {
         // Encode headers with QPACK.
         let mut qpack_buf = [0u8; 2048];
@@ -519,7 +520,7 @@ where
         let frame_len = encode_h3_frame(&frame, &mut frame_buf)?;
 
         self.quic
-            .stream_send(stream_id, &frame_buf[..frame_len], false)?;
+            .stream_send(stream_id, &frame_buf[..frame_len], end_stream)?;
         Ok(())
     }
 
@@ -831,7 +832,7 @@ mod tests {
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Client sends GET request.
-        let stream_id = client.send_request("GET", "/", "test.local", &[]).unwrap();
+        let stream_id = client.send_request("GET", "/", "test.local", &[], false).unwrap();
 
         // Send FIN on the request stream (no body for GET).
         client.send_body(stream_id, &[], true).unwrap();
@@ -873,7 +874,7 @@ mod tests {
 
         // Server sends response.
         server
-            .send_response(header_stream_id, 200, &[(b"content-type", b"text/plain")])
+            .send_response(header_stream_id, 200, &[(b"content-type", b"text/plain")], false)
             .unwrap();
 
         let body = b"Hello, HTTP/3!";
@@ -949,10 +950,10 @@ mod tests {
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Send two requests.
-        let stream1 = client.send_request("GET", "/page1", "test.local", &[]).unwrap();
+        let stream1 = client.send_request("GET", "/page1", "test.local", &[], false).unwrap();
         client.send_body(stream1, &[], true).unwrap();
 
-        let stream2 = client.send_request("GET", "/page2", "test.local", &[]).unwrap();
+        let stream2 = client.send_request("GET", "/page2", "test.local", &[], false).unwrap();
         client.send_body(stream2, &[], true).unwrap();
 
         // Stream IDs should be different.
@@ -1065,6 +1066,7 @@ mod tests {
                     (b"content-type", b"application/json"),
                     (b"accept", b"application/json"),
                 ],
+                false,
             )
             .unwrap();
 

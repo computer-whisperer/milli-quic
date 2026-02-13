@@ -141,7 +141,7 @@ fn main() {
         // Send request once connected (first poll_event after Connected).
         if !request_sent {
             // Try to send — will succeed once handshake and H3 setup are done.
-            match h3.send_request("GET", "/", "localhost", &[]) {
+            match h3.send_request("GET", "/", "localhost", &[], false) {
                 Ok(stream_id) => {
                     h3.send_body(stream_id, &[], true).ok();
                     println!("[h3] sent GET / on stream {stream_id}");

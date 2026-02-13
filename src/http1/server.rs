@@ -111,7 +111,7 @@ mod tests {
             .unwrap();
 
         let event = server.poll_event().unwrap();
-        assert!(matches!(event, Http1Event::Request { stream_id: 1 }));
+        assert!(matches!(event, Http1Event::Headers(1)));
     }
 
     #[test]

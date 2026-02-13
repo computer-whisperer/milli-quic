@@ -22,10 +22,8 @@ use super::parse;
 /// Events produced by the HTTP/1.1 connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http1Event {
-    /// A complete request has been received (server-side).
+    /// Headers received (request headers on server-side, response headers on client-side).
     /// The `u32` is a pseudo-stream-id for API consistency with H2/H3.
-    Request { stream_id: u32 },
-    /// Response headers received (client-side).
     Headers(u32),
     /// Body data available.
     Data(u32),
@@ -543,7 +541,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         if self.role == Role::Server {
             self.current_stream_id += 1;
             let sid = self.current_stream_id;
-            let _ = self.events.push_back(Http1Event::Request { stream_id: sid });
+            let _ = self.events.push_back(Http1Event::Headers(sid));
         } else {
             let sid = self.current_stream_id;
             let _ = self.events.push_back(Http1Event::Headers(sid));
@@ -791,7 +789,7 @@ mod tests {
             .unwrap();
 
         let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Request { stream_id: 1 });
+        assert_eq!(event, Http1Event::Headers(1));
 
         // Should also get Finished since GET has no body
         let event2 = conn.poll_event().unwrap();
@@ -830,7 +828,7 @@ mod tests {
         .unwrap();
 
         let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Request { stream_id: 1 });
+        assert_eq!(event, Http1Event::Headers(1));
 
         // Data event
         let event2 = conn.poll_event().unwrap();
@@ -862,7 +860,7 @@ mod tests {
             let _ = events.push(ev);
         }
 
-        assert!(events.contains(&Http1Event::Request { stream_id: 1 }));
+        assert!(events.contains(&Http1Event::Headers(1)));
         assert!(events.contains(&Http1Event::Finished(1)));
 
         // Read body
@@ -967,7 +965,7 @@ mod tests {
 
         conn.feed_data(b"\r\n").unwrap();
         let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Request { stream_id: 1 });
+        assert_eq!(event, Http1Event::Headers(1));
     }
 
     #[test]
@@ -978,7 +976,7 @@ mod tests {
         conn.feed_data(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
 
         // Drain all events
         while conn.poll_event().is_some() {}
@@ -990,7 +988,7 @@ mod tests {
         conn.feed_data(b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
         let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Request { stream_id: 2 });
+        assert_eq!(ev2, Http1Event::Headers(2));
     }
 
     #[test]
@@ -1004,7 +1002,7 @@ mod tests {
         .unwrap();
 
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
 
         // Drain events
         while conn.poll_event().is_some() {}
@@ -1020,7 +1018,7 @@ mod tests {
         conn.feed_data(b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
         let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Request { stream_id: 2 });
+        assert_eq!(ev2, Http1Event::Headers(2));
 
         // body_finished should be false for the new request context
         // (recv_body should WouldBlock if called before Finished, but GET
@@ -1042,7 +1040,7 @@ mod tests {
 
         // Should only see first request
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
         assert_eq!(ev2, Http1Event::Finished(1));
         // No more events yet — second request is blocked
@@ -1054,7 +1052,7 @@ mod tests {
         // Now feed_data (or process) can parse the second request
         conn.feed_data(b"").unwrap(); // Trigger processing
         let ev3 = conn.poll_event().unwrap();
-        assert_eq!(ev3, Http1Event::Request { stream_id: 2 });
+        assert_eq!(ev3, Http1Event::Headers(2));
     }
 
     #[test]
@@ -1100,7 +1098,7 @@ mod tests {
         .unwrap();
 
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
         assert_eq!(ev2, Http1Event::Finished(1));
         // No Data event
@@ -1140,7 +1138,7 @@ mod tests {
 
         // Should get request + data event (first 8 bytes fill data_buf)
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
         assert_eq!(ev2, Http1Event::Data(1));
         // No finished yet — 4 bytes remain but data_buf is full
@@ -1198,7 +1196,7 @@ mod tests {
         )
         .unwrap();
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
 
         // Feed chunk size + partial data
         conn.feed_data(b"5\r\nhel").unwrap();
@@ -1264,7 +1262,7 @@ mod tests {
 
         // Server gets request
         let ev = server.poll_event().unwrap();
-        assert!(matches!(ev, Http1Event::Request { .. }));
+        assert!(matches!(ev, Http1Event::Headers(_)));
 
         // Drain remaining events
         while server.poll_event().is_some() {}
@@ -1387,7 +1385,7 @@ mod tests {
         .unwrap();
 
         let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Request { stream_id: 1 });
+        assert_eq!(event, Http1Event::Headers(1));
         let event2 = conn.poll_event().unwrap();
         assert_eq!(event2, Http1Event::Finished(1));
 
@@ -1533,7 +1531,7 @@ mod tests {
             .unwrap();
 
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
 
         let mut connection_hdr = heapless::Vec::<u8, 16>::new();
         conn.recv_headers(1, |name, value| {
@@ -1559,7 +1557,7 @@ mod tests {
         .unwrap();
 
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
 
         let mut method = heapless::Vec::<u8, 16>::new();
         let mut path = heapless::Vec::<u8, 64>::new();
@@ -1599,7 +1597,7 @@ mod tests {
         .unwrap();
 
         let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        assert_eq!(ev, Http1Event::Headers(1));
 
         // Parser should accept uppercase HOST header
         let mut host = heapless::Vec::<u8, 64>::new();

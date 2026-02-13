@@ -306,7 +306,7 @@ fn main() {
                         (b"server", b"milli-quic/0.1"),
                     ];
 
-                    if let Err(e) = h3.send_response(stream_id, 200, extra_headers) {
+                    if let Err(e) = h3.send_response(stream_id, 200, extra_headers, false) {
                         eprintln!("[h3] error sending response headers: {e}");
                         continue;
                     }

@@ -267,7 +267,7 @@ fn h3_get_request_response() {
 
     // Client sends a GET request.
     let stream_id = client
-        .send_request("GET", "/index.html", "test.local", &[])
+        .send_request("GET", "/index.html", "test.local", &[], false)
         .unwrap();
 
     // End the request stream (no body for GET).
@@ -307,7 +307,7 @@ fn h3_get_request_response() {
     assert_eq!(path, b"/index.html");
 
     // Server sends 200 response with body.
-    server.send_response(req_stream, 200, &[]).unwrap();
+    server.send_response(req_stream, 200, &[], false).unwrap();
     let body = b"Hello, world!";
     server.send_body(req_stream, body, true).unwrap();
 
@@ -366,6 +366,7 @@ fn h3_post_with_body() {
             "/api/data",
             "test.local",
             &[(b"content-type", b"application/json")],
+            false,
         )
         .unwrap();
 
@@ -425,12 +426,12 @@ fn h3_multiple_requests() {
 
     // Client sends two GET requests on different streams.
     let stream1 = client
-        .send_request("GET", "/page1", "test.local", &[])
+        .send_request("GET", "/page1", "test.local", &[], false)
         .unwrap();
     client.send_body(stream1, &[], true).unwrap();
 
     let stream2 = client
-        .send_request("GET", "/page2", "test.local", &[])
+        .send_request("GET", "/page2", "test.local", &[], false)
         .unwrap();
     client.send_body(stream2, &[], true).unwrap();
 
@@ -461,7 +462,7 @@ fn h3_multiple_requests() {
 
     // Server responds to both requests.
     for &sid in &header_streams {
-        server.send_response(sid, 200, &[]).unwrap();
+        server.send_response(sid, 200, &[], false).unwrap();
         server.send_body(sid, b"ok", true).unwrap();
     }
 
@@ -498,7 +499,7 @@ fn h3_large_response_body() {
 
     // Client sends GET request.
     let stream_id = client
-        .send_request("GET", "/large", "test.local", &[])
+        .send_request("GET", "/large", "test.local", &[], false)
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
@@ -520,7 +521,7 @@ fn h3_large_response_body() {
     let req_stream = req_stream.expect("server should receive request");
 
     // Server sends response headers.
-    server.send_response(req_stream, 200, &[]).unwrap();
+    server.send_response(req_stream, 200, &[], false).unwrap();
 
     // Server sends a body larger than what fits in a single stream-send entry.
     // The stream_send limit is 1024 bytes per call, so we send in two chunks
@@ -574,7 +575,7 @@ fn h3_response_headers_correct() {
 
     // Client sends GET.
     let stream_id = client
-        .send_request("GET", "/headers-test", "test.local", &[])
+        .send_request("GET", "/headers-test", "test.local", &[], false)
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
@@ -605,6 +606,7 @@ fn h3_response_headers_correct() {
                 (b"server", b"milli-quic/test"),
                 (b"x-custom", b"hello"),
             ],
+            false,
         )
         .unwrap();
     server.send_body(req_stream, &[], true).unwrap();
@@ -742,7 +744,7 @@ fn h3_stream_fin_on_response() {
 
     // Client sends GET.
     let stream_id = client
-        .send_request("GET", "/fin-test", "test.local", &[])
+        .send_request("GET", "/fin-test", "test.local", &[], false)
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
@@ -764,7 +766,7 @@ fn h3_stream_fin_on_response() {
     let req_stream = req_stream.expect("server should receive request");
 
     // Server sends response with body and fin=true.
-    server.send_response(req_stream, 200, &[]).unwrap();
+    server.send_response(req_stream, 200, &[], false).unwrap();
     server.send_body(req_stream, b"done", true).unwrap();
 
     exchange_h3_packets(&mut client, &mut server, now, &mut pool);
@@ -807,7 +809,7 @@ fn h3_empty_body_response() {
 
     // Client sends GET.
     let stream_id = client
-        .send_request("GET", "/empty", "test.local", &[])
+        .send_request("GET", "/empty", "test.local", &[], false)
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
 
@@ -829,7 +831,7 @@ fn h3_empty_body_response() {
     let req_stream = req_stream.expect("server should receive request");
 
     // Server sends 200 with NO body, just headers + fin.
-    server.send_response(req_stream, 200, &[]).unwrap();
+    server.send_response(req_stream, 200, &[], false).unwrap();
     server.send_body(req_stream, &[], true).unwrap();
 
     exchange_h3_packets(&mut client, &mut server, now, &mut pool);
@@ -881,6 +883,7 @@ fn h3_request_headers_round_trip() {
                 (b"accept", b"*/*"),
                 (b"user-agent", b"milli-quic/test"),
             ],
+            false,
         )
         .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
@@ -949,7 +952,7 @@ fn h3_server_responds_different_status_codes() {
         let (mut client, mut server, now, mut pool) = setup_h3_pair();
 
         let stream_id = client
-            .send_request("GET", "/", "test.local", &[])
+            .send_request("GET", "/", "test.local", &[], false)
             .unwrap();
         client.send_body(stream_id, &[], true).unwrap();
 
@@ -969,7 +972,7 @@ fn h3_server_responds_different_status_codes() {
         }
         let req_stream = req_stream.expect("server should receive request");
 
-        server.send_response(req_stream, code, &[]).unwrap();
+        server.send_response(req_stream, code, &[], false).unwrap();
         server.send_body(req_stream, &[], true).unwrap();
 
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
