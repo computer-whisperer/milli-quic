@@ -4,11 +4,18 @@ use crate::error::Error;
 use super::connection::{H2Connection, H2Event};
 
 /// HTTP/2 server.
-pub struct H2Server<const MAX_STREAMS: usize = 64, const BUF: usize = 16384> {
-    inner: H2Connection<MAX_STREAMS, BUF>,
+pub struct H2Server<
+    const MAX_STREAMS: usize = 8,
+    const BUF: usize = 16384,
+    const HDRBUF: usize = 2048,
+    const DATABUF: usize = 4096,
+> {
+    inner: H2Connection<MAX_STREAMS, BUF, HDRBUF, DATABUF>,
 }
 
-impl<const MAX_STREAMS: usize, const BUF: usize> H2Server<MAX_STREAMS, BUF> {
+impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
+    H2Server<MAX_STREAMS, BUF, HDRBUF, DATABUF>
+{
     /// Create a new HTTP/2 server connection.
     pub fn new() -> Self {
         Self {
@@ -82,7 +89,9 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Server<MAX_STREAMS, BUF> {
     }
 }
 
-impl<const MAX_STREAMS: usize, const BUF: usize> Default for H2Server<MAX_STREAMS, BUF> {
+impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
+    Default for H2Server<MAX_STREAMS, BUF, HDRBUF, DATABUF>
+{
     fn default() -> Self {
         Self::new()
     }

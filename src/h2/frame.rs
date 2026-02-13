@@ -184,6 +184,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             }
         }
         FRAME_PRIORITY => {
+            // RFC 9113 §6.3: PRIORITY must not be on stream 0
+            if hdr.stream_id == 0 {
+                return Err(Error::InvalidState);
+            }
             if payload.len() != 5 {
                 return Err(Error::InvalidState);
             }
@@ -196,6 +200,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             }
         }
         FRAME_RST_STREAM => {
+            // RFC 9113 §6.4: RST_STREAM must not be on stream 0
+            if hdr.stream_id == 0 {
+                return Err(Error::InvalidState);
+            }
             if payload.len() != 4 {
                 return Err(Error::InvalidState);
             }
@@ -206,6 +214,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             }
         }
         FRAME_SETTINGS => {
+            // RFC 9113 §6.5: SETTINGS must be on stream 0
+            if hdr.stream_id != 0 {
+                return Err(Error::InvalidState);
+            }
             H2Frame::Settings {
                 ack: hdr.flags & FLAG_ACK != 0,
                 params: payload,
@@ -225,6 +237,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             }
         }
         FRAME_PING => {
+            // RFC 9113 §6.7: PING must be on stream 0
+            if hdr.stream_id != 0 {
+                return Err(Error::InvalidState);
+            }
             if payload.len() != 8 {
                 return Err(Error::InvalidState);
             }
@@ -236,6 +252,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             }
         }
         FRAME_GOAWAY => {
+            // RFC 9113 §6.8: GOAWAY must be on stream 0
+            if hdr.stream_id != 0 {
+                return Err(Error::InvalidState);
+            }
             if payload.len() < 8 {
                 return Err(Error::BufferTooSmall { needed: 8 });
             }
@@ -466,7 +486,7 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
 
 /// Strip PADDED framing if the PADDED flag is set.
 /// Returns (unpadded_data, padding_length).
-fn strip_padding<'a>(payload: &'a [u8], flags: u8) -> Result<(&'a [u8], usize), Error> {
+fn strip_padding(payload: &[u8], flags: u8) -> Result<(&[u8], usize), Error> {
     if flags & FLAG_PADDED != 0 {
         if payload.is_empty() {
             return Err(Error::BufferTooSmall { needed: 1 });
@@ -507,16 +527,16 @@ pub fn encode_setting(id: u16, value: u32, buf: &mut [u8]) -> Result<usize, Erro
 /// Calls `emit(id, value)` for each parameter.
 pub fn decode_settings_params<F>(payload: &[u8], mut emit: F) -> Result<(), Error>
 where
-    F: FnMut(u16, u32),
+    F: FnMut(u16, u32) -> Result<(), Error>,
 {
-    if payload.len() % 6 != 0 {
+    if !payload.len().is_multiple_of(6) {
         return Err(Error::InvalidState);
     }
     let mut pos = 0;
     while pos + 6 <= payload.len() {
         let id = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
         let value = u32::from_be_bytes([payload[pos + 2], payload[pos + 3], payload[pos + 4], payload[pos + 5]]);
-        emit(id, value);
+        emit(id, value)?;
         pos += 6;
     }
     Ok(())
@@ -795,6 +815,7 @@ mod tests {
         let mut params = heapless::Vec::<(u16, u32), 8>::new();
         decode_settings_params(&buf[..off], |id, val| {
             let _ = params.push((id, val));
+            Ok(())
         }).unwrap();
 
         assert_eq!(params.len(), 3);
@@ -806,7 +827,7 @@ mod tests {
     #[test]
     fn settings_params_odd_length_error() {
         let buf = [0u8; 5]; // Not a multiple of 6
-        assert!(decode_settings_params(&buf, |_, _| {}).is_err());
+        assert!(decode_settings_params(&buf, |_, _| Ok(())).is_err());
     }
 
     #[test]

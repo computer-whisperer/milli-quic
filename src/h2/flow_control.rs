@@ -35,6 +35,10 @@ impl FlowController {
     /// Consume `n` bytes from the window (for sending data).
     /// Returns error if not enough window available.
     pub fn consume(&mut self, n: u32) -> Result<(), Error> {
+        // Guard against truncation: n > i32::MAX can't fit
+        if n > i32::MAX as u32 {
+            return Err(Error::InvalidState);
+        }
         let n_i32 = n as i32;
         if self.window < n_i32 {
             return Err(Error::InvalidState);

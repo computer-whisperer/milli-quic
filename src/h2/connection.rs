@@ -75,17 +75,33 @@ impl H2Settings {
         Ok(off)
     }
 
-    /// Apply a settings parameter.
-    pub fn apply(&mut self, id: u16, value: u32) {
+    /// Apply a settings parameter with RFC 9113 §6.5.2 validation.
+    pub fn apply(&mut self, id: u16, value: u32) -> Result<(), Error> {
         match id {
             SETTINGS_HEADER_TABLE_SIZE => self.header_table_size = value,
-            SETTINGS_ENABLE_PUSH => self.enable_push = value != 0,
+            SETTINGS_ENABLE_PUSH => {
+                if value > 1 {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
+                self.enable_push = value != 0;
+            }
             SETTINGS_MAX_CONCURRENT_STREAMS => self.max_concurrent_streams = value,
-            SETTINGS_INITIAL_WINDOW_SIZE => self.initial_window_size = value,
-            SETTINGS_MAX_FRAME_SIZE => self.max_frame_size = value,
+            SETTINGS_INITIAL_WINDOW_SIZE => {
+                if value > 0x7fff_ffff {
+                    return Err(Error::Http2(crate::error::H2Error::FlowControlError));
+                }
+                self.initial_window_size = value;
+            }
+            SETTINGS_MAX_FRAME_SIZE => {
+                if !(16384..=16_777_215).contains(&value) {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
+                self.max_frame_size = value;
+            }
             SETTINGS_MAX_HEADER_LIST_SIZE => self.max_header_list_size = value,
-            _ => {} // Unknown settings are ignored
+            _ => {} // Unknown settings are ignored (RFC 9113 §6.5.2)
         }
+        Ok(())
     }
 }
 
@@ -110,12 +126,19 @@ enum H2ConnState {
 /// Generic parameters:
 /// - `MAX_STREAMS`: maximum number of concurrent streams tracked
 /// - `BUF`: size of internal send/recv buffers
-pub struct H2Connection<const MAX_STREAMS: usize = 64, const BUF: usize = 16384> {
+/// - `HDRBUF`: per-stream header buffer size
+/// - `DATABUF`: per-stream data buffer size
+pub struct H2Connection<
+    const MAX_STREAMS: usize = 8,
+    const BUF: usize = 16384,
+    const HDRBUF: usize = 2048,
+    const DATABUF: usize = 4096,
+> {
     role: Role,
     state: H2ConnState,
     local_settings: H2Settings,
     peer_settings: H2Settings,
-    streams: heapless::Vec<H2Stream, MAX_STREAMS>,
+    streams: heapless::Vec<H2Stream<HDRBUF, DATABUF>, MAX_STREAMS>,
     encoder: HpackEncoder,
     decoder: HpackDecoder,
     // I/O accumulation
@@ -130,6 +153,8 @@ pub struct H2Connection<const MAX_STREAMS: usize = 64, const BUF: usize = 16384>
     // Connection state
     next_stream_id: u32,
     last_peer_stream_id: u32,
+    /// Stream expecting CONTINUATION frames (RFC 9113 §4.3).
+    continuation_stream_id: Option<u32>,
     settings_sent: bool,
     settings_ack_received: bool,
     peer_settings_received: bool,
@@ -139,7 +164,9 @@ pub struct H2Connection<const MAX_STREAMS: usize = 64, const BUF: usize = 16384>
     goaway_sent: bool,
 }
 
-impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> {
+impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
+    H2Connection<MAX_STREAMS, BUF, HDRBUF, DATABUF>
+{
     /// Create a new client-side connection.
     pub fn new_client() -> Self {
         Self::new(Role::Client)
@@ -171,6 +198,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
             events: heapless::Deque::new(),
             next_stream_id,
             last_peer_stream_id: 0,
+            continuation_stream_id: None,
             settings_sent: false,
             settings_ack_received: false,
             peer_settings_received: false,
@@ -275,8 +303,12 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<u32, Error> {
+        // RFC 9113 §5.1.1: stream IDs must not exceed 2^31-1
+        if self.next_stream_id > 0x7fff_ffff {
+            return Err(Error::StreamLimitExhausted);
+        }
         let stream_id = self.next_stream_id;
-        self.next_stream_id += 2;
+        self.next_stream_id = self.next_stream_id.wrapping_add(2);
         self.send_headers(stream_id, headers, end_stream)?;
         Ok(stream_id)
     }
@@ -288,6 +320,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
+        // Check stream state
+        if let Some(stream) = self.get_stream(stream_id) && !stream.can_send() {
+            return Err(Error::InvalidState);
+        }
         // Check flow control
         let max_by_conn = self.conn_send_fc.window().max(0) as usize;
         let max_by_stream = self.get_stream(stream_id)
@@ -326,10 +362,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
         }
 
         // Update stream state
-        if actual_end {
-            if let Some(stream) = self.get_stream_mut(stream_id) {
-                stream.send_end_stream();
-            }
+        if actual_end && let Some(stream) = self.get_stream_mut(stream_id) {
+            stream.send_end_stream();
         }
 
         Ok(to_send.len())
@@ -346,6 +380,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
             return Err(Error::WouldBlock);
         }
         self.decoder.decode(&stream.headers_data, emit)?;
+        // Clear after decode to prevent double-reading
+        if let Some(stream) = self.get_stream_mut(stream_id) {
+            stream.headers_data.clear();
+            stream.headers_received = false;
+        }
         Ok(())
     }
 
@@ -456,7 +495,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
         if stream_id == 0 {
             let _ = self.conn_recv_fc.replenish(increment);
         } else if let Some(stream) = self.get_stream_mut(stream_id) {
-            stream.recv_window += increment as i32;
+            let new_window = stream.recv_window as i64 + increment as i64;
+            stream.recv_window = new_window.min(0x7fff_ffff) as i32;
         }
     }
 
@@ -517,6 +557,9 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
             self.handle_frame(frame)?;
         }
 
+        // Clean up closed streams to free slots
+        self.streams.retain(|s| s.state != H2StreamState::Closed || s.data_available);
+
         Ok(())
     }
 
@@ -541,63 +584,84 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
     }
 
     fn handle_frame(&mut self, frame: H2Frame<'_>) -> Result<(), Error> {
+        // RFC 9113 §4.3: If we're expecting CONTINUATION, only CONTINUATION
+        // for the same stream is allowed.
+        if let Some(expected_sid) = self.continuation_stream_id {
+            match &frame {
+                H2Frame::Continuation { stream_id, .. } if *stream_id == expected_sid => {
+                    // OK — this is the expected continuation
+                }
+                _ => {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
+            }
+        }
+
         match frame {
-            H2Frame::Settings { ack, params } => {
+            H2Frame::Settings { ack, params, .. } => {
+                // SETTINGS must be on stream 0 (checked via frame stream_id in caller)
                 if ack {
+                    // ACK must have empty payload (RFC 9113 §6.5)
+                    if !params.is_empty() {
+                        return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
+                    }
                     self.settings_ack_received = true;
                     if self.peer_settings_received && self.state == H2ConnState::WaitingSettings {
                         self.state = H2ConnState::Active;
                         let _ = self.events.push_back(H2Event::Connected);
                     }
                 } else {
-                    // Apply peer settings
+                    // Save old initial window size for delta computation
+                    let old_initial = self.peer_settings.initial_window_size as i32;
+                    // Apply peer settings (with validation)
                     frame::decode_settings_params(params, |id, value| {
-                        self.peer_settings.apply(id, value);
+                        self.peer_settings.apply(id, value)
                     })?;
                     self.peer_settings_received = true;
                     // Send ACK
                     self.send_settings_ack()?;
-                    // Transition to active if we also received their ACK or if just waiting
+                    // Transition to active once we have peer settings
                     match self.state {
                         H2ConnState::WaitingPreface | H2ConnState::WaitingSettings => {
-                            self.state = H2ConnState::WaitingSettings;
-                            if self.settings_ack_received {
-                                self.state = H2ConnState::Active;
-                                let _ = self.events.push_back(H2Event::Connected);
-                            } else {
-                                // Transition to active even without our ACK being acked yet
-                                // (RFC allows this — we just need to have received peer settings)
-                                self.state = H2ConnState::Active;
-                                let _ = self.events.push_back(H2Event::Connected);
-                            }
+                            self.state = H2ConnState::Active;
+                            let _ = self.events.push_back(H2Event::Connected);
                         }
                         _ => {}
                     }
-                    // Update stream initial window sizes
+                    // Update stream send windows by the delta (RFC 9113 §6.9.2)
                     let new_initial = self.peer_settings.initial_window_size as i32;
-                    for stream in self.streams.iter_mut() {
-                        let delta = new_initial - stream.send_window;
-                        stream.send_window += delta;
+                    let delta = new_initial - old_initial;
+                    if delta != 0 {
+                        for stream in self.streams.iter_mut() {
+                            stream.send_window += delta;
+                        }
                     }
                 }
             }
             H2Frame::Headers { stream_id, fragment, end_stream, end_headers, .. } => {
+                // RFC 9113 §6.2: HEADERS must not be on stream 0
+                if stream_id == 0 {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
                 self.last_peer_stream_id = self.last_peer_stream_id.max(stream_id);
                 self.ensure_stream(stream_id);
                 if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
                     if stream.state == H2StreamState::Idle {
                         stream.open();
                     }
+                    // Always store the fragment (may be followed by CONTINUATION)
+                    stream.headers_data.clear();
+                    let _ = stream.headers_data.extend_from_slice(fragment);
                     if end_headers {
-                        stream.headers_data.clear();
-                        let _ = stream.headers_data.extend_from_slice(fragment);
                         stream.headers_received = true;
                     }
                     if end_stream {
                         stream.recv_end_stream();
                     }
                 }
-                if end_headers {
+                if !end_headers {
+                    self.continuation_stream_id = Some(stream_id);
+                } else {
                     let _ = self.events.push_back(H2Event::Headers(stream_id));
                 }
                 if end_stream {
@@ -605,6 +669,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
                 }
             }
             H2Frame::Data { stream_id, payload, end_stream } => {
+                // RFC 9113 §6.1: DATA must not be on stream 0
+                if stream_id == 0 {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
                 // Update connection recv flow control
                 self.conn_recv_fc.consume(payload.len() as u32)?;
 
@@ -622,10 +690,19 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
                 }
             }
             H2Frame::WindowUpdate { stream_id, increment } => {
+                // RFC 9113 §6.9: increment of 0 MUST be treated as error
+                if increment == 0 {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
                 if stream_id == 0 {
                     self.conn_send_fc.replenish(increment)?;
                 } else if let Some(stream) = self.get_stream_mut(stream_id) {
-                    stream.send_window += increment as i32;
+                    // Check overflow: window must not exceed 2^31-1
+                    let new_window = stream.send_window as i64 + increment as i64;
+                    if new_window > 0x7fff_ffff {
+                        return Err(Error::Http2(crate::error::H2Error::FlowControlError));
+                    }
+                    stream.send_window = new_window as i32;
                 }
             }
             H2Frame::Ping { data, ack } => {
@@ -647,10 +724,15 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
                 // Priority frames are advisory; we ignore them.
             }
             H2Frame::Continuation { stream_id, fragment, end_headers } => {
+                // RFC 9113 §6.10: CONTINUATION must not be on stream 0
+                if stream_id == 0 {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                }
                 if let Some(stream) = self.get_stream_mut(stream_id) {
                     let _ = stream.headers_data.extend_from_slice(fragment);
                     if end_headers {
                         stream.headers_received = true;
+                        self.continuation_stream_id = None;
                         let _ = self.events.push_back(H2Event::Headers(stream_id));
                     }
                 }
@@ -677,11 +759,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize> H2Connection<MAX_STREAMS, BUF> 
         }
     }
 
-    fn get_stream(&self, stream_id: u32) -> Option<&H2Stream> {
+    fn get_stream(&self, stream_id: u32) -> Option<&H2Stream<HDRBUF, DATABUF>> {
         self.streams.iter().find(|s| s.id == stream_id)
     }
 
-    fn get_stream_mut(&mut self, stream_id: u32) -> Option<&mut H2Stream> {
+    fn get_stream_mut(&mut self, stream_id: u32) -> Option<&mut H2Stream<HDRBUF, DATABUF>> {
         self.streams.iter_mut().find(|s| s.id == stream_id)
     }
 
@@ -900,9 +982,9 @@ mod tests {
 
     // Test helpers
 
-    fn run_handshake<const M: usize, const B: usize>(
-        client: &mut H2Connection<M, B>,
-        server: &mut H2Connection<M, B>,
+    fn run_handshake<const M: usize, const B: usize, const H: usize, const D: usize>(
+        client: &mut H2Connection<M, B, H, D>,
+        server: &mut H2Connection<M, B, H, D>,
     ) {
         for _ in 0..5 {
             exchange(client, server);
@@ -910,9 +992,9 @@ mod tests {
         }
     }
 
-    fn exchange<const M: usize, const B: usize>(
-        sender: &mut H2Connection<M, B>,
-        receiver: &mut H2Connection<M, B>,
+    fn exchange<const M: usize, const B: usize, const H: usize, const D: usize>(
+        sender: &mut H2Connection<M, B, H, D>,
+        receiver: &mut H2Connection<M, B, H, D>,
     ) {
         let mut buf = [0u8; 8192];
         while let Some(data) = sender.poll_output(&mut buf) {

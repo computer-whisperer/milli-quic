@@ -13,21 +13,25 @@ pub enum H2StreamState {
 }
 
 /// An HTTP/2 stream.
+///
+/// Generic parameters:
+/// - `HDRBUF`: max bytes for HPACK-encoded header block
+/// - `DATABUF`: max bytes for buffered body data
 #[derive(Debug)]
-pub struct H2Stream {
+pub struct H2Stream<const HDRBUF: usize = 2048, const DATABUF: usize = 4096> {
     pub id: u32,
     pub state: H2StreamState,
     pub send_window: i32,
     pub recv_window: i32,
-    pub headers_data: heapless::Vec<u8, 4096>,
+    pub headers_data: heapless::Vec<u8, HDRBUF>,
     pub headers_received: bool,
-    pub data_buf: heapless::Vec<u8, 8192>,
+    pub data_buf: heapless::Vec<u8, DATABUF>,
     pub data_available: bool,
     pub fin_received: bool,
     pub fin_sent: bool,
 }
 
-impl H2Stream {
+impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
     pub fn new(id: u32, initial_send_window: i32, initial_recv_window: i32) -> Self {
         Self {
             id,
@@ -92,7 +96,7 @@ mod tests {
 
     #[test]
     fn stream_lifecycle_normal() {
-        let mut s = H2Stream::new(1, 65535, 65535);
+        let mut s = H2Stream::<2048, 4096>::new(1, 65535, 65535);
         assert_eq!(s.state, H2StreamState::Idle);
 
         s.open();
@@ -113,7 +117,7 @@ mod tests {
 
     #[test]
     fn stream_recv_first() {
-        let mut s = H2Stream::new(2, 65535, 65535);
+        let mut s = H2Stream::<2048, 4096>::new(2, 65535, 65535);
         s.open();
         s.recv_end_stream();
         assert_eq!(s.state, H2StreamState::HalfClosedRemote);
@@ -123,7 +127,7 @@ mod tests {
 
     #[test]
     fn stream_reset() {
-        let mut s = H2Stream::new(1, 65535, 65535);
+        let mut s = H2Stream::<2048, 4096>::new(1, 65535, 65535);
         s.open();
         s.reset();
         assert_eq!(s.state, H2StreamState::Closed);
