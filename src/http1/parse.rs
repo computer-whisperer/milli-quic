@@ -168,6 +168,9 @@ fn parse_decimal_u16(buf: &[u8]) -> Option<u16> {
 
 /// Parse hex digits into usize.
 fn parse_hex(buf: &[u8]) -> Option<usize> {
+    if buf.is_empty() {
+        return None;
+    }
     let mut n: usize = 0;
     for &b in buf {
         let d = match b {
@@ -330,7 +333,7 @@ mod tests {
         assert_eq!(parse_hex(b"10"), Some(16));
         assert_eq!(parse_hex(b"ff"), Some(255));
         assert_eq!(parse_hex(b"100"), Some(256));
-        assert_eq!(parse_hex(b""), Some(0));
+        assert_eq!(parse_hex(b""), None);
         assert_eq!(parse_hex(b"xyz"), None);
     }
 

@@ -58,11 +58,13 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Send response headers.
     ///
     /// Encodes `HTTP/1.1 {status} {reason}\r\n` + headers + `\r\n`.
+    /// If `end_stream` is true, no body will follow.
     pub fn send_response(
         &mut self,
         stream_id: u32,
         status: u16,
         headers: &[(&[u8], &[u8])],
+        end_stream: bool,
     ) -> Result<(), Error> {
         let status_str = crate::http::StatusCode(status).to_bytes();
         let mut all_headers: heapless::Vec<(&[u8], &[u8]), 20> = heapless::Vec::new();
@@ -70,7 +72,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         for &(name, value) in headers {
             let _ = all_headers.push((name, value));
         }
-        self.inner.send_headers(stream_id, &all_headers, false)
+        self.inner.send_headers(stream_id, &all_headers, end_stream)
     }
 
     /// Send response body data.
@@ -124,7 +126,7 @@ mod tests {
         server.recv_headers(1, |_, _| {}).unwrap();
 
         server
-            .send_response(1, 200, &[(b"content-length", b"5")])
+            .send_response(1, 200, &[(b"content-length", b"5")], false)
             .unwrap();
         server.send_body(1, b"hello", true).unwrap();
 

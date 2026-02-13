@@ -2,6 +2,19 @@
 //!
 //! Pure codec following the milli-http pattern:
 //! `feed_data()` → `poll_output()` → `poll_event()`
+//!
+//! # Buffer lifecycle
+//!
+//! The connection will not begin parsing the next request/response until the
+//! application has consumed the current headers (via [`recv_headers`]) and body
+//! data (via [`recv_body`]). This prevents data from one message leaking into
+//! the next on keep-alive connections.
+//!
+//! # Stack usage
+//!
+//! [`try_parse_start_line`] allocates a temporary `heapless::Vec<u8, BUF>` on
+//! the stack to work around borrow-checker limitations. With the default
+//! `BUF = 8192` this adds 8 KiB to the call stack.
 
 use crate::error::Error;
 use super::parse;
@@ -9,7 +22,7 @@ use super::parse;
 /// Events produced by the HTTP/1.1 connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http1Event {
-    /// A complete request has been received (server) or response headers are ready (client).
+    /// A complete request has been received (server-side).
     /// The `u32` is a pseudo-stream-id for API consistency with H2/H3.
     Request { stream_id: u32 },
     /// Response headers received (client-side).
@@ -38,7 +51,8 @@ enum ParseState {
     BodyChunked,
     /// Reading body until connection close (response only).
     BodyUntilClose,
-    /// Current message is done; ready for next (keep-alive).
+    /// Current message is done; waiting for app to drain buffers before
+    /// accepting the next message (keep-alive).
     Done,
 }
 
@@ -76,7 +90,7 @@ pub struct Http1Connection<
     headers_available: bool,
     /// Buffered body data for the application to read.
     data_buf: heapless::Vec<u8, DATABUF>,
-    events: heapless::Deque<Http1Event, 8>,
+    events: heapless::Deque<Http1Event, 32>,
     /// Pseudo-stream-id (increments per request).
     current_stream_id: u32,
     /// Chunked decoding sub-state.
@@ -160,10 +174,11 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// will be used to construct the request/status line.
     pub fn send_headers(
         &mut self,
-        _stream_id: u32,
+        stream_id: u32,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
+        self.check_stream_id(stream_id)?;
         match self.role {
             Role::Client => self.encode_request(headers, end_stream),
             Role::Server => self.encode_response(headers, end_stream),
@@ -173,10 +188,11 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Send body data.
     pub fn send_data(
         &mut self,
-        _stream_id: u32,
+        stream_id: u32,
         data: &[u8],
         _end_stream: bool,
     ) -> Result<usize, Error> {
+        self.check_stream_id(stream_id)?;
         self.queue_send(data)?;
         Ok(data.len())
     }
@@ -186,9 +202,10 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Iterates stored headers as `name\0value\0` pairs, calling `emit(name, value)`.
     pub fn recv_headers<F: FnMut(&[u8], &[u8])>(
         &mut self,
-        _stream_id: u32,
+        stream_id: u32,
         mut emit: F,
     ) -> Result<(), Error> {
+        self.check_stream_id(stream_id)?;
         if !self.headers_available {
             return Err(Error::WouldBlock);
         }
@@ -228,9 +245,10 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Read received body data.
     pub fn recv_body(
         &mut self,
-        _stream_id: u32,
+        stream_id: u32,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
+        self.check_stream_id(stream_id)?;
         if self.data_buf.is_empty() {
             if self.body_finished {
                 return Ok((0, true));
@@ -265,13 +283,25 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     // ------------------------------------------------------------------
+    // Internal: validation
+    // ------------------------------------------------------------------
+
+    /// Validate that the stream_id matches the current active stream.
+    fn check_stream_id(&self, stream_id: u32) -> Result<(), Error> {
+        if stream_id != self.current_stream_id {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Internal: encoding
     // ------------------------------------------------------------------
 
     fn encode_request(
         &mut self,
         headers: &[(&[u8], &[u8])],
-        end_stream: bool,
+        _end_stream: bool,
     ) -> Result<(), Error> {
         let mut method: &[u8] = b"GET";
         let mut path: &[u8] = b"/";
@@ -314,17 +344,13 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         // End of headers
         self.queue_send(b"\r\n")?;
 
-        if end_stream {
-            // No body follows
-        }
-
         Ok(())
     }
 
     fn encode_response(
         &mut self,
         headers: &[(&[u8], &[u8])],
-        end_stream: bool,
+        _end_stream: bool,
     ) -> Result<(), Error> {
         let mut status: &[u8] = b"200";
 
@@ -356,10 +382,6 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
 
         // End of headers
         self.queue_send(b"\r\n")?;
-
-        if end_stream {
-            // No body follows
-        }
 
         Ok(())
     }
@@ -401,8 +423,13 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
                     return Ok(());
                 }
                 ParseState::Done => {
-                    // Reset internal parse state for next request (keep-alive).
-                    // Don't clear header_buf/data_buf — the app may not have read them yet.
+                    // Only transition to Idle once the app has consumed headers
+                    // and body data. This prevents data from one message leaking
+                    // into the next on keep-alive connections.
+                    if self.headers_available || !self.data_buf.is_empty() {
+                        return Ok(());
+                    }
+                    self.body_finished = false;
                     self.chunk_state = ChunkState::Size;
                     self.state = ParseState::Idle;
                 }
@@ -420,7 +447,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         };
 
         // Copy the header block out so we can parse from a separate buffer
-        // while mutating self.header_buf.
+        // while mutating self.header_buf. This puts BUF bytes on the stack.
         let mut hdr_copy: heapless::Vec<u8, BUF> = heapless::Vec::new();
         if hdr_copy.extend_from_slice(&self.recv_buf[..end]).is_err() {
             return Err(Error::BufferTooSmall { needed: end });
@@ -458,6 +485,12 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
                 break; // End of headers
             }
 
+            // Reject null bytes in header names and values (RFC 9110 forbids them,
+            // and they would corrupt our \0-separated header_buf storage).
+            if name.contains(&0) || value.contains(&0) {
+                return Err(Error::InvalidState);
+            }
+
             // Check for transfer-encoding and content-length (case-insensitive)
             if eq_ignore_case(name, b"content-length") {
                 content_length = parse_usize_ascii(value);
@@ -472,6 +505,12 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
             }
 
             self.store_header(name, value)?;
+        }
+
+        // RFC 9112 §6.1: reject messages with both Content-Length and
+        // Transfer-Encoding to prevent request smuggling.
+        if chunked && content_length.is_some() {
+            return Err(Error::InvalidState);
         }
 
         // Consume parsed bytes from recv_buf
@@ -733,7 +772,7 @@ fn status_reason(status: &[u8]) -> &'static [u8] {
         b"500" => b"Internal Server Error",
         b"502" => b"Bad Gateway",
         b"503" => b"Service Unavailable",
-        _ => b"OK",
+        _ => b"",
     }
 }
 
@@ -837,10 +876,8 @@ mod tests {
     fn client_parses_response() {
         let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
         conn.current_stream_id = 1; // Simulate having sent a request
-        conn.feed_data(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
-        )
-        .unwrap();
+        conn.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .unwrap();
 
         let event = conn.poll_event().unwrap();
         assert_eq!(event, Http1Event::Headers(1));
@@ -889,7 +926,8 @@ mod tests {
         let mut out = [0u8; 4096];
         let data = conn.poll_output(&mut out).unwrap();
 
-        let expected = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello";
+        let expected =
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello";
         assert_eq!(data, expected);
     }
 
@@ -953,6 +991,247 @@ mod tests {
             .unwrap();
         let ev2 = conn.poll_event().unwrap();
         assert_eq!(ev2, Http1Event::Request { stream_id: 2 });
+    }
+
+    #[test]
+    fn keep_alive_post_then_get() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+
+        // First request: POST with body
+        conn.feed_data(
+            b"POST /a HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc",
+        )
+        .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+
+        // Drain events
+        while conn.poll_event().is_some() {}
+
+        // App reads headers and body
+        conn.recv_headers(1, |_, _| {}).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"abc");
+        assert!(fin);
+
+        // Second request: GET (no body)
+        conn.feed_data(b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+        let ev2 = conn.poll_event().unwrap();
+        assert_eq!(ev2, Http1Event::Request { stream_id: 2 });
+
+        // body_finished should be false for the new request context
+        // (recv_body should WouldBlock if called before Finished, but GET
+        // goes straight to Done so body_finished is true again)
+        let ev3 = conn.poll_event().unwrap();
+        assert_eq!(ev3, Http1Event::Finished(2));
+    }
+
+    #[test]
+    fn keep_alive_blocks_until_headers_consumed() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+
+        // Feed two requests at once (pipelining)
+        conn.feed_data(
+            b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n\
+              GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .unwrap();
+
+        // Should only see first request
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        let ev2 = conn.poll_event().unwrap();
+        assert_eq!(ev2, Http1Event::Finished(1));
+        // No more events yet — second request is blocked
+        assert!(conn.poll_event().is_none());
+
+        // Consume first request's headers
+        conn.recv_headers(1, |_, _| {}).unwrap();
+
+        // Now feed_data (or process) can parse the second request
+        conn.feed_data(b"").unwrap(); // Trigger processing
+        let ev3 = conn.poll_event().unwrap();
+        assert_eq!(ev3, Http1Event::Request { stream_id: 2 });
+    }
+
+    #[test]
+    fn stream_id_validation() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+
+        // Drain events
+        while conn.poll_event().is_some() {}
+
+        // Wrong stream_id should fail
+        assert_eq!(conn.recv_headers(99, |_, _| {}), Err(Error::InvalidState));
+        // Correct stream_id should work
+        assert!(conn.recv_headers(1, |_, _| {}).is_ok());
+    }
+
+    #[test]
+    fn reject_content_length_and_transfer_encoding() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let result = conn.feed_data(
+            b"POST /data HTTP/1.1\r\nHost: example.com\r\n\
+              Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert_eq!(result, Err(Error::InvalidState));
+    }
+
+    #[test]
+    fn reject_null_byte_in_header_value() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let data = b"GET / HTTP/1.1\r\nHost: exam\x00ple.com\r\n\r\n".to_vec();
+        // The null byte is in the header value
+        let result = conn.feed_data(&data);
+        assert_eq!(result, Err(Error::InvalidState));
+    }
+
+    #[test]
+    fn content_length_zero() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        conn.feed_data(
+            b"POST /data HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        let ev2 = conn.poll_event().unwrap();
+        assert_eq!(ev2, Http1Event::Finished(1));
+        // No Data event
+        assert!(conn.poll_event().is_none());
+    }
+
+    #[test]
+    fn feed_data_buffer_overflow() {
+        let mut conn = Http1Connection::<64, 64, 64>::new_server();
+        let big = [b'X'; 100];
+        let result = conn.feed_data(&big);
+        assert_eq!(
+            result,
+            Err(Error::BufferTooSmall { needed: 100 })
+        );
+    }
+
+    #[test]
+    fn header_buf_overflow() {
+        let mut conn = Http1Connection::<4096, 32, 1024>::new_server();
+        // HDRBUF=32 is too small for the pseudo-headers + Host header
+        let result = conn.feed_data(
+            b"GET /very-long-path-that-will-overflow HTTP/1.1\r\n\
+              Host: example.com\r\n\r\n",
+        );
+        assert_eq!(result, Err(Error::BufferTooSmall { needed: 41 }));
+    }
+
+    #[test]
+    fn data_buf_backpressure() {
+        let mut conn = Http1Connection::<4096, 1024, 8>::new_server();
+        // DATABUF=8, body is 12 bytes
+        conn.feed_data(
+            b"POST /data HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\nhello world!",
+        )
+        .unwrap();
+
+        // Should get request + data event (first 8 bytes fill data_buf)
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+        let ev2 = conn.poll_event().unwrap();
+        assert_eq!(ev2, Http1Event::Data(1));
+        // No finished yet — 4 bytes remain but data_buf is full
+        assert!(conn.poll_event().is_none());
+
+        // Drain the data_buf
+        let mut buf = [0u8; 16];
+        let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
+        assert_eq!(n, 8);
+        assert!(!fin);
+
+        // Now feed empty to trigger processing of remaining bytes
+        conn.feed_data(b"").unwrap();
+        let ev3 = conn.poll_event().unwrap();
+        assert_eq!(ev3, Http1Event::Data(1));
+        let ev4 = conn.poll_event().unwrap();
+        assert_eq!(ev4, Http1Event::Finished(1));
+
+        let (n2, fin2) = conn.recv_body(1, &mut buf).unwrap();
+        assert_eq!(n2, 4);
+        assert!(fin2);
+    }
+
+    #[test]
+    fn client_body_until_close() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        conn.current_stream_id = 1;
+
+        // Response with no Content-Length and no Transfer-Encoding
+        conn.feed_data(b"HTTP/1.1 200 OK\r\n\r\nhello").unwrap();
+
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Headers(1));
+        let ev2 = conn.poll_event().unwrap();
+        assert_eq!(ev2, Http1Event::Data(1));
+
+        // More data arrives
+        conn.feed_data(b" world").unwrap();
+        let ev3 = conn.poll_event().unwrap();
+        assert_eq!(ev3, Http1Event::Data(1));
+
+        // Read all body data so far
+        let mut buf = [0u8; 64];
+        let (n, _fin) = conn.recv_body(1, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello world");
+    }
+
+    #[test]
+    fn incremental_chunked_body() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+
+        // Feed headers
+        conn.feed_data(
+            b"POST /data HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap();
+        let ev = conn.poll_event().unwrap();
+        assert_eq!(ev, Http1Event::Request { stream_id: 1 });
+
+        // Feed chunk size + partial data
+        conn.feed_data(b"5\r\nhel").unwrap();
+        let ev2 = conn.poll_event().unwrap();
+        assert_eq!(ev2, Http1Event::Data(1));
+
+        // Feed rest of chunk + trailer CRLF + terminator
+        conn.feed_data(b"lo\r\n0\r\n\r\n").unwrap();
+
+        let mut events = heapless::Vec::<Http1Event, 8>::new();
+        while let Some(ev) = conn.poll_event() {
+            let _ = events.push(ev);
+        }
+        assert!(events.contains(&Http1Event::Finished(1)));
+
+        let mut buf = [0u8; 64];
+        let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert!(fin);
+    }
+
+    #[test]
+    fn malformed_request_no_spaces() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let result = conn.feed_data(b"GET\r\n\r\n");
+        assert_eq!(result, Err(Error::InvalidState));
+    }
+
+    #[test]
+    fn malformed_header_no_colon() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let result = conn.feed_data(b"GET / HTTP/1.1\r\nBadHeader\r\n\r\n");
+        assert_eq!(result, Err(Error::InvalidState));
     }
 
     #[test]
@@ -1090,6 +1369,6 @@ mod tests {
         assert_eq!(status_reason(b"200"), b"OK");
         assert_eq!(status_reason(b"404"), b"Not Found");
         assert_eq!(status_reason(b"500"), b"Internal Server Error");
-        assert_eq!(status_reason(b"999"), b"OK"); // Unknown → default
+        assert_eq!(status_reason(b"999"), b""); // Unknown → empty
     }
 }

@@ -177,6 +177,7 @@ mod tests {
                     (b"content-type", b"text/plain"),
                     (b"content-length", &cl_buf[..cl_len]),
                 ],
+                false,
             )
             .unwrap();
         server.send_body(request_sid, body, true).unwrap();

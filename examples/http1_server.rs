@@ -76,7 +76,7 @@ fn main() {
                         (b"content-type", b"text/html"),
                         (b"content-length", content_length.as_bytes()),
                         (b"server", b"milli-http/0.1"),
-                    ]).ok();
+                    ], false).ok();
                     http1.send_body(stream_id, body, true).ok();
                 }
                 _ => {}
