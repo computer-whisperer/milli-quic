@@ -180,8 +180,11 @@ where
             return None;
         }
 
-        // Pad Initial packets from client to 1200 bytes minimum
-        let is_client = self.role == crate::tls::handshake::Role::Client;
+        // RFC 9000 §14.1: Both client and server MUST pad datagrams carrying
+        // ack-eliciting Initial packets to at least 1200 bytes.
+        // For server: only pad when there's CRYPTO data (ack-eliciting).
+        let has_crypto = crypto_written > 0;
+        let pad_to_min = self.role == crate::tls::handshake::Role::Client || has_crypto;
 
         // Get initial send keys (concrete AES type) and build the packet.
         // Take keys out temporarily to avoid borrow conflict with &mut self.
@@ -191,7 +194,7 @@ where
             let r = if let Some(ref k) = send {
                 self.build_and_encrypt_initial_packet(
                     &frame_buf[..frame_len],
-                    is_client,
+                    pad_to_min,
                     buf,
                     now,
                     k,
@@ -411,6 +414,8 @@ where
             ctx.pending_crypto[idx].clear();
 
             let offset = ctx.crypto_send_offset[idx];
+            #[cfg(feature = "std")]
+            eprintln!("[debug] sending pending CRYPTO {:?} offset={} len={}", target_level, offset, pending_data.len());
             let crypto = Frame::Crypto(CryptoFrame {
                 offset,
                 data: &pending_data,
@@ -427,6 +432,8 @@ where
         let idx = level_index(target_level);
         let ctx = pool.get_mut(slot);
         let offset = ctx.crypto_send_offset[idx];
+        #[cfg(feature = "std")]
+        eprintln!("[debug] sending CRYPTO {:?} offset={} len={}", target_level, offset, tls_len);
         let crypto = Frame::Crypto(CryptoFrame {
             offset,
             data: &tls_buf[..tls_len],

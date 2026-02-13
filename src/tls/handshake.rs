@@ -86,11 +86,16 @@ pub struct TlsConfig {
 
 /// Configuration for creating a server-side TLS engine.
 pub struct ServerTlsConfig {
-    /// DER-encoded server certificate containing an Ed25519 public key.
+    /// DER-encoded server certificate.
+    ///
+    /// The certificate may contain either an Ed25519 public key (OID 1.3.101.112)
+    /// or a P-256/secp256r1 public key (OID 1.2.840.10045.3.1.7). The key type
+    /// is auto-detected from the certificate.
     pub cert_der: &'static [u8],
-    /// Ed25519 private key seed (32 bytes) for CertificateVerify signing.
-    /// This is the raw 32-byte Ed25519 seed that corresponds to the
-    /// public key in `cert_der`.
+    /// Private key bytes (32 bytes) for CertificateVerify signing.
+    ///
+    /// For Ed25519: the 32-byte seed.
+    /// For ECDSA-P256: the 32-byte private scalar.
     pub private_key_der: &'static [u8],
     /// ALPN protocols the server supports.
     pub alpn_protocols: &'static [&'static [u8]],
@@ -435,7 +440,9 @@ where
 
     /// Process a CertificateVerify message (client side).
     ///
-    /// Verifies the Ed25519 signature over the transcript hash per RFC 8446 section 4.4.3.
+    /// Verifies the signature over the transcript hash per RFC 8446 section 4.4.3.
+    /// Supports both Ed25519 (0x0807) and ECDSA-P256 (0x0403) signatures.
+    ///
     /// The transcript hash used is the hash of all messages up to and including the
     /// Certificate message (which was added to the transcript before this method is called,
     /// but the CertificateVerify itself has NOT yet been added).
@@ -445,11 +452,6 @@ where
         transcript_before_cv: &[u8; 32],
     ) -> Result<(), Error> {
         let cv = parse_certificate_verify(msg_body)?;
-
-        // Verify the algorithm is Ed25519
-        if cv.algorithm != crate::crypto::ed25519::ED25519_ALGORITHM {
-            return Err(Error::Tls);
-        }
 
         // Check pinned certificates if configured
         if !self.pinned_certs.is_empty() {
@@ -465,17 +467,39 @@ where
             }
         }
 
-        // Extract the Ed25519 public key from the server's certificate
-        let pubkey = crate::crypto::ed25519::extract_ed25519_pubkey_from_cert(
-            self.server_cert_data.as_slice(),
-        )?;
+        // Dispatch based on the signature algorithm
+        match cv.algorithm {
+            crate::crypto::ed25519::ED25519_ALGORITHM => {
+                // Extract the Ed25519 public key from the server's certificate
+                let pubkey = crate::crypto::ed25519::extract_ed25519_pubkey_from_cert(
+                    self.server_cert_data.as_slice(),
+                )?;
 
-        // Verify the signature over the transcript hash
-        crate::crypto::ed25519::verify_certificate_verify(
-            &pubkey,
-            cv.signature,
-            transcript_before_cv,
-        )?;
+                // Verify the Ed25519 signature
+                crate::crypto::ed25519::verify_certificate_verify(
+                    &pubkey,
+                    cv.signature,
+                    transcript_before_cv,
+                )?;
+            }
+            crate::crypto::ecdsa_p256::ECDSA_SECP256R1_SHA256 => {
+                // Extract the P-256 public key from the server's certificate
+                let pubkey = crate::crypto::ecdsa_p256::extract_p256_pubkey_from_cert(
+                    self.server_cert_data.as_slice(),
+                )?;
+
+                // Verify the ECDSA-P256 signature
+                crate::crypto::ecdsa_p256::verify_certificate_verify(
+                    &pubkey,
+                    cv.signature,
+                    transcript_before_cv,
+                )?;
+            }
+            _ => {
+                // Unsupported signature algorithm
+                return Err(Error::Tls);
+            }
+        }
 
         self.state = HandshakeState::WaitFinished;
         Ok(())
@@ -710,23 +734,39 @@ where
         hs_buf[hs_off..hs_off + cert_len].copy_from_slice(&cert_msg_buf[..cert_len]);
         hs_off += cert_len;
 
-        // CertificateVerify — Ed25519 signature (RFC 8446 section 4.4.3)
+        // CertificateVerify — sign with the key type matching the certificate.
+        // Auto-detect: if the cert contains a P-256 key, use ECDSA-P256;
+        // otherwise fall back to Ed25519.
         // The signed content is: 64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + transcript_hash
         let cv_transcript_hash = self.transcript.current_hash();
-        let signing_key_bytes: [u8; 32] = self
-            .server_private_key_der
-            .try_into()
-            .map_err(|_| Error::Tls)?;
-        let signature = crate::crypto::ed25519::sign_certificate_verify(
-            &signing_key_bytes,
-            &cv_transcript_hash,
-        )?;
         let mut cv_msg_buf = [0u8; 256];
-        let cv_len = encode_certificate_verify(
-            crate::crypto::ed25519::ED25519_ALGORITHM,
-            &signature,
-            &mut cv_msg_buf,
-        )?;
+        let cv_len = if crate::crypto::ecdsa_p256::cert_has_p256_key(self.server_cert_der) {
+            // ECDSA-P256 signing
+            let signature = crate::crypto::ecdsa_p256::sign_certificate_verify(
+                self.server_private_key_der,
+                &cv_transcript_hash,
+            )?;
+            encode_certificate_verify(
+                crate::crypto::ecdsa_p256::ECDSA_SECP256R1_SHA256,
+                &signature,
+                &mut cv_msg_buf,
+            )?
+        } else {
+            // Ed25519 signing (original path)
+            let signing_key_bytes: [u8; 32] = self
+                .server_private_key_der
+                .try_into()
+                .map_err(|_| Error::Tls)?;
+            let signature = crate::crypto::ed25519::sign_certificate_verify(
+                &signing_key_bytes,
+                &cv_transcript_hash,
+            )?;
+            encode_certificate_verify(
+                crate::crypto::ed25519::ED25519_ALGORITHM,
+                &signature,
+                &mut cv_msg_buf,
+            )?
+        };
         self.transcript.update(&cv_msg_buf[..cv_len]);
         if hs_off + cv_len > hs_buf.len() {
             return Err(Error::BufferTooSmall {
@@ -765,6 +805,23 @@ where
         self.pending_level = Level::Initial;
 
         // Buffer the Handshake-level flight
+        #[cfg(feature = "std")]
+        {
+            // Debug: dump TLS message types in the handshake flight
+            let mut doff = 0;
+            while doff + 4 <= hs_off {
+                let msg_type = hs_buf[doff];
+                let msg_len = (hs_buf[doff + 1] as usize) << 16
+                    | (hs_buf[doff + 2] as usize) << 8
+                    | hs_buf[doff + 3] as usize;
+                std::eprintln!(
+                    "[debug] HS flight msg: type={} len={} (offset {})",
+                    msg_type, msg_len, doff
+                );
+                doff += 4 + msg_len;
+            }
+            std::eprintln!("[debug] HS flight total: {} bytes", hs_off);
+        }
         self.pending_write_hs.clear();
         self.pending_write_hs
             .extend_from_slice(&hs_buf[..hs_off])
@@ -1729,6 +1786,142 @@ mod tests {
             &client_hs_keys.recv_secret[..client_hs_keys.secret_len],
             &server_hs_keys.send_secret[..server_hs_keys.secret_len],
             "client HS recv secret should match server HS send secret"
+        );
+    }
+
+    // =========================================================================
+    // P-256 / ECDSA tests
+    // =========================================================================
+
+    /// P-256 private key scalar used by ECDSA TLS tests.
+    const TEST_P256_SCALAR: [u8; 32] = [0x02u8; 32];
+
+    /// Build a real P-256 ECDSA certificate DER from the test scalar.
+    fn get_test_p256_cert_der() -> &'static [u8] {
+        use std::sync::LazyLock;
+        static V: LazyLock<std::vec::Vec<u8>> = LazyLock::new(|| {
+            let scalar: [u8; 32] = [0x02u8; 32];
+            let pk = crate::crypto::ecdsa_p256::p256_public_key_from_scalar(&scalar).unwrap();
+            let mut buf = [0u8; 512];
+            let len =
+                crate::crypto::ecdsa_p256::build_p256_cert_der(pk.as_slice(), &mut buf).unwrap();
+            buf[..len].to_vec()
+        });
+        &V
+    }
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn make_p256_server_config() -> ServerTlsConfig {
+        ServerTlsConfig {
+            cert_der: get_test_p256_cert_der(),
+            private_key_der: &TEST_P256_SCALAR,
+            alpn_protocols: &[b"h3"],
+            transport_params: TransportParams::default_params(),
+        }
+    }
+
+    /// Test: Full client-server handshake with ECDSA-P256 certificate.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn full_client_server_handshake_p256() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(make_p256_server_config(), [0xAA; 32], [0xBB; 32]);
+
+        // Step 1: Client writes ClientHello
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, ch_level) = client.write_handshake(&mut ch_buf).unwrap();
+        assert!(ch_len > 0);
+        assert_eq!(ch_level, Level::Initial);
+
+        // Step 2: Server reads ClientHello
+        server
+            .read_handshake(Level::Initial, &ch_buf[..ch_len])
+            .unwrap();
+
+        // Server should have handshake keys now
+        let server_hs_keys = server.derived_keys().unwrap();
+        assert_eq!(server_hs_keys.level, Level::Handshake);
+
+        // Step 3: Server writes ServerHello (Initial level)
+        let mut sh_buf = [0u8; 2048];
+        let (sh_len, sh_level) = server.write_handshake(&mut sh_buf).unwrap();
+        assert!(sh_len > 0);
+        assert_eq!(sh_level, Level::Initial);
+
+        // Step 4: Client reads ServerHello
+        client
+            .read_handshake(Level::Initial, &sh_buf[..sh_len])
+            .unwrap();
+
+        // Client should have handshake keys now
+        let client_hs_keys = client.derived_keys().unwrap();
+        assert_eq!(client_hs_keys.level, Level::Handshake);
+
+        // Step 5: Server writes EncryptedExtensions+Certificate+CertificateVerify+Finished
+        let mut hs_buf = [0u8; 2048];
+        let (hs_len, hs_level) = server.write_handshake(&mut hs_buf).unwrap();
+        assert!(hs_len > 0);
+        assert_eq!(hs_level, Level::Handshake);
+
+        // Verify CertificateVerify uses ECDSA-P256 (0x0403)
+        let mut off = 0;
+        while off < hs_len {
+            let (msg_type, body_len) = read_handshake_header(&hs_buf[off..]).unwrap();
+            if msg_type == HandshakeType::CertificateVerify as u8 {
+                let cv_body = &hs_buf[off + 4..off + 4 + body_len];
+                let algo = u16::from_be_bytes([cv_body[0], cv_body[1]]);
+                assert_eq!(
+                    algo,
+                    crate::crypto::ecdsa_p256::ECDSA_SECP256R1_SHA256,
+                    "CertificateVerify should use ECDSA-P256 algorithm"
+                );
+            }
+            off += 4 + body_len;
+        }
+
+        // Step 6: Client reads the handshake-level flight
+        client
+            .read_handshake(Level::Handshake, &hs_buf[..hs_len])
+            .unwrap();
+
+        // Client should have application keys now
+        let client_app_keys = client.derived_keys().unwrap();
+        assert_eq!(client_app_keys.level, Level::Application);
+
+        // Step 7: Client writes its Finished
+        let mut cfin_buf = [0u8; 256];
+        let (cfin_len, cfin_level) = client.write_handshake(&mut cfin_buf).unwrap();
+        assert!(cfin_len > 0);
+        assert_eq!(cfin_level, Level::Handshake);
+        assert!(client.is_complete());
+
+        // Step 8: Server reads client Finished
+        server
+            .read_handshake(Level::Handshake, &cfin_buf[..cfin_len])
+            .unwrap();
+
+        // Server should have application keys now
+        let server_app_keys = server.derived_keys().unwrap();
+        assert_eq!(server_app_keys.level, Level::Application);
+
+        // Both engines should be complete
+        assert!(client.is_complete());
+        assert!(server.is_complete());
+
+        // Verify that the application secrets match
+        assert_eq!(
+            &client_app_keys.send_secret[..client_app_keys.secret_len],
+            &server_app_keys.recv_secret[..server_app_keys.secret_len],
+            "client send secret should match server recv secret (P-256)"
+        );
+        assert_eq!(
+            &client_app_keys.recv_secret[..client_app_keys.secret_len],
+            &server_app_keys.send_secret[..server_app_keys.secret_len],
+            "client recv secret should match server send secret (P-256)"
         );
     }
 

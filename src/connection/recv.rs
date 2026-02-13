@@ -224,6 +224,8 @@ where
 
             match result {
                 Ok(pr) => {
+                    #[cfg(feature = "std")]
+                    eprintln!("[debug] processed {:?} pkt pn={} ack_eliciting={}", pr.level, pr.pn, pr.ack_eliciting);
                                         if pr.ack_eliciting {
                         let idx = level_index(pr.level);
                         self.ack_eliciting_received[idx] = true;
@@ -240,9 +242,11 @@ where
                     // Track received PNs for ACK generation
                     self.track_received_pn(pr.level, pr.pn);
                 }
-                Err(_) => {
+                Err(e) => {
                     // Decryption failure or parse error: silently discard this packet
                     // per RFC 9000 Section 12.2
+                    #[cfg(feature = "std")]
+                    eprintln!("[debug] packet error: {:?} (first_byte=0x{:02x}, len={})", e, pkt_data[0], pkt_data.len());
                     continue;
                 }
             }
@@ -600,6 +604,8 @@ where
             }
 
             Frame::Crypto(crypto) => {
+                #[cfg(feature = "std")]
+                eprintln!("[debug] CRYPTO frame at {:?} offset={} len={}", level, crypto.offset, crypto.data.len());
                 self.handle_crypto_frame(level, crypto.offset, crypto.data, pool)?;
             }
 
@@ -803,6 +809,8 @@ where
 
         while let Some(derived) = pool.get_mut(slot).tls.derived_keys() {
             let level = derived.level;
+            #[cfg(feature = "std")]
+            eprintln!("[debug] installing keys for {:?}", level);
             self.keys.install_derived(&self.crypto, &derived)?;
 
             match level {

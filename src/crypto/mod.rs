@@ -6,6 +6,7 @@
 //! (software via RustCrypto, or hardware-accelerated).
 
 mod aead;
+pub mod ecdsa_p256;
 pub mod ed25519;
 mod header_protection;
 mod hkdf;

@@ -10,6 +10,7 @@ default = ["quic", "h3", "rustcrypto-chacha"]
 quic = []
 h3 = ["quic"]
 alloc = []
+std = []
 rustcrypto-chacha = ["quic", "dep:chacha20poly1305", "dep:chacha20", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
 rustcrypto-aes = ["quic", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
 discovery = []
@@ -18,6 +19,7 @@ discovery = []
 heapless = "0.8"
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 ed25519-dalek = { version = "2", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 sha2 = { version = "0.10", default-features = false }
 
 # RustCrypto - all no_std compatible
