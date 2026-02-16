@@ -222,6 +222,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 
     /// Feed received TCP data into the connection.
     pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        // Ensure our own SETTINGS is queued before processing any peer data
+        // (RFC 9113 §3.4: server SETTINGS must be the first frame sent)
+        self.generate_output();
+
         // Append to recv buffer
         if self.recv_buf.len() + data.len() > BUF {
             return Err(Error::BufferTooSmall { needed: self.recv_buf.len() + data.len() });
