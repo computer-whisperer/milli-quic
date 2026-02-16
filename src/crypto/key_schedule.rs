@@ -89,6 +89,21 @@ pub fn derive_packet_keys<H: Hkdf>(
     Ok(())
 }
 
+/// Derive TLS record protection keys from a traffic secret.
+///
+/// Uses labels `"key"` and `"iv"` (RFC 8446 §7.3) instead of `"quic key"` / `"quic iv"`.
+/// No header protection key is needed for TLS records.
+pub fn derive_tls_record_keys<H: Hkdf>(
+    hkdf: &H,
+    secret: &[u8],
+    key: &mut [u8],
+    iv: &mut [u8; 12],
+) -> Result<(), Error> {
+    hkdf_expand_label(hkdf, secret, b"key", &[], key)?;
+    hkdf_expand_label(hkdf, secret, b"iv", &[], iv)?;
+    Ok(())
+}
+
 /// Derive the next-generation application traffic secret for QUIC Key Update.
 ///
 /// Per RFC 9001 section 6.1, the updated secret is derived as:

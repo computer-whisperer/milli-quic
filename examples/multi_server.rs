@@ -263,6 +263,7 @@ fn main() {
                     H2Event::StreamReset(sid, code) => {
                         println!("[h2] stream {sid} reset ({code})");
                     }
+                    _ => {}
                 }
             }
         }

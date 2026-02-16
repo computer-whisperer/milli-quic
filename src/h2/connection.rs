@@ -27,6 +27,8 @@ pub enum H2Event {
     GoAway(u64, u32),
     /// Stream finished (END_STREAM received).
     Finished(u64),
+    /// A timeout fired (idle or header timeout).
+    Timeout,
 }
 
 /// Connection role.
@@ -162,6 +164,11 @@ pub struct H2Connection<
     preface_validated: bool,
     preface_bytes_seen: usize,
     goaway_sent: bool,
+    // Timeout support
+    timeout_config: crate::http::TimeoutConfig,
+    last_activity: u64,
+    connection_start: u64,
+    headers_phase_complete: bool,
 }
 
 impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -206,6 +213,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
             preface_validated: false,
             preface_bytes_seen: 0,
             goaway_sent: false,
+            timeout_config: crate::http::TimeoutConfig::default(),
+            last_activity: 0,
+            connection_start: 0,
+            headers_phase_complete: false,
         }
     }
 
@@ -608,6 +619,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                     self.settings_ack_received = true;
                     if self.peer_settings_received && self.state == H2ConnState::WaitingSettings {
                         self.state = H2ConnState::Active;
+                        self.headers_phase_complete = true;
                         let _ = self.events.push_back(H2Event::Connected);
                     }
                 } else {
@@ -624,6 +636,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                     match self.state {
                         H2ConnState::WaitingPreface | H2ConnState::WaitingSettings => {
                             self.state = H2ConnState::Active;
+                            self.headers_phase_complete = true;
                             let _ = self.events.push_back(H2Event::Connected);
                         }
                         _ => {}
@@ -769,6 +782,85 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 
     /// Whether the connection is in Active state.
     pub fn is_active(&self) -> bool {
+        self.state == H2ConnState::Active
+    }
+
+    // ------------------------------------------------------------------
+    // Timeout + connection state API
+    // ------------------------------------------------------------------
+
+    /// Configure timeouts. `now` is the current timestamp in microseconds.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.timeout_config = config;
+        self.last_activity = now;
+        self.connection_start = now;
+    }
+
+    /// Return the earliest deadline (in µs) at which `handle_timeout` should be called,
+    /// or `None` if no timeouts are configured.
+    pub fn next_timeout(&self) -> Option<u64> {
+        if self.state == H2ConnState::Closed {
+            return None;
+        }
+        let mut earliest: Option<u64> = None;
+
+        if !self.headers_phase_complete {
+            if let Some(hdr_us) = self.timeout_config.header_timeout_us {
+                let deadline = self.connection_start.saturating_add(hdr_us);
+                earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
+            }
+        }
+
+        if let Some(idle_us) = self.timeout_config.idle_timeout_us {
+            let deadline = self.last_activity.saturating_add(idle_us);
+            earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
+        }
+
+        earliest
+    }
+
+    /// Check timeouts. If a timeout fires, queues a GOAWAY frame, transitions
+    /// to Closed, and emits `H2Event::Timeout`.
+    pub fn handle_timeout(&mut self, now: u64) {
+        if self.state == H2ConnState::Closed {
+            return;
+        }
+
+        // Header timeout: fires if headers phase not complete
+        if !self.headers_phase_complete {
+            if let Some(hdr_us) = self.timeout_config.header_timeout_us {
+                if now >= self.connection_start.saturating_add(hdr_us) {
+                    let _ = self.send_goaway(0);
+                    self.state = H2ConnState::Closed;
+                    let _ = self.events.push_back(H2Event::Timeout);
+                    return;
+                }
+            }
+        }
+
+        // Idle timeout
+        if let Some(idle_us) = self.timeout_config.idle_timeout_us {
+            if now >= self.last_activity.saturating_add(idle_us) {
+                let _ = self.send_goaway(0);
+                self.state = H2ConnState::Closed;
+                let _ = self.events.push_back(H2Event::Timeout);
+            }
+        }
+    }
+
+    /// Feed data with timestamp tracking. Updates `last_activity` then calls `feed_data`.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        self.last_activity = now;
+        self.feed_data(data)
+    }
+
+    /// Whether the connection has been closed (GOAWAY sent/received, or timeout).
+    pub fn is_closed(&self) -> bool {
+        matches!(self.state, H2ConnState::Closed | H2ConnState::Closing)
+    }
+
+    /// Whether the SETTINGS exchange is complete and the connection is usable.
+    pub fn is_established(&self) -> bool {
         self.state == H2ConnState::Active
     }
 }
@@ -1005,5 +1097,119 @@ mod tests {
             };
             let _ = receiver.feed_data(&copy);
         }
+    }
+
+    // ====== Timeout + Connection State Tests ======
+
+    #[test]
+    fn idle_timeout_fires() {
+        let mut client = H2Connection::<16, 8192>::new_client();
+        let mut server = H2Connection::<16, 8192>::new_server();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000), // 1 second
+            header_timeout_us: None,
+        };
+        server.set_timeouts(config, 0);
+        run_handshake(&mut client, &mut server);
+
+        // No activity for 2 seconds
+        server.handle_timeout(2_000_000);
+
+        let mut got_timeout = false;
+        while let Some(ev) = server.poll_event() {
+            if ev == H2Event::Timeout {
+                got_timeout = true;
+            }
+        }
+        assert!(got_timeout);
+        assert!(server.is_closed());
+    }
+
+    #[test]
+    fn header_timeout_fires_during_preface() {
+        let mut server = H2Connection::<16, 8192>::new_server();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: None,
+            header_timeout_us: Some(500_000), // 0.5 seconds
+        };
+        server.set_timeouts(config, 0);
+
+        // No data sent, header timeout fires
+        server.handle_timeout(600_000);
+
+        let mut got_timeout = false;
+        while let Some(ev) = server.poll_event() {
+            if ev == H2Event::Timeout {
+                got_timeout = true;
+            }
+        }
+        assert!(got_timeout);
+        assert!(server.is_closed());
+    }
+
+    #[test]
+    fn activity_resets_idle_timer() {
+        let mut client = H2Connection::<16, 8192>::new_client();
+        let mut server = H2Connection::<16, 8192>::new_server();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        server.set_timeouts(config, 0);
+        run_handshake(&mut client, &mut server);
+
+        // Activity at t=800ms
+        server.feed_data_timed(b"", 800_000).unwrap();
+
+        // Check at t=1.5s — should NOT timeout (last activity was 800ms, idle is 1s)
+        server.handle_timeout(1_500_000);
+        assert!(!server.is_closed());
+
+        // Check at t=2s — SHOULD timeout (1.2s since last activity)
+        server.handle_timeout(2_000_000);
+        assert!(server.is_closed());
+    }
+
+    #[test]
+    fn is_closed_and_is_established() {
+        let mut client = H2Connection::<16, 8192>::new_client();
+        let mut server = H2Connection::<16, 8192>::new_server();
+
+        // Before handshake
+        assert!(!server.is_established());
+        assert!(!server.is_closed());
+
+        run_handshake(&mut client, &mut server);
+
+        // After handshake
+        assert!(server.is_established());
+        assert!(!server.is_closed());
+
+        // After GOAWAY
+        server.send_goaway(0).unwrap();
+        assert!(!server.is_established());
+        assert!(server.is_closed());
+    }
+
+    #[test]
+    fn next_timeout_returns_correct_deadline() {
+        let mut server = H2Connection::<16, 8192>::new_server();
+
+        // No config → no timeout
+        assert_eq!(server.next_timeout(), None);
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: Some(500_000),
+        };
+        server.set_timeouts(config, 100_000);
+
+        // header timeout is 100_000 + 500_000 = 600_000
+        // idle timeout is 100_000 + 1_000_000 = 1_100_000
+        // earliest is 600_000
+        assert_eq!(server.next_timeout(), Some(600_000));
     }
 }

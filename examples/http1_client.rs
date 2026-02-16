@@ -68,6 +68,7 @@ fn main() {
                     println!("[done] request complete");
                     return;
                 }
+                _ => {}
             }
         }
 

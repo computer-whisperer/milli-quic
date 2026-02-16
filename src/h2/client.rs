@@ -47,6 +47,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         extra_headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<u64, Error> {
+        // 4 pseudo-headers + up to 16 user headers = 20 max
+        if 4 + extra_headers.len() > 20 {
+            return Err(Error::TooManyHeaders);
+        }
         let mut headers: heapless::Vec<(&[u8], &[u8]), 20> = heapless::Vec::new();
         let _ = headers.push((b":method", method.as_bytes()));
         let _ = headers.push((b":path", path.as_bytes()));
@@ -85,6 +89,36 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     ) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
     }
+
+    /// Configure timeouts. `now` is the current timestamp in microseconds.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.inner.set_timeouts(config, now);
+    }
+
+    /// Return the earliest deadline (in µs) at which `handle_timeout` should be called.
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.inner.next_timeout()
+    }
+
+    /// Check timeouts and emit events if they fire.
+    pub fn handle_timeout(&mut self, now: u64) {
+        self.inner.handle_timeout(now);
+    }
+
+    /// Feed data with timestamp tracking.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        self.inner.feed_data_timed(data, now)
+    }
+
+    /// Whether the connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Whether the SETTINGS exchange is complete.
+    pub fn is_established(&self) -> bool {
+        self.inner.is_established()
+    }
 }
 
 impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -112,6 +146,35 @@ mod tests {
         let mut buf = [0u8; 4096];
         let output = client.poll_output(&mut buf).unwrap();
         assert!(output.starts_with(CONNECTION_PREFACE));
+    }
+
+    #[test]
+    fn client_max_headers_succeeds() {
+        let mut client = H2Client::<16, 16384>::new();
+        // 4 pseudo + 16 user = 20, at the limit
+        let hdrs: [(&[u8], &[u8]); 16] = [
+            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
+            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
+            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
+            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+        ];
+        let result = client.send_request("GET", "/", "example.com", &hdrs, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn client_too_many_headers() {
+        let mut client = H2Client::<16, 16384>::new();
+        // 4 pseudo + 17 user = 21, over the limit
+        let hdrs: [(&[u8], &[u8]); 17] = [
+            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
+            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
+            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
+            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+            (b"h17", b"v"),
+        ];
+        let result = client.send_request("GET", "/", "example.com", &hdrs, true);
+        assert_eq!(result, Err(crate::error::Error::TooManyHeaders));
     }
 
     #[test]

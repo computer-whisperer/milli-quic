@@ -51,12 +51,16 @@ where
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<u64, Error> {
+        // 4 pseudo-headers + up to 16 user headers = 20 max
+        if 4 + headers.len() > 20 {
+            return Err(Error::TooManyHeaders);
+        }
+
         // Open a new bidirectional request stream.
         let stream_id = self.inner.quic.open_stream()?;
 
         // Build the full header list: pseudo-headers first, then regular headers.
         // We need to combine them into a single slice for QPACK encoding.
-        // Max 16 extra headers + 4 pseudo-headers.
         let mut all_headers: heapless::Vec<(&[u8], &[u8]), 20> = heapless::Vec::new();
         let _ = all_headers.push((b":method", method.as_bytes()));
         let _ = all_headers.push((b":scheme", b"https"));

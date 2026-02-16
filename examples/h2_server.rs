@@ -123,6 +123,7 @@ fn main() {
                 H2Event::StreamReset(stream_id, code) => {
                     println!("[h2] stream {stream_id} reset (error={code})");
                 }
+                _ => {}
             }
         }
     }

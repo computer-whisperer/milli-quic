@@ -165,6 +165,8 @@ pub enum Error {
     InvalidState,
     /// All handshake pool slots are in use.
     HandshakePoolExhausted,
+    /// Too many headers for the fixed-size header list.
+    TooManyHeaders,
 }
 
 impl From<TransportError> for Error {
@@ -203,6 +205,7 @@ impl core::fmt::Display for Error {
             Error::WouldBlock => write!(f, "would block"),
             Error::InvalidState => write!(f, "invalid state"),
             Error::HandshakePoolExhausted => write!(f, "handshake pool exhausted"),
+            Error::TooManyHeaders => write!(f, "too many headers"),
         }
     }
 }

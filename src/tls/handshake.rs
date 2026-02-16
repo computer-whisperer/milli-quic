@@ -162,6 +162,12 @@ pub struct TlsEngine<C: CryptoProvider> {
     // Handshake complete flag
     complete: bool,
 
+    // Whether this is a QUIC connection (affects transport params + legacy session ID)
+    quic_mode: bool,
+
+    // Legacy session ID for TCP TLS (RFC 8446 middlebox compat)
+    legacy_session_id: [u8; 32],
+
     _crypto: core::marker::PhantomData<C>,
 }
 
@@ -207,6 +213,8 @@ where
             server_cert_der: &[],
             server_private_key_der: &[],
             complete: false,
+            quic_mode: true,
+            legacy_session_id: [0u8; 32],
             _crypto: core::marker::PhantomData,
         }
     }
@@ -249,8 +257,25 @@ where
             server_cert_der: config.cert_der,
             server_private_key_der: config.private_key_der,
             complete: false,
+            quic_mode: true,
+            legacy_session_id: [0u8; 32],
             _crypto: core::marker::PhantomData,
         }
+    }
+
+    /// Create a new TCP client-side TLS engine (no QUIC transport parameters).
+    pub fn new_tcp_client(config: TlsConfig, secret_bytes: [u8; 32], random: [u8; 32]) -> Self {
+        let mut engine = Self::new_client(config, secret_bytes, random);
+        engine.quic_mode = false;
+        engine.legacy_session_id = random; // Use random for middlebox compat
+        engine
+    }
+
+    /// Create a new TCP server-side TLS engine (no QUIC transport parameters).
+    pub fn new_tcp_server(config: ServerTlsConfig, secret_bytes: [u8; 32], random: [u8; 32]) -> Self {
+        let mut engine = Self::new_server(config, secret_bytes, random);
+        engine.quic_mode = false;
+        engine
     }
 
     /// Create a placeholder TLS engine for pool initialization.
@@ -292,6 +317,8 @@ where
             server_cert_der: &[],
             server_private_key_der: &[],
             complete: false,
+            quic_mode: true,
+            legacy_session_id: [0u8; 32],
             _crypto: core::marker::PhantomData,
         }
     }
@@ -317,11 +344,12 @@ where
     fn build_client_hello(&mut self, random: &[u8; 32]) -> Result<(), Error> {
         // Encode extensions
         let mut ext_buf = [0u8; 1024];
+        let tp = if self.quic_mode { Some(&self.transport_params) } else { None };
         let ext_len = encode_client_hello_extensions(
             self.server_name.as_str(),
             self.public_key.as_bytes(),
             self.alpn_protocols,
-            &self.transport_params,
+            tp,
             &mut ext_buf,
         )?;
 
@@ -330,8 +358,8 @@ where
             CipherSuite::TlsChacha20Poly1305Sha256,
         ];
 
-        // QUIC doesn't use the legacy session ID
-        let session_id: &[u8] = &[];
+        // QUIC doesn't use the legacy session ID; TCP needs one for middlebox compat
+        let session_id: &[u8] = if self.quic_mode { &[] } else { &self.legacy_session_id };
 
         let mut msg_buf = [0u8; 2048];
         let msg_len = encode_client_hello(
@@ -711,9 +739,10 @@ where
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         let mut ee_ext_buf = [0u8; 512];
+        let tp = if self.quic_mode { Some(&self.transport_params) } else { None };
         let ee_ext_len = encode_encrypted_extensions_data(
             alpn_bytes,
-            &self.transport_params,
+            tp,
             &mut ee_ext_buf,
         )?;
         let mut ee_msg_buf = [0u8; 1024];

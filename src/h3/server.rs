@@ -77,6 +77,11 @@ where
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
+        // 1 pseudo-header + up to 19 user headers = 20 max
+        if 1 + headers.len() > 20 {
+            return Err(Error::TooManyHeaders);
+        }
+
         // Format the status as a short string.
         let status_str = crate::http::StatusCode(status).to_bytes();
 

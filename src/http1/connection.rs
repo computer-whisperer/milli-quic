@@ -31,6 +31,8 @@ pub enum Http1Event {
     Data(u64),
     /// Request/response complete.
     Finished(u64),
+    /// A timeout fired (idle or header timeout).
+    Timeout,
 }
 
 /// Connection role.
@@ -101,6 +103,12 @@ pub struct Http1Connection<
     body_finished: bool,
     /// Whether the Connected event has been emitted.
     connected_emitted: bool,
+    // Timeout support
+    timeout_config: crate::http::TimeoutConfig,
+    last_activity: u64,
+    connection_start: u64,
+    headers_phase_complete: bool,
+    closed: bool,
 }
 
 impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -132,6 +140,11 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
             keep_alive: true,
             body_finished: false,
             connected_emitted: false,
+            timeout_config: crate::http::TimeoutConfig::default(),
+            last_activity: 0,
+            connection_start: 0,
+            headers_phase_complete: false,
+            closed: false,
         }
     }
 
@@ -290,6 +303,83 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     // ------------------------------------------------------------------
+    // Timeout + connection state API
+    // ------------------------------------------------------------------
+
+    /// Configure timeouts. `now` is the current timestamp in microseconds.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.timeout_config = config;
+        self.last_activity = now;
+        self.connection_start = now;
+    }
+
+    /// Return the earliest deadline (in µs) at which `handle_timeout` should be called,
+    /// or `None` if no timeouts are configured.
+    pub fn next_timeout(&self) -> Option<u64> {
+        if self.closed {
+            return None;
+        }
+        let mut earliest: Option<u64> = None;
+
+        if !self.headers_phase_complete {
+            if let Some(hdr_us) = self.timeout_config.header_timeout_us {
+                let deadline = self.connection_start.saturating_add(hdr_us);
+                earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
+            }
+        }
+
+        if let Some(idle_us) = self.timeout_config.idle_timeout_us {
+            let deadline = self.last_activity.saturating_add(idle_us);
+            earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
+        }
+
+        earliest
+    }
+
+    /// Check timeouts. If a timeout fires, sets `closed = true` and emits
+    /// `Http1Event::Timeout`.
+    pub fn handle_timeout(&mut self, now: u64) {
+        if self.closed {
+            return;
+        }
+
+        // Header timeout: fires if headers phase not complete
+        if !self.headers_phase_complete {
+            if let Some(hdr_us) = self.timeout_config.header_timeout_us {
+                if now >= self.connection_start.saturating_add(hdr_us) {
+                    self.closed = true;
+                    let _ = self.events.push_back(Http1Event::Timeout);
+                    return;
+                }
+            }
+        }
+
+        // Idle timeout
+        if let Some(idle_us) = self.timeout_config.idle_timeout_us {
+            if now >= self.last_activity.saturating_add(idle_us) {
+                self.closed = true;
+                let _ = self.events.push_back(Http1Event::Timeout);
+            }
+        }
+    }
+
+    /// Feed data with timestamp tracking. Updates `last_activity` then calls `feed_data`.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        self.last_activity = now;
+        self.feed_data(data)
+    }
+
+    /// Whether the connection has been closed (by timeout or other means).
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Whether the connection is usable (not closed).
+    pub fn is_established(&self) -> bool {
+        !self.closed
+    }
+
+    // ------------------------------------------------------------------
     // Internal: validation
     // ------------------------------------------------------------------
 
@@ -438,6 +528,9 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
                     }
                     self.body_finished = false;
                     self.chunk_state = ChunkState::Size;
+                    // Reset header phase for the next keep-alive request
+                    self.headers_phase_complete = false;
+                    self.connection_start = self.last_activity;
                     self.state = ParseState::Idle;
                 }
             }
@@ -547,6 +640,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         }
 
         // Emit events
+        self.headers_phase_complete = true;
         if self.role == Role::Server {
             self.current_stream_id += 1;
             let sid = self.current_stream_id;
@@ -1660,5 +1754,116 @@ mod tests {
             data,
             b"HTTP/1.1 200 OK\r\nServer: milli-http\r\nContent-Length: 2\r\n\r\nOK"
         );
+    }
+
+    // ====== Timeout + Connection State Tests ======
+
+    #[test]
+    fn idle_timeout_between_keepalive() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        conn.set_timeouts(config, 0);
+
+        // First request arrives
+        conn.feed_data_timed(
+            b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            100_000,
+        ).unwrap();
+
+        // Drain events + headers
+        while conn.poll_event().is_some() {}
+        conn.recv_headers(1, |_, _| {}).unwrap();
+
+        // Trigger Idle→Idle transition so connection_start resets
+        conn.feed_data_timed(b"", 200_000).unwrap();
+
+        // 2 seconds of inactivity
+        conn.handle_timeout(2_200_000);
+        assert!(conn.is_closed());
+
+        let mut got_timeout = false;
+        while let Some(ev) = conn.poll_event() {
+            if ev == Http1Event::Timeout {
+                got_timeout = true;
+            }
+        }
+        assert!(got_timeout);
+    }
+
+    #[test]
+    fn header_timeout_on_slow_headers() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: None,
+            header_timeout_us: Some(500_000),
+        };
+        conn.set_timeouts(config, 0);
+
+        // Partial request
+        conn.feed_data_timed(b"GET / HTTP/1.1\r\n", 100_000).unwrap();
+
+        // No complete headers after 600ms
+        conn.handle_timeout(600_000);
+        assert!(conn.is_closed());
+
+        let mut got_timeout = false;
+        while let Some(ev) = conn.poll_event() {
+            if ev == Http1Event::Timeout {
+                got_timeout = true;
+            }
+        }
+        assert!(got_timeout);
+    }
+
+    #[test]
+    fn header_timeout_resets_on_keepalive() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: None,
+            header_timeout_us: Some(500_000),
+        };
+        conn.set_timeouts(config, 0);
+
+        // First request completes at t=100ms
+        conn.feed_data_timed(
+            b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            100_000,
+        ).unwrap();
+
+        // Drain events + headers
+        while conn.poll_event().is_some() {}
+        conn.recv_headers(1, |_, _| {}).unwrap();
+
+        // Trigger transition to Idle for keep-alive
+        conn.feed_data_timed(b"", 200_000).unwrap();
+
+        // At t=600ms: 400ms since keep-alive Idle started (connection_start reset to 200ms)
+        // Header timeout is 500ms, so 200_000 + 500_000 = 700_000 — NOT fired yet
+        conn.handle_timeout(600_000);
+        assert!(!conn.is_closed());
+
+        // At t=800ms: 600ms since keep-alive Idle — timeout fires
+        conn.handle_timeout(800_000);
+        assert!(conn.is_closed());
+    }
+
+    #[test]
+    fn is_closed_and_is_established() {
+        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        assert!(conn.is_established());
+        assert!(!conn.is_closed());
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(100),
+            header_timeout_us: None,
+        };
+        conn.set_timeouts(config, 0);
+        conn.handle_timeout(1000);
+
+        assert!(conn.is_closed());
+        assert!(!conn.is_established());
     }
 }

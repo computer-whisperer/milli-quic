@@ -64,6 +64,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
+        // 1 pseudo-header + up to 19 user headers = 20 max
+        if 1 + headers.len() > 20 {
+            return Err(Error::TooManyHeaders);
+        }
         let status_str = crate::http::StatusCode(status).to_bytes();
         let mut all_headers: heapless::Vec<(&[u8], &[u8]), 20> = heapless::Vec::new();
         let _ = all_headers.push((b":status", &status_str[..]));
@@ -87,6 +91,36 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     pub fn send_goaway(&mut self, error_code: u32) -> Result<(), Error> {
         self.inner.send_goaway(error_code)
     }
+
+    /// Configure timeouts. `now` is the current timestamp in microseconds.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.inner.set_timeouts(config, now);
+    }
+
+    /// Return the earliest deadline (in µs) at which `handle_timeout` should be called.
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.inner.next_timeout()
+    }
+
+    /// Check timeouts and emit events if they fire.
+    pub fn handle_timeout(&mut self, now: u64) {
+        self.inner.handle_timeout(now);
+    }
+
+    /// Feed data with timestamp tracking.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        self.inner.feed_data_timed(data, now)
+    }
+
+    /// Whether the connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Whether the SETTINGS exchange is complete.
+    pub fn is_established(&self) -> bool {
+        self.inner.is_established()
+    }
 }
 
 impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -104,6 +138,39 @@ mod tests {
     #[test]
     fn server_creation() {
         let _server = H2Server::<16, 4096>::new();
+    }
+
+    #[test]
+    fn server_max_headers_succeeds() {
+        let mut server = H2Server::<16, 16384>::new();
+        // Need a handshake first to get a valid stream
+        // But we can test the error path without one — send_response
+        // calls inner.send_headers which just queues output
+        let hdrs: [(&[u8], &[u8]); 19] = [
+            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
+            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
+            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
+            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+            (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"),
+        ];
+        // 1 pseudo + 19 user = 20, at the limit — should not return TooManyHeaders
+        let result = server.send_response(1, 200, &hdrs, true);
+        assert_ne!(result, Err(crate::error::Error::TooManyHeaders));
+    }
+
+    #[test]
+    fn server_too_many_headers() {
+        let mut server = H2Server::<16, 16384>::new();
+        let hdrs: [(&[u8], &[u8]); 20] = [
+            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
+            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
+            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
+            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+            (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"), (b"h20", b"v"),
+        ];
+        // 1 pseudo + 20 user = 21, over the limit
+        let result = server.send_response(1, 200, &hdrs, true);
+        assert_eq!(result, Err(crate::error::Error::TooManyHeaders));
     }
 
     #[test]

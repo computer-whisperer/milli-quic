@@ -73,7 +73,7 @@ pub fn encode_client_hello_extensions(
     server_name: &str,
     public_key: &[u8; 32],
     alpn: &[&[u8]],
-    transport_params: &TransportParams,
+    transport_params: Option<&TransportParams>,
     buf: &mut [u8],
 ) -> Result<usize, Error> {
     let mut off = 0;
@@ -166,18 +166,20 @@ pub fn encode_client_hello_extensions(
         }
     }
 
-    // --- QUIC transport parameters ---
-    let mut tp_buf = [0u8; 256];
-    let tp_len = transport_params.encode(&mut tp_buf)?;
-    put_u16(buf, &mut off, EXT_QUIC_TRANSPORT_PARAMS)?;
-    put_u16(buf, &mut off, tp_len as u16)?;
-    if buf.len() < off + tp_len {
-        return Err(Error::BufferTooSmall {
-            needed: off + tp_len,
-        });
+    // --- QUIC transport parameters (skipped in TCP mode) ---
+    if let Some(tp) = transport_params {
+        let mut tp_buf = [0u8; 256];
+        let tp_len = tp.encode(&mut tp_buf)?;
+        put_u16(buf, &mut off, EXT_QUIC_TRANSPORT_PARAMS)?;
+        put_u16(buf, &mut off, tp_len as u16)?;
+        if buf.len() < off + tp_len {
+            return Err(Error::BufferTooSmall {
+                needed: off + tp_len,
+            });
+        }
+        buf[off..off + tp_len].copy_from_slice(&tp_buf[..tp_len]);
+        off += tp_len;
     }
-    buf[off..off + tp_len].copy_from_slice(&tp_buf[..tp_len]);
-    off += tp_len;
 
     Ok(off)
 }
@@ -426,7 +428,7 @@ pub fn encode_server_hello_extensions(
 /// Includes: ALPN (selected protocol) and QUIC transport parameters.
 pub fn encode_encrypted_extensions_data(
     selected_alpn: &[u8],
-    transport_params: &TransportParams,
+    transport_params: Option<&TransportParams>,
     buf: &mut [u8],
 ) -> Result<usize, Error> {
     let mut off = 0;
@@ -449,18 +451,20 @@ pub fn encode_encrypted_extensions_data(
         off += selected_alpn.len();
     }
 
-    // --- QUIC transport parameters ---
-    let mut tp_buf = [0u8; 256];
-    let tp_len = transport_params.encode(&mut tp_buf)?;
-    put_u16(buf, &mut off, EXT_QUIC_TRANSPORT_PARAMS)?;
-    put_u16(buf, &mut off, tp_len as u16)?;
-    if buf.len() < off + tp_len {
-        return Err(Error::BufferTooSmall {
-            needed: off + tp_len,
-        });
+    // --- QUIC transport parameters (skipped in TCP mode) ---
+    if let Some(tp) = transport_params {
+        let mut tp_buf = [0u8; 256];
+        let tp_len = tp.encode(&mut tp_buf)?;
+        put_u16(buf, &mut off, EXT_QUIC_TRANSPORT_PARAMS)?;
+        put_u16(buf, &mut off, tp_len as u16)?;
+        if buf.len() < off + tp_len {
+            return Err(Error::BufferTooSmall {
+                needed: off + tp_len,
+            });
+        }
+        buf[off..off + tp_len].copy_from_slice(&tp_buf[..tp_len]);
+        off += tp_len;
     }
-    buf[off..off + tp_len].copy_from_slice(&tp_buf[..tp_len]);
-    off += tp_len;
 
     Ok(off)
 }
@@ -478,7 +482,7 @@ mod tests {
             "example.com",
             &public_key,
             &[b"h3"],
-            &params,
+            Some(&params),
             &mut buf,
         )
         .unwrap();
@@ -592,7 +596,7 @@ mod tests {
             "",
             &public_key,
             &[b"h3"],
-            &params,
+            Some(&params),
             &mut buf,
         )
         .unwrap();
@@ -617,7 +621,7 @@ mod tests {
             "example.com",
             &public_key,
             &[b"h3", b"hq-29"],
-            &params,
+            Some(&params),
             &mut buf,
         )
         .unwrap();
@@ -647,7 +651,7 @@ mod tests {
     fn encode_parse_encrypted_extensions_data_roundtrip() {
         let params = TransportParams::default_params();
         let mut buf = [0u8; 512];
-        let len = encode_encrypted_extensions_data(b"h3", &params, &mut buf).unwrap();
+        let len = encode_encrypted_extensions_data(b"h3", Some(&params), &mut buf).unwrap();
 
         let parsed = parse_encrypted_extensions_data(&buf[..len]).unwrap();
         assert_eq!(parsed.alpn.as_ref().unwrap().as_slice(), b"h3");
