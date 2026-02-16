@@ -16,6 +16,7 @@
 //! the stack to work around borrow-checker limitations. With the default
 //! `BUF = 8192` this adds 8 KiB to the call stack.
 
+use crate::buf::Buf;
 use crate::error::Error;
 use super::parse;
 
@@ -84,14 +85,14 @@ pub struct Http1Connection<
 > {
     role: Role,
     state: ParseState,
-    recv_buf: heapless::Vec<u8, BUF>,
-    send_buf: heapless::Vec<u8, BUF>,
+    recv_buf: Buf<BUF>,
+    send_buf: Buf<BUF>,
     send_offset: usize,
     /// Parsed headers stored as `name\0value\0` pairs.
-    header_buf: heapless::Vec<u8, HDRBUF>,
+    header_buf: Buf<HDRBUF>,
     headers_available: bool,
     /// Buffered body data for the application to read.
-    data_buf: heapless::Vec<u8, DATABUF>,
+    data_buf: Buf<DATABUF>,
     events: heapless::Deque<Http1Event, 32>,
     /// Pseudo-stream-id (increments per request).
     current_stream_id: u64,
@@ -128,12 +129,12 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         Self {
             role,
             state: ParseState::Idle,
-            recv_buf: heapless::Vec::new(),
-            send_buf: heapless::Vec::new(),
+            recv_buf: Buf::new(),
+            send_buf: Buf::new(),
             send_offset: 0,
-            header_buf: heapless::Vec::new(),
+            header_buf: Buf::new(),
             headers_available: false,
-            data_buf: heapless::Vec::new(),
+            data_buf: Buf::new(),
             events: heapless::Deque::new(),
             current_stream_id: 0,
             chunk_state: ChunkState::Size,
@@ -280,11 +281,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         buf[..copy_len].copy_from_slice(&self.data_buf[..copy_len]);
 
         // Shift remaining data
-        let remaining = self.data_buf.len() - copy_len;
-        for i in 0..remaining {
-            self.data_buf[i] = self.data_buf[copy_len + i];
-        }
-        self.data_buf.truncate(remaining);
+        self.data_buf.copy_within(copy_len.., 0);
+        self.data_buf.truncate(self.data_buf.len() - copy_len);
 
         let fin = self.data_buf.is_empty() && self.body_finished;
         Ok((copy_len, fin))
@@ -798,11 +796,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     fn drain_recv(&mut self, count: usize) {
-        let remaining = self.recv_buf.len() - count;
-        for i in 0..remaining {
-            self.recv_buf[i] = self.recv_buf[count + i];
-        }
-        self.recv_buf.truncate(remaining);
+        self.recv_buf.copy_within(count.., 0);
+        self.recv_buf.truncate(self.recv_buf.len() - count);
     }
 }
 

@@ -4,6 +4,7 @@
 //! the HTTP/3 client ([`super::client::H3Client`]) and server
 //! ([`super::server::H3Server`]).
 
+use crate::buf::Buf;
 use crate::connection::{Connection, Event};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
@@ -42,10 +43,10 @@ pub enum H3Event {
 pub(crate) struct RequestStreamState {
     pub stream_id: u64,
     /// Buffer for received HEADERS frame data (QPACK-encoded).
-    pub headers_data: heapless::Vec<u8, 512>,
+    pub headers_data: Buf<512>,
     pub headers_received: bool,
     /// Buffer for received DATA.
-    pub data_buf: heapless::Vec<u8, 1024>,
+    pub data_buf: Buf<1024>,
     pub data_available: bool,
     pub fin_received: bool,
 }
@@ -54,9 +55,9 @@ impl RequestStreamState {
     pub fn new(stream_id: u64) -> Self {
         Self {
             stream_id,
-            headers_data: heapless::Vec::new(),
+            headers_data: Buf::new(),
             headers_received: false,
-            data_buf: heapless::Vec::new(),
+            data_buf: Buf::new(),
             data_available: false,
             fin_received: false,
         }
@@ -488,14 +489,8 @@ where
         buf[..copy_len].copy_from_slice(&rs.data_buf[..copy_len]);
 
         // Remove the consumed bytes from the front of the buffer.
-        let remaining = rs.data_buf.len() - copy_len;
-        if remaining > 0 {
-            // Shift remaining data to front.
-            for i in 0..remaining {
-                rs.data_buf[i] = rs.data_buf[copy_len + i];
-            }
-        }
-        rs.data_buf.truncate(remaining);
+        rs.data_buf.copy_within(copy_len.., 0);
+        rs.data_buf.truncate(rs.data_buf.len() - copy_len);
 
         let fin = rs.data_buf.is_empty() && rs.fin_received;
         rs.data_available = !rs.data_buf.is_empty();

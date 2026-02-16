@@ -1,5 +1,7 @@
 //! HTTP/2 stream state machine (RFC 9113 §5.1).
 
+use crate::buf::Buf;
+
 /// HTTP/2 stream states (RFC 9113 §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2StreamState {
@@ -23,9 +25,9 @@ pub struct H2Stream<const HDRBUF: usize = 2048, const DATABUF: usize = 4096> {
     pub state: H2StreamState,
     pub send_window: i32,
     pub recv_window: i32,
-    pub headers_data: heapless::Vec<u8, HDRBUF>,
+    pub headers_data: Buf<HDRBUF>,
     pub headers_received: bool,
-    pub data_buf: heapless::Vec<u8, DATABUF>,
+    pub data_buf: Buf<DATABUF>,
     pub data_available: bool,
     pub fin_received: bool,
     pub fin_sent: bool,
@@ -38,9 +40,9 @@ impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
             state: H2StreamState::Idle,
             send_window: initial_send_window,
             recv_window: initial_recv_window,
-            headers_data: heapless::Vec::new(),
+            headers_data: Buf::new(),
             headers_received: false,
-            data_buf: heapless::Vec::new(),
+            data_buf: Buf::new(),
             data_available: false,
             fin_received: false,
             fin_sent: false,

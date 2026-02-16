@@ -2,6 +2,7 @@
 //!
 //! Follows the milli-http `feed_data()` → `poll_output()` → `poll_event()` pattern.
 
+use crate::buf::Buf;
 use crate::crypto::{CryptoProvider, Aead, Level};
 use crate::crypto::key_schedule::derive_tls_record_keys;
 use crate::error::Error;
@@ -52,16 +53,16 @@ pub struct TlsConnection<C: CryptoProvider, const BUF: usize = 18432> {
     state: ConnState,
 
     // Raw TCP data received
-    recv_buf: heapless::Vec<u8, BUF>,
+    recv_buf: Buf<BUF>,
     // Data to send on TCP
-    send_buf: heapless::Vec<u8, BUF>,
+    send_buf: Buf<BUF>,
     send_offset: usize,
 
     // Decrypted application data buffer
-    app_recv_buf: heapless::Vec<u8, BUF>,
+    app_recv_buf: Buf<BUF>,
 
     // Application data to encrypt and send
-    app_send_buf: heapless::Vec<u8, BUF>,
+    app_send_buf: Buf<BUF>,
 
     // AEAD keys for handshake traffic
     hs_send: Option<DirectionalRecordKeys<C::Aead>>,
@@ -108,11 +109,11 @@ where
             provider,
             engine,
             state: ConnState::Handshake,
-            recv_buf: heapless::Vec::new(),
-            send_buf: heapless::Vec::new(),
+            recv_buf: Buf::new(),
+            send_buf: Buf::new(),
             send_offset: 0,
-            app_recv_buf: heapless::Vec::new(),
-            app_send_buf: heapless::Vec::new(),
+            app_recv_buf: Buf::new(),
+            app_send_buf: Buf::new(),
             hs_send: None,
             hs_recv: None,
             app_send: None,
@@ -173,11 +174,8 @@ where
         let n = self.app_recv_buf.len().min(buf.len());
         buf[..n].copy_from_slice(&self.app_recv_buf[..n]);
 
-        let remaining = self.app_recv_buf.len() - n;
-        for i in 0..remaining {
-            self.app_recv_buf[i] = self.app_recv_buf[n + i];
-        }
-        self.app_recv_buf.truncate(remaining);
+        self.app_recv_buf.copy_within(n.., 0);
+        self.app_recv_buf.truncate(self.app_recv_buf.len() - n);
         Ok(n)
     }
 
@@ -224,6 +222,8 @@ where
     // Internal: processing received data
     // ------------------------------------------------------------------
 
+    /// Process received TLS records directly in `recv_buf` using field-level
+    /// borrows, avoiding the previous 18 KiB stack temporary.
     fn process_recv(&mut self) -> Result<(), Error> {
         loop {
             if self.recv_buf.len() < RECORD_HEADER_LEN {
@@ -237,124 +237,143 @@ where
                 return Ok(());
             }
 
-            // Copy record out of recv_buf
-            let mut record_data = [0u8; 18432];
-            if total > record_data.len() {
-                return Err(Error::BufferTooSmall { needed: total });
-            }
-            record_data[..total].copy_from_slice(&self.recv_buf[..total]);
-
-            let remaining = self.recv_buf.len() - total;
-            for i in 0..remaining {
-                self.recv_buf[i] = self.recv_buf[total + i];
-            }
-            self.recv_buf.truncate(remaining);
-
-            // Save header bytes for AAD
+            // Save 5-byte header for AAD (tiny stack alloc)
             let header_bytes: [u8; 5] = [
-                record_data[0], record_data[1], record_data[2],
-                record_data[3], record_data[4],
+                self.recv_buf[0], self.recv_buf[1], self.recv_buf[2],
+                self.recv_buf[3], self.recv_buf[4],
             ];
             let payload_len = hdr.length as usize;
-            self.handle_record(hdr.content_type, &header_bytes,
-                              &mut record_data[RECORD_HEADER_LEN..total], payload_len)?;
-        }
-    }
+            let ct = hdr.content_type;
+            let ps = RECORD_HEADER_LEN; // payload start
 
-    fn handle_record(
-        &mut self,
-        ct: ContentType,
-        header_bytes: &[u8; 5],
-        payload: &mut [u8],
-        payload_len: usize,
-    ) -> Result<(), Error> {
-        match self.state {
-            ConnState::Handshake => {
-                match ct {
-                    ContentType::Handshake => {
-                        self.engine.read_handshake(Level::Initial, &payload[..payload_len])
-                            .map_err(|_| Error::Tls)?;
-                        self.check_keys()?;
-                    }
-                    ContentType::ChangeCipherSpec => {} // ignore
-                    ContentType::Alert => self.handle_alert(&payload[..payload_len])?,
-                    _ => return Err(Error::Tls),
-                }
-            }
-            ConnState::HandshakeEncrypted => {
-                match ct {
-                    ContentType::ApplicationData => {
-                        let keys = self.hs_recv.as_ref().ok_or(Error::Tls)?;
-                        let nonce = record::build_nonce(&keys.iv, self.hs_recv_seq);
-                        self.hs_recv_seq += 1;
+            // Process the record in-place using field-level borrows.
+            // Each arm accesses disjoint fields of `self` so the borrow
+            // checker can verify safety without a copy to a stack temp.
+            let mut need_check_keys = false;
 
-                        let plain_len = keys.aead.open_in_place(
-                            &nonce, header_bytes, payload, payload_len,
-                        )?;
-                        let (data_len, inner_ct) = find_inner_content_type(&payload[..plain_len])?;
-
-                        match inner_ct {
-                            ContentType::Handshake => {
-                                self.engine.read_handshake(Level::Handshake, &payload[..data_len])
-                                    .map_err(|_| Error::Tls)?;
-                                self.check_keys()?;
-                            }
-                            ContentType::Alert => self.handle_alert(&payload[..data_len])?,
-                            _ => return Err(Error::Tls),
+            match self.state {
+                ConnState::Handshake => {
+                    match ct {
+                        ContentType::Handshake => {
+                            self.engine.read_handshake(
+                                Level::Initial,
+                                &self.recv_buf[ps..ps + payload_len],
+                            ).map_err(|_| Error::Tls)?;
+                            need_check_keys = true;
                         }
+                        ContentType::ChangeCipherSpec => {}
+                        ContentType::Alert => {
+                            if payload_len < 2 { return Err(Error::Tls); }
+                            let desc = self.recv_buf[ps + 1];
+                            self.drain_recv(total);
+                            return self.handle_alert_desc(desc);
+                        }
+                        _ => return Err(Error::Tls),
                     }
-                    ContentType::ChangeCipherSpec => {} // ignore
-                    ContentType::Handshake => {
-                        self.engine.read_handshake(Level::Initial, &payload[..payload_len])
-                            .map_err(|_| Error::Tls)?;
-                        self.check_keys()?;
-                    }
-                    _ => return Err(Error::Tls),
                 }
-            }
-            ConnState::Active => {
-                match ct {
-                    ContentType::ApplicationData => {
-                        let keys = self.app_recv.as_ref().ok_or(Error::Tls)?;
-                        let nonce = record::build_nonce(&keys.iv, self.recv_seq);
-                        self.recv_seq += 1;
-
-                        let plain_len = keys.aead.open_in_place(
-                            &nonce, header_bytes, payload, payload_len,
-                        )?;
-                        let (data_len, inner_ct) = find_inner_content_type(&payload[..plain_len])?;
-
-                        match inner_ct {
-                            ContentType::ApplicationData => {
-                                if self.app_recv_buf.len() + data_len > BUF {
-                                    return Err(Error::BufferTooSmall {
-                                        needed: self.app_recv_buf.len() + data_len,
-                                    });
+                ConnState::HandshakeEncrypted => {
+                    match ct {
+                        ContentType::ApplicationData => {
+                            // Decrypt in-place within recv_buf (field borrows:
+                            // &self.hs_recv for keys, &mut self.recv_buf for payload).
+                            let keys = self.hs_recv.as_ref().ok_or(Error::Tls)?;
+                            let nonce = record::build_nonce(&keys.iv, self.hs_recv_seq);
+                            self.hs_recv_seq += 1;
+                            let plain_len = keys.aead.open_in_place(
+                                &nonce, &header_bytes,
+                                &mut self.recv_buf[ps..ps + payload_len],
+                                payload_len,
+                            )?;
+                            let (data_len, inner_ct) = find_inner_content_type(
+                                &self.recv_buf[ps..ps + plain_len],
+                            )?;
+                            match inner_ct {
+                                ContentType::Handshake => {
+                                    self.engine.read_handshake(
+                                        Level::Handshake,
+                                        &self.recv_buf[ps..ps + data_len],
+                                    ).map_err(|_| Error::Tls)?;
+                                    need_check_keys = true;
                                 }
-                                let _ = self.app_recv_buf.extend_from_slice(&payload[..data_len]);
-                                let _ = self.events.push_back(TlsEvent::AppData);
+                                ContentType::Alert => {
+                                    if data_len < 2 { return Err(Error::Tls); }
+                                    let desc = self.recv_buf[ps + 1];
+                                    self.drain_recv(total);
+                                    return self.handle_alert_desc(desc);
+                                }
+                                _ => return Err(Error::Tls),
                             }
-                            ContentType::Alert => self.handle_alert(&payload[..data_len])?,
-                            ContentType::Handshake => {} // Post-handshake (e.g. NewSessionTicket)
-                            _ => return Err(Error::Tls),
                         }
+                        ContentType::ChangeCipherSpec => {}
+                        ContentType::Handshake => {
+                            self.engine.read_handshake(
+                                Level::Initial,
+                                &self.recv_buf[ps..ps + payload_len],
+                            ).map_err(|_| Error::Tls)?;
+                            need_check_keys = true;
+                        }
+                        _ => return Err(Error::Tls),
                     }
-                    ContentType::ChangeCipherSpec => {} // ignore
-                    _ => return Err(Error::Tls),
                 }
+                ConnState::Active => {
+                    match ct {
+                        ContentType::ApplicationData => {
+                            // Decrypt in-place (field borrows: &self.app_recv
+                            // for keys, &mut self.recv_buf for payload).
+                            let keys = self.app_recv.as_ref().ok_or(Error::Tls)?;
+                            let nonce = record::build_nonce(&keys.iv, self.recv_seq);
+                            self.recv_seq += 1;
+                            let plain_len = keys.aead.open_in_place(
+                                &nonce, &header_bytes,
+                                &mut self.recv_buf[ps..ps + payload_len],
+                                payload_len,
+                            )?;
+                            let (data_len, inner_ct) = find_inner_content_type(
+                                &self.recv_buf[ps..ps + plain_len],
+                            )?;
+                            match inner_ct {
+                                ContentType::ApplicationData => {
+                                    if self.app_recv_buf.len() + data_len > BUF {
+                                        return Err(Error::BufferTooSmall {
+                                            needed: self.app_recv_buf.len() + data_len,
+                                        });
+                                    }
+                                    // Copy decrypted plaintext directly from recv_buf
+                                    // to app_recv_buf (disjoint fields).
+                                    let _ = self.app_recv_buf.extend_from_slice(
+                                        &self.recv_buf[ps..ps + data_len],
+                                    );
+                                    let _ = self.events.push_back(TlsEvent::AppData);
+                                }
+                                ContentType::Alert => {
+                                    if data_len < 2 { return Err(Error::Tls); }
+                                    let desc = self.recv_buf[ps + 1];
+                                    self.drain_recv(total);
+                                    return self.handle_alert_desc(desc);
+                                }
+                                ContentType::Handshake => {} // Post-handshake
+                                _ => return Err(Error::Tls),
+                            }
+                        }
+                        ContentType::ChangeCipherSpec => {}
+                        _ => return Err(Error::Tls),
+                    }
+                }
+                ConnState::Closing | ConnState::Closed => {}
             }
-            ConnState::Closing | ConnState::Closed => {} // ignore
+
+            // Drain consumed record from recv_buf
+            self.drain_recv(total);
+
+            if need_check_keys {
+                self.check_keys()?;
+            }
         }
-        Ok(())
     }
 
-    fn handle_alert(&mut self, data: &[u8]) -> Result<(), Error> {
-        if data.len() < 2 {
-            return Err(Error::Tls);
-        }
-        let desc = data[1];
+    /// Handle an alert given only the description byte (level is unused in TLS 1.3).
+    fn handle_alert_desc(&mut self, desc: u8) -> Result<(), Error> {
         if desc == 0 {
-            // close_notify
             self.state = ConnState::Closing;
             let _ = self.events.push_back(TlsEvent::PeerClosed);
             Ok(())
@@ -362,6 +381,11 @@ where
             self.state = ConnState::Closed;
             Err(Error::Tls)
         }
+    }
+
+    fn drain_recv(&mut self, n: usize) {
+        self.recv_buf.copy_within(n.., 0);
+        self.recv_buf.truncate(self.recv_buf.len() - n);
     }
 
     fn send_alert(&mut self, level: u8, desc: u8) -> Result<(), Error> {
@@ -485,6 +509,8 @@ where
         self.engine_output_pending = false;
     }
 
+    /// Encrypt pending application data directly from `app_send_buf` into
+    /// `send_buf` using field-level borrows (no 16 KiB stack temp).
     fn flush_app_send(&mut self) {
         if self.app_send_buf.is_empty() || self.state != ConnState::Active {
             return;
@@ -492,18 +518,27 @@ where
 
         while !self.app_send_buf.is_empty() {
             let chunk_len = self.app_send_buf.len().min(16384);
-            let mut chunk = [0u8; 16384];
-            chunk[..chunk_len].copy_from_slice(&self.app_send_buf[..chunk_len]);
+            let keys = match self.app_send.as_ref() {
+                Some(k) => k,
+                None => break,
+            };
+            let nonce = record::build_nonce(&keys.iv, self.send_seq);
+            self.send_seq += 1;
 
-            if self.encrypt_and_send(&chunk[..chunk_len], ContentType::ApplicationData, false).is_err() {
+            // Field-level borrows: &self.app_send_buf (shared data),
+            // &keys.aead via &self.app_send (shared), &mut self.send_buf (mutable output).
+            if encrypt_into::<C::Aead, BUF>(
+                &self.app_send_buf[..chunk_len],
+                ContentType::ApplicationData,
+                &keys.aead,
+                &nonce,
+                &mut self.send_buf,
+            ).is_err() {
                 break;
             }
 
-            let remaining = self.app_send_buf.len() - chunk_len;
-            for i in 0..remaining {
-                self.app_send_buf[i] = self.app_send_buf[chunk_len + i];
-            }
-            self.app_send_buf.truncate(remaining);
+            self.app_send_buf.copy_within(chunk_len.., 0);
+            self.app_send_buf.truncate(self.app_send_buf.len() - chunk_len);
         }
     }
 
@@ -514,46 +549,28 @@ where
         self.queue_send(data)
     }
 
+    /// Encrypt a TLS record and append it to `send_buf`.
+    ///
+    /// For calls from `flush_engine_output` and `send_alert` where the data is
+    /// in a local variable (not a self field). Uses the `encrypt_into` free
+    /// function to write directly into `send_buf` — no 16 KiB stack temp.
     fn encrypt_and_send(
         &mut self,
         data: &[u8],
         inner_ct: ContentType,
         use_hs_keys: bool,
     ) -> Result<(), Error> {
-        let (keys, seq) = if use_hs_keys {
-            (self.hs_send.as_ref().ok_or(Error::Tls)?, &mut self.hs_send_seq)
+        if use_hs_keys {
+            let keys = self.hs_send.as_ref().ok_or(Error::Tls)?;
+            let nonce = record::build_nonce(&keys.iv, self.hs_send_seq);
+            self.hs_send_seq += 1;
+            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, &mut self.send_buf)
         } else {
-            (self.app_send.as_ref().ok_or(Error::Tls)?, &mut self.send_seq)
-        };
-
-        let nonce = record::build_nonce(&keys.iv, *seq);
-        *seq += 1;
-
-        let inner_len = data.len() + 1;
-        let outer_payload_len = inner_len + C::Aead::TAG_LEN;
-
-        // Outer record header (also used as AAD)
-        let mut header = [0u8; 5];
-        record::encode_record_header(
-            ContentType::ApplicationData,
-            outer_payload_len as u16,
-            &mut header,
-        )?;
-
-        // Build plaintext: data + inner_ct_byte
-        let mut enc_buf = [0u8; 16640];
-        if inner_len + C::Aead::TAG_LEN > enc_buf.len() {
-            return Err(Error::BufferTooSmall {
-                needed: inner_len + C::Aead::TAG_LEN,
-            });
+            let keys = self.app_send.as_ref().ok_or(Error::Tls)?;
+            let nonce = record::build_nonce(&keys.iv, self.send_seq);
+            self.send_seq += 1;
+            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, &mut self.send_buf)
         }
-        enc_buf[..data.len()].copy_from_slice(data);
-        enc_buf[data.len()] = inner_ct as u8;
-
-        let ciphertext_len = keys.aead.seal_in_place(&nonce, &header, &mut enc_buf, inner_len)?;
-
-        self.queue_send(&header)?;
-        self.queue_send(&enc_buf[..ciphertext_len])
     }
 
     fn queue_send(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -579,6 +596,50 @@ fn find_inner_content_type(plaintext: &[u8]) -> Result<(usize, ContentType), Err
     }
     let ct = ContentType::from_byte(plaintext[pos - 1]).ok_or(Error::Tls)?;
     Ok((pos - 1, ct))
+}
+
+/// Encrypt a TLS record directly into `send_buf`, avoiding any large stack temp.
+///
+/// Writes a complete TLS record: 5-byte header + AEAD-encrypted (data + inner_ct + tag).
+fn encrypt_into<A: crate::crypto::Aead, const BUF: usize>(
+    data: &[u8],
+    inner_ct: ContentType,
+    aead: &A,
+    nonce: &[u8; 12],
+    send_buf: &mut Buf<BUF>,
+) -> Result<(), Error> {
+    let inner_len = data.len() + 1; // data + inner content type byte
+    let outer_payload_len = inner_len + A::TAG_LEN;
+    let total_needed = RECORD_HEADER_LEN + outer_payload_len;
+
+    if send_buf.len() + total_needed > BUF {
+        return Err(Error::BufferTooSmall {
+            needed: send_buf.len() + total_needed,
+        });
+    }
+
+    // Build and write record header (also used as AAD)
+    let mut header = [0u8; 5];
+    record::encode_record_header(
+        ContentType::ApplicationData,
+        outer_payload_len as u16,
+        &mut header,
+    )?;
+    let _ = send_buf.extend_from_slice(&header);
+
+    // Write plaintext payload directly into send_buf: data + inner_ct
+    let enc_start = send_buf.len();
+    let _ = send_buf.extend_from_slice(data);
+    let _ = send_buf.push(inner_ct as u8);
+    // Reserve space for AEAD tag
+    for _ in 0..A::TAG_LEN {
+        let _ = send_buf.push(0);
+    }
+
+    // Encrypt in-place within send_buf
+    let ct_len = aead.seal_in_place(nonce, &header, &mut send_buf[enc_start..], inner_len)?;
+    send_buf.truncate(enc_start + ct_len);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -4,6 +4,11 @@
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+pub mod buf;
+
 pub mod error;
 pub mod frame;
 pub mod varint;
