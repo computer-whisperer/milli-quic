@@ -283,7 +283,7 @@ fn http1_post_with_body() {
 fn http1_keep_alive_sequential() {
     let (mut client, mut server) = setup_pair();
 
-    for i in 1..=3u32 {
+    for i in 1..=3u64 {
         let path = match i {
             1 => "/page1",
             2 => "/page2",

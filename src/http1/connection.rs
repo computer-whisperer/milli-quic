@@ -22,13 +22,15 @@ use super::parse;
 /// Events produced by the HTTP/1.1 connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http1Event {
+    /// Connection ready. Emitted as the first event for API consistency with H2/H3.
+    Connected,
     /// Headers received (request headers on server-side, response headers on client-side).
-    /// The `u32` is a pseudo-stream-id for API consistency with H2/H3.
-    Headers(u32),
+    /// The `u64` is a pseudo-stream-id for API consistency with H2/H3.
+    Headers(u64),
     /// Body data available.
-    Data(u32),
+    Data(u64),
     /// Request/response complete.
-    Finished(u32),
+    Finished(u64),
 }
 
 /// Connection role.
@@ -90,13 +92,15 @@ pub struct Http1Connection<
     data_buf: heapless::Vec<u8, DATABUF>,
     events: heapless::Deque<Http1Event, 32>,
     /// Pseudo-stream-id (increments per request).
-    current_stream_id: u32,
+    current_stream_id: u64,
     /// Chunked decoding sub-state.
     chunk_state: ChunkState,
     /// Whether the current message uses keep-alive.
     keep_alive: bool,
     /// Whether end-of-stream has been signalled for the current message.
     body_finished: bool,
+    /// Whether the Connected event has been emitted.
+    connected_emitted: bool,
 }
 
 impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -127,6 +131,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
             chunk_state: ChunkState::Size,
             keep_alive: true,
             body_finished: false,
+            connected_emitted: false,
         }
     }
 
@@ -159,6 +164,10 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
 
     /// Poll for the next event.
     pub fn poll_event(&mut self) -> Option<Http1Event> {
+        if !self.connected_emitted {
+            self.connected_emitted = true;
+            return Some(Http1Event::Connected);
+        }
         self.events.pop_front()
     }
 
@@ -172,7 +181,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// will be used to construct the request/status line.
     pub fn send_headers(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
@@ -186,7 +195,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Send body data.
     pub fn send_data(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         data: &[u8],
         _end_stream: bool,
     ) -> Result<usize, Error> {
@@ -200,7 +209,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Iterates stored headers as `name\0value\0` pairs, calling `emit(name, value)`.
     pub fn recv_headers<F: FnMut(&[u8], &[u8])>(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         mut emit: F,
     ) -> Result<(), Error> {
         self.check_stream_id(stream_id)?;
@@ -243,7 +252,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Read received body data.
     pub fn recv_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
         self.check_stream_id(stream_id)?;
@@ -273,7 +282,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         &mut self,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
-    ) -> Result<u32, Error> {
+    ) -> Result<u64, Error> {
         self.current_stream_id += 1;
         let sid = self.current_stream_id;
         self.send_headers(sid, headers, end_stream)?;
@@ -285,7 +294,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     // ------------------------------------------------------------------
 
     /// Validate that the stream_id matches the current active stream.
-    fn check_stream_id(&self, stream_id: u32) -> Result<(), Error> {
+    fn check_stream_id(&self, stream_id: u64) -> Result<(), Error> {
         if stream_id != self.current_stream_id {
             return Err(Error::InvalidState);
         }
@@ -788,6 +797,7 @@ mod tests {
         conn.feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let event = conn.poll_event().unwrap();
         assert_eq!(event, Http1Event::Headers(1));
 
@@ -827,6 +837,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let event = conn.poll_event().unwrap();
         assert_eq!(event, Http1Event::Headers(1));
 
@@ -877,6 +888,7 @@ mod tests {
         conn.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
             .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let event = conn.poll_event().unwrap();
         assert_eq!(event, Http1Event::Headers(1));
 
@@ -958,6 +970,7 @@ mod tests {
 
         // Feed partial request
         conn.feed_data(b"GET / HTTP/1.1\r\n").unwrap();
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         assert!(conn.poll_event().is_none()); // Not complete yet
 
         conn.feed_data(b"Host: example.com\r\n").unwrap();
@@ -975,6 +988,7 @@ mod tests {
         // First request
         conn.feed_data(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1001,6 +1015,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1039,6 +1054,7 @@ mod tests {
         .unwrap();
 
         // Should only see first request
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
@@ -1097,6 +1113,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
@@ -1136,7 +1153,8 @@ mod tests {
         )
         .unwrap();
 
-        // Should get request + data event (first 8 bytes fill data_buf)
+        // Should get Connected + request + data event (first 8 bytes fill data_buf)
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
@@ -1170,6 +1188,7 @@ mod tests {
         // Response with no Content-Length and no Transfer-Encoding
         conn.feed_data(b"HTTP/1.1 200 OK\r\n\r\nhello").unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
         let ev2 = conn.poll_event().unwrap();
@@ -1195,6 +1214,7 @@ mod tests {
             b"POST /data HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
         )
         .unwrap();
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1260,7 +1280,8 @@ mod tests {
             server.feed_data(&copy).unwrap();
         }
 
-        // Server gets request
+        // Server gets Connected then request
+        assert!(matches!(server.poll_event(), Some(Http1Event::Connected)));
         let ev = server.poll_event().unwrap();
         assert!(matches!(ev, Http1Event::Headers(_)));
 
@@ -1384,6 +1405,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let event = conn.poll_event().unwrap();
         assert_eq!(event, Http1Event::Headers(1));
         let event2 = conn.poll_event().unwrap();
@@ -1434,6 +1456,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1478,6 +1501,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1530,6 +1554,7 @@ mod tests {
         conn.feed_data(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1556,6 +1581,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 
@@ -1596,6 +1622,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let ev = conn.poll_event().unwrap();
         assert_eq!(ev, Http1Event::Headers(1));
 

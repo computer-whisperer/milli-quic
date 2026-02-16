@@ -40,7 +40,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Read request headers.
     pub fn recv_headers<F: FnMut(&[u8], &[u8])>(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         emit: F,
     ) -> Result<(), Error> {
         self.inner.recv_headers(stream_id, emit)
@@ -49,7 +49,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Read request body.
     pub fn recv_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
@@ -61,7 +61,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// If `end_stream` is true, no body will follow.
     pub fn send_response(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         status: u16,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
@@ -78,7 +78,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Send response body data.
     pub fn send_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
@@ -110,6 +110,7 @@ mod tests {
             .feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
 
+        assert!(matches!(server.poll_event(), Some(Http1Event::Connected)));
         let event = server.poll_event().unwrap();
         assert!(matches!(event, Http1Event::Headers(1)));
     }

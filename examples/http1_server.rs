@@ -62,6 +62,9 @@ fn main() {
         // Process events.
         while let Some(event) = http1.poll_event() {
             match event {
+                Http1Event::Connected => {
+                    println!("[http1] connected");
+                }
                 Http1Event::Headers(stream_id) => {
                     println!("[http1] request on stream {stream_id}");
 

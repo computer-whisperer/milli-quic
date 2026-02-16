@@ -18,15 +18,15 @@ pub enum H2Event {
     /// Connection settings exchanged, ready for requests.
     Connected,
     /// Headers received on a stream.
-    Headers(u32),
+    Headers(u64),
     /// Body data available on a stream.
-    Data(u32),
+    Data(u64),
     /// Stream reset by peer.
-    StreamReset(u32, u32),
+    StreamReset(u64, u32),
     /// Peer sent GOAWAY.
-    GoAway(u32, u32),
+    GoAway(u64, u32),
     /// Stream finished (END_STREAM received).
-    Finished(u32),
+    Finished(u64),
 }
 
 /// Connection role.
@@ -151,10 +151,10 @@ pub struct H2Connection<
     // Event queue
     events: heapless::Deque<H2Event, 32>,
     // Connection state
-    next_stream_id: u32,
-    last_peer_stream_id: u32,
+    next_stream_id: u64,
+    last_peer_stream_id: u64,
     /// Stream expecting CONTINUATION frames (RFC 9113 §4.3).
-    continuation_stream_id: Option<u32>,
+    continuation_stream_id: Option<u64>,
     settings_sent: bool,
     settings_ack_received: bool,
     peer_settings_received: bool,
@@ -261,7 +261,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// For servers: sends response headers.
     pub fn send_headers(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
@@ -302,13 +302,13 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         &mut self,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
-    ) -> Result<u32, Error> {
+    ) -> Result<u64, Error> {
         // RFC 9113 §5.1.1: stream IDs must not exceed 2^31-1
         if self.next_stream_id > 0x7fff_ffff {
             return Err(Error::StreamLimitExhausted);
         }
         let stream_id = self.next_stream_id;
-        self.next_stream_id = self.next_stream_id.wrapping_add(2);
+        self.next_stream_id += 2;
         self.send_headers(stream_id, headers, end_stream)?;
         Ok(stream_id)
     }
@@ -316,7 +316,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Send data on a stream.
     pub fn send_data(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
@@ -372,7 +372,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Read received headers for a stream.
     pub fn recv_headers<F: FnMut(&[u8], &[u8])>(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         emit: F,
     ) -> Result<(), Error> {
         let stream = self.get_stream(stream_id).ok_or(Error::InvalidState)?;
@@ -391,7 +391,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Read received body data for a stream.
     pub fn recv_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
         let stream = self.get_stream_mut(stream_id).ok_or(Error::InvalidState)?;
@@ -482,7 +482,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         self.queue_send(&buf[..n])
     }
 
-    fn send_window_update(&mut self, stream_id: u32, increment: u32) {
+    fn send_window_update(&mut self, stream_id: u64, increment: u32) {
         if increment == 0 {
             return;
         }
@@ -751,7 +751,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     // Stream management
     // ------------------------------------------------------------------
 
-    fn ensure_stream(&mut self, stream_id: u32) {
+    fn ensure_stream(&mut self, stream_id: u64) {
         if !self.streams.iter().any(|s| s.id == stream_id) {
             let initial_send = self.peer_settings.initial_window_size as i32;
             let initial_recv = self.local_settings.initial_window_size as i32;
@@ -759,11 +759,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         }
     }
 
-    fn get_stream(&self, stream_id: u32) -> Option<&H2Stream<HDRBUF, DATABUF>> {
+    fn get_stream(&self, stream_id: u64) -> Option<&H2Stream<HDRBUF, DATABUF>> {
         self.streams.iter().find(|s| s.id == stream_id)
     }
 
-    fn get_stream_mut(&mut self, stream_id: u32) -> Option<&mut H2Stream<HDRBUF, DATABUF>> {
+    fn get_stream_mut(&mut self, stream_id: u64) -> Option<&mut H2Stream<HDRBUF, DATABUF>> {
         self.streams.iter_mut().find(|s| s.id == stream_id)
     }
 
@@ -888,7 +888,7 @@ mod tests {
 
         // Server should see Headers
         let mut got_headers = false;
-        let mut header_stream = 0u32;
+        let mut header_stream = 0u64;
         while let Some(ev) = server.poll_event() {
             if let H2Event::Headers(sid) = ev {
                 got_headers = true;

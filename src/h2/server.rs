@@ -41,7 +41,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Read request headers.
     pub fn recv_headers<F: FnMut(&[u8], &[u8])>(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         emit: F,
     ) -> Result<(), Error> {
         self.inner.recv_headers(stream_id, emit)
@@ -50,7 +50,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Read request body.
     pub fn recv_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
@@ -59,7 +59,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Send response headers.
     pub fn send_response(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         status: u16,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
@@ -76,7 +76,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     /// Send response body.
     pub fn send_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {

@@ -104,7 +104,7 @@ fn drain_client_events(client: &mut TestH2Client) -> Vec<H2Event> {
 fn wait_for_server_headers(
     client: &mut TestH2Client,
     server: &mut TestH2Server,
-) -> u32 {
+) -> u64 {
     for _ in 0..10 {
         while let Some(ev) = server.poll_event() {
             if let H2Event::Headers(sid) = ev {
@@ -120,7 +120,7 @@ fn wait_for_server_headers(
 fn wait_for_client_headers(
     client: &mut TestH2Client,
     server: &mut TestH2Server,
-    expected_stream: u32,
+    expected_stream: u64,
 ) {
     for _ in 0..10 {
         while let Some(ev) = client.poll_event() {
@@ -340,7 +340,7 @@ fn h2_multiple_concurrent_streams() {
     );
 
     // Read paths from each stream.
-    let mut paths: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut paths: Vec<(u64, Vec<u8>)> = Vec::new();
     for &sid in &header_streams {
         let mut path = Vec::new();
         server

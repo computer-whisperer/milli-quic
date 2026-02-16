@@ -31,7 +31,7 @@ fn main() {
     // Drive the handshake first.
     let mut handshake_done = false;
     let mut request_sent = false;
-    let mut response_stream: Option<u32> = None;
+    let mut response_stream: Option<u64> = None;
 
     for _round in 0..100 {
         // Send pending output.

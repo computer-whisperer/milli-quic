@@ -67,7 +67,7 @@ fn run_h2(addr: &str) {
     let mut h2 = H2Client::<16, 65536>::new();
     let mut handshake_done = false;
     let mut request_sent = false;
-    let mut request_stream: Option<u32> = None;
+    let mut request_stream: Option<u64> = None;
 
     for _round in 0..200 {
         let mut out_buf = [0u8; 65535];

@@ -19,7 +19,7 @@ pub enum H2StreamState {
 /// - `DATABUF`: max bytes for buffered body data
 #[derive(Debug)]
 pub struct H2Stream<const HDRBUF: usize = 2048, const DATABUF: usize = 4096> {
-    pub id: u32,
+    pub id: u64,
     pub state: H2StreamState,
     pub send_window: i32,
     pub recv_window: i32,
@@ -32,7 +32,7 @@ pub struct H2Stream<const HDRBUF: usize = 2048, const DATABUF: usize = 4096> {
 }
 
 impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
-    pub fn new(id: u32, initial_send_window: i32, initial_recv_window: i32) -> Self {
+    pub fn new(id: u64, initial_send_window: i32, initial_recv_window: i32) -> Self {
         Self {
             id,
             state: H2StreamState::Idle,

@@ -47,7 +47,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         authority: &str,
         extra_headers: &[(&[u8], &[u8])],
         end_stream: bool,
-    ) -> Result<u32, Error> {
+    ) -> Result<u64, Error> {
         let mut headers: heapless::Vec<(&[u8], &[u8]), 20> = heapless::Vec::new();
         let _ = headers.push((b":method", method.as_bytes()));
         let _ = headers.push((b":path", path.as_bytes()));
@@ -61,7 +61,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Send body data on a stream.
     pub fn send_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
@@ -71,7 +71,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Read response headers.
     pub fn recv_headers<F: FnMut(&[u8], &[u8])>(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         emit: F,
     ) -> Result<(), Error> {
         self.inner.recv_headers(stream_id, emit)
@@ -80,7 +80,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     /// Read response body.
     pub fn recv_body(
         &mut self,
-        stream_id: u32,
+        stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
@@ -144,7 +144,7 @@ mod tests {
 
         // Server receives request
         let mut got_request = false;
-        let mut request_sid = 0u32;
+        let mut request_sid = 0u64;
         while let Some(ev) = server.poll_event() {
             if let Http1Event::Headers(stream_id) = ev {
                 got_request = true;

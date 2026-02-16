@@ -46,6 +46,9 @@ fn main() {
         // Process events.
         while let Some(event) = http1.poll_event() {
             match event {
+                Http1Event::Connected => {
+                    println!("[http1] connected");
+                }
                 Http1Event::Headers(sid) => {
                     println!("[http1] response headers:");
                     http1.recv_headers(sid, |name, value| {
@@ -65,7 +68,6 @@ fn main() {
                     println!("[done] request complete");
                     return;
                 }
-                _ => {}
             }
         }
 

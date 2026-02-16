@@ -40,7 +40,7 @@ pub struct H2FrameHeader {
     pub length: u32,     // 24-bit payload length
     pub frame_type: u8,
     pub flags: u8,
-    pub stream_id: u32,  // 31-bit (MSB reserved)
+    pub stream_id: u64,  // 31-bit on wire (MSB reserved), u64 for API consistency with H3
 }
 
 /// HTTP/2 stream priority weight/dependency.
@@ -55,23 +55,23 @@ pub struct H2Priority {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H2Frame<'a> {
     Data {
-        stream_id: u32,
+        stream_id: u64,
         payload: &'a [u8],
         end_stream: bool,
     },
     Headers {
-        stream_id: u32,
+        stream_id: u64,
         fragment: &'a [u8],
         end_stream: bool,
         end_headers: bool,
         priority: Option<H2Priority>,
     },
     Priority {
-        stream_id: u32,
+        stream_id: u64,
         priority: H2Priority,
     },
     RstStream {
-        stream_id: u32,
+        stream_id: u64,
         error_code: u32,
     },
     Settings {
@@ -79,8 +79,8 @@ pub enum H2Frame<'a> {
         params: &'a [u8],
     },
     PushPromise {
-        stream_id: u32,
-        promised_id: u32,
+        stream_id: u64,
+        promised_id: u64,
         fragment: &'a [u8],
         end_headers: bool,
     },
@@ -89,23 +89,23 @@ pub enum H2Frame<'a> {
         ack: bool,
     },
     GoAway {
-        last_stream_id: u32,
+        last_stream_id: u64,
         error_code: u32,
         debug: &'a [u8],
     },
     WindowUpdate {
-        stream_id: u32,
+        stream_id: u64,
         increment: u32,
     },
     Continuation {
-        stream_id: u32,
+        stream_id: u64,
         fragment: &'a [u8],
         end_headers: bool,
     },
     /// Unknown frame type — skip per RFC 9113 §4.1.
     Unknown {
         frame_type: u8,
-        stream_id: u32,
+        stream_id: u64,
         flags: u8,
         payload: &'a [u8],
     },
@@ -119,7 +119,7 @@ pub fn decode_frame_header(buf: &[u8]) -> Result<H2FrameHeader, Error> {
     let length = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | (buf[2] as u32);
     let frame_type = buf[3];
     let flags = buf[4];
-    let stream_id = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]);
+    let stream_id = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]) as u64;
     Ok(H2FrameHeader { length, frame_type, flags, stream_id })
 }
 
@@ -128,12 +128,15 @@ pub fn encode_frame_header(hdr: &H2FrameHeader, buf: &mut [u8]) -> Result<(), Er
     if buf.len() < 9 {
         return Err(Error::BufferTooSmall { needed: 9 });
     }
+    if hdr.stream_id > 0x7fff_ffff {
+        return Err(Error::InvalidState);
+    }
     buf[0] = ((hdr.length >> 16) & 0xff) as u8;
     buf[1] = ((hdr.length >> 8) & 0xff) as u8;
     buf[2] = (hdr.length & 0xff) as u8;
     buf[3] = hdr.frame_type;
     buf[4] = hdr.flags;
-    let id_bytes = hdr.stream_id.to_be_bytes();
+    let id_bytes = (hdr.stream_id as u32).to_be_bytes();
     buf[5] = id_bytes[0] & 0x7f; // Clear reserved bit
     buf[6] = id_bytes[1];
     buf[7] = id_bytes[2];
@@ -228,7 +231,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             if data.len() < 4 {
                 return Err(Error::BufferTooSmall { needed: 4 });
             }
-            let promised_id = u32::from_be_bytes([data[0] & 0x7f, data[1], data[2], data[3]]);
+            let promised_id = u32::from_be_bytes([data[0] & 0x7f, data[1], data[2], data[3]]) as u64;
             H2Frame::PushPromise {
                 stream_id: hdr.stream_id,
                 promised_id,
@@ -261,7 +264,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             }
             let last_stream_id = u32::from_be_bytes([
                 payload[0] & 0x7f, payload[1], payload[2], payload[3],
-            ]);
+            ]) as u64;
             let error_code = u32::from_be_bytes([
                 payload[4], payload[5], payload[6], payload[7],
             ]);
@@ -413,7 +416,7 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
                 return Err(Error::BufferTooSmall { needed: total });
             }
             encode_frame_header(&hdr, buf)?;
-            buf[9..13].copy_from_slice(&(promised_id & 0x7fff_ffff).to_be_bytes());
+            buf[9..13].copy_from_slice(&((*promised_id as u32) & 0x7fff_ffff).to_be_bytes());
             buf[13..total].copy_from_slice(fragment);
             Ok(total)
         }
@@ -445,7 +448,7 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
                 return Err(Error::BufferTooSmall { needed: total });
             }
             encode_frame_header(&hdr, buf)?;
-            buf[9..13].copy_from_slice(&(last_stream_id & 0x7fff_ffff).to_be_bytes());
+            buf[9..13].copy_from_slice(&((*last_stream_id as u32) & 0x7fff_ffff).to_be_bytes());
             buf[13..17].copy_from_slice(&error_code.to_be_bytes());
             buf[17..total].copy_from_slice(debug);
             Ok(total)
@@ -461,7 +464,7 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
                 return Err(Error::BufferTooSmall { needed: 13 });
             }
             encode_frame_header(&hdr, buf)?;
-            buf[9..13].copy_from_slice(&(increment & 0x7fff_ffff).to_be_bytes());
+            buf[9..13].copy_from_slice(&(*increment & 0x7fff_ffff).to_be_bytes());
             Ok(13)
         }
         H2Frame::Continuation { stream_id, fragment, end_headers } => {
