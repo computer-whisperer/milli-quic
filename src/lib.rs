@@ -28,6 +28,12 @@ pub mod http1;
 #[cfg(feature = "tcp-tls")]
 pub mod tcp_tls;
 
+#[cfg(all(feature = "tcp-tls", feature = "http1"))]
+pub mod https1;
+
+#[cfg(all(feature = "tcp-tls", feature = "h2"))]
+pub mod h2_tls;
+
 #[cfg(feature = "h3")]
 pub mod h3;
 

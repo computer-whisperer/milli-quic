@@ -446,7 +446,12 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     // Internal: output generation
     // ------------------------------------------------------------------
 
-    fn generate_output<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) {
+    /// Generate pending protocol frames (SETTINGS, WINDOW_UPDATE, etc.) into the I/O send buffer.
+    ///
+    /// This is automatically called by [`poll_output`]. Exposed publicly for
+    /// composed stacks (e.g. H2-over-TLS) where the send buffer feeds into
+    /// another layer rather than directly to the network.
+    pub fn generate_output<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) {
         if !self.preface_sent {
             if self.role == Role::Client {
                 let _ = io.queue_send(CONNECTION_PREFACE);
