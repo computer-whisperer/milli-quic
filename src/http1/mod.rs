@@ -5,9 +5,11 @@
 
 pub mod parse;
 pub mod connection;
+pub mod io;
 pub mod server;
 pub mod client;
 
 pub use connection::{Http1Connection, Http1Event};
+pub use io::{Http1Io, Http1IoBufs};
 pub use server::Http1Server;
 pub use client::Http1Client;

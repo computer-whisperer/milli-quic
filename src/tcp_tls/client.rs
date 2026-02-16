@@ -5,10 +5,12 @@ use crate::error::Error;
 use crate::tls::handshake::TlsConfig;
 
 use super::connection::{TlsConnection, TlsEvent};
+use super::io::TlsIoBufs;
 
-/// TLS client.
+/// TLS client — owns both the connection state and I/O buffers.
 pub struct TlsClient<C: CryptoProvider, const BUF: usize = 18432> {
-    inner: TlsConnection<C, BUF>,
+    inner: TlsConnection<C>,
+    io: TlsIoBufs<BUF>,
 }
 
 impl<C: CryptoProvider, const BUF: usize> TlsClient<C, BUF>
@@ -19,17 +21,18 @@ where
     pub fn new(provider: C, config: TlsConfig, secret: [u8; 32], random: [u8; 32]) -> Self {
         Self {
             inner: TlsConnection::new_client(provider, config, secret, random),
+            io: TlsIoBufs::new(),
         }
     }
 
     /// Feed received TCP data.
     pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.inner.feed_data(data)
+        self.inner.feed_data(&mut self.io.as_io(), data)
     }
 
     /// Pull outgoing data to send on TCP.
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        self.inner.poll_output(buf)
+        self.inner.poll_output(&mut self.io.as_io(), buf)
     }
 
     /// Poll for events.
@@ -39,12 +42,12 @@ where
 
     /// Read decrypted application data.
     pub fn recv_app_data(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        self.inner.recv_app_data(buf)
+        self.inner.recv_app_data(&mut self.io.as_io(), buf)
     }
 
     /// Send application data (will be encrypted).
     pub fn send_app_data(&mut self, data: &[u8]) -> Result<usize, Error> {
-        self.inner.send_app_data(data)
+        self.inner.send_app_data(&mut self.io.as_io(), data)
     }
 
     /// Get negotiated ALPN protocol.
@@ -64,6 +67,6 @@ where
 
     /// Initiate graceful close.
     pub fn close(&mut self) -> Result<(), Error> {
-        self.inner.close()
+        self.inner.close(&mut self.io.as_io())
     }
 }

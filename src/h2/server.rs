@@ -2,15 +2,17 @@
 
 use crate::error::Error;
 use super::connection::{H2Connection, H2Event};
+use super::io::H2IoBufs;
 
-/// HTTP/2 server.
+/// HTTP/2 server — owns both the connection state and I/O buffers.
 pub struct H2Server<
     const MAX_STREAMS: usize = 8,
     const BUF: usize = 16384,
     const HDRBUF: usize = 2048,
     const DATABUF: usize = 4096,
 > {
-    inner: H2Connection<MAX_STREAMS, BUF, HDRBUF, DATABUF>,
+    inner: H2Connection<MAX_STREAMS, HDRBUF, DATABUF>,
+    io: H2IoBufs<BUF>,
 }
 
 impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -20,17 +22,18 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     pub fn new() -> Self {
         Self {
             inner: H2Connection::new_server(),
+            io: H2IoBufs::new(),
         }
     }
 
     /// Feed received TCP data.
     pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.inner.feed_data(data)
+        self.inner.feed_data(&mut self.io.as_io(), data)
     }
 
     /// Pull outgoing data to send on TCP.
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        self.inner.poll_output(buf)
+        self.inner.poll_output(&mut self.io.as_io(), buf)
     }
 
     /// Poll for events.
@@ -53,7 +56,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
-        self.inner.recv_body(stream_id, buf)
+        self.inner.recv_body(&mut self.io.as_io(), stream_id, buf)
     }
 
     /// Send response headers.
@@ -74,7 +77,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         for &(name, value) in headers {
             let _ = all_headers.push((name, value));
         }
-        self.inner.send_headers(stream_id, &all_headers, end_stream)
+        self.inner.send_headers(&mut self.io.as_io(), stream_id, &all_headers, end_stream)
     }
 
     /// Send response body.
@@ -84,12 +87,12 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(stream_id, data, end_stream)
+        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Send GOAWAY.
     pub fn send_goaway(&mut self, error_code: u32) -> Result<(), Error> {
-        self.inner.send_goaway(error_code)
+        self.inner.send_goaway(&mut self.io.as_io(), error_code)
     }
 
     /// Configure timeouts. `now` is the current timestamp in microseconds.
@@ -104,12 +107,12 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 
     /// Check timeouts and emit events if they fire.
     pub fn handle_timeout(&mut self, now: u64) {
-        self.inner.handle_timeout(now);
+        self.inner.handle_timeout(&mut self.io.as_io(), now);
     }
 
     /// Feed data with timestamp tracking.
     pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
-        self.inner.feed_data_timed(data, now)
+        self.inner.feed_data_timed(&mut self.io.as_io(), data, now)
     }
 
     /// Whether the connection is closed.
@@ -143,9 +146,6 @@ mod tests {
     #[test]
     fn server_max_headers_succeeds() {
         let mut server = H2Server::<16, 16384>::new();
-        // Need a handshake first to get a valid stream
-        // But we can test the error path without one — send_response
-        // calls inner.send_headers which just queues output
         let hdrs: [(&[u8], &[u8]); 19] = [
             (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
             (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
@@ -153,7 +153,6 @@ mod tests {
             (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
             (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"),
         ];
-        // 1 pseudo + 19 user = 20, at the limit — should not return TooManyHeaders
         let result = server.send_response(1, 200, &hdrs, true);
         assert_ne!(result, Err(crate::error::Error::TooManyHeaders));
     }
@@ -168,7 +167,6 @@ mod tests {
             (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
             (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"), (b"h20", b"v"),
         ];
-        // 1 pseudo + 20 user = 21, over the limit
         let result = server.send_response(1, 200, &hdrs, true);
         assert_eq!(result, Err(crate::error::Error::TooManyHeaders));
     }

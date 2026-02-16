@@ -4,9 +4,11 @@
 
 pub mod record;
 pub mod connection;
+pub mod io;
 pub mod client;
 pub mod server;
 
 pub use connection::{TlsConnection, TlsEvent};
+pub use io::{TlsIo, TlsIoBufs};
 pub use client::TlsClient;
 pub use server::TlsServer;

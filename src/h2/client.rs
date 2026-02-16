@@ -2,15 +2,17 @@
 
 use crate::error::Error;
 use super::connection::{H2Connection, H2Event};
+use super::io::H2IoBufs;
 
-/// HTTP/2 client.
+/// HTTP/2 client — owns both the connection state and I/O buffers.
 pub struct H2Client<
     const MAX_STREAMS: usize = 8,
     const BUF: usize = 16384,
     const HDRBUF: usize = 2048,
     const DATABUF: usize = 4096,
 > {
-    inner: H2Connection<MAX_STREAMS, BUF, HDRBUF, DATABUF>,
+    inner: H2Connection<MAX_STREAMS, HDRBUF, DATABUF>,
+    io: H2IoBufs<BUF>,
 }
 
 impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -20,17 +22,18 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     pub fn new() -> Self {
         Self {
             inner: H2Connection::new_client(),
+            io: H2IoBufs::new(),
         }
     }
 
     /// Feed received TCP data.
     pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.inner.feed_data(data)
+        self.inner.feed_data(&mut self.io.as_io(), data)
     }
 
     /// Pull outgoing data to send on TCP.
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        self.inner.poll_output(buf)
+        self.inner.poll_output(&mut self.io.as_io(), buf)
     }
 
     /// Poll for events.
@@ -59,7 +62,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         for &(name, value) in extra_headers {
             let _ = headers.push((name, value));
         }
-        self.inner.open_stream(&headers, end_stream)
+        self.inner.open_stream(&mut self.io.as_io(), &headers, end_stream)
     }
 
     /// Send body data on a stream.
@@ -69,7 +72,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(stream_id, data, end_stream)
+        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Read response headers.
@@ -87,7 +90,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
-        self.inner.recv_body(stream_id, buf)
+        self.inner.recv_body(&mut self.io.as_io(), stream_id, buf)
     }
 
     /// Configure timeouts. `now` is the current timestamp in microseconds.
@@ -102,12 +105,12 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 
     /// Check timeouts and emit events if they fire.
     pub fn handle_timeout(&mut self, now: u64) {
-        self.inner.handle_timeout(now);
+        self.inner.handle_timeout(&mut self.io.as_io(), now);
     }
 
     /// Feed data with timestamp tracking.
     pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
-        self.inner.feed_data_timed(data, now)
+        self.inner.feed_data_timed(&mut self.io.as_io(), data, now)
     }
 
     /// Whether the connection is closed.
@@ -151,7 +154,6 @@ mod tests {
     #[test]
     fn client_max_headers_succeeds() {
         let mut client = H2Client::<16, 16384>::new();
-        // 4 pseudo + 16 user = 20, at the limit
         let hdrs: [(&[u8], &[u8]); 16] = [
             (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
             (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
@@ -165,7 +167,6 @@ mod tests {
     #[test]
     fn client_too_many_headers() {
         let mut client = H2Client::<16, 16384>::new();
-        // 4 pseudo + 17 user = 21, over the limit
         let hdrs: [(&[u8], &[u8]); 17] = [
             (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
             (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),

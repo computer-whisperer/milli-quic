@@ -2,14 +2,16 @@
 
 use crate::error::Error;
 use super::connection::{Http1Connection, Http1Event};
+use super::io::Http1IoBufs;
 
-/// HTTP/1.1 server.
+/// HTTP/1.1 server — owns both the connection state and I/O buffers.
 pub struct Http1Server<
     const BUF: usize = 8192,
     const HDRBUF: usize = 2048,
     const DATABUF: usize = 4096,
 > {
-    inner: Http1Connection<BUF, HDRBUF, DATABUF>,
+    inner: Http1Connection<HDRBUF, DATABUF>,
+    io: Http1IoBufs<BUF>,
 }
 
 impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -19,17 +21,18 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     pub fn new() -> Self {
         Self {
             inner: Http1Connection::new_server(),
+            io: Http1IoBufs::new(),
         }
     }
 
     /// Feed received TCP data.
     pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.inner.feed_data(data)
+        self.inner.feed_data(&mut self.io.as_io(), data)
     }
 
     /// Pull outgoing data to send on TCP.
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        self.inner.poll_output(buf)
+        self.inner.poll_output(&mut self.io.as_io(), buf)
     }
 
     /// Poll for events.
@@ -76,7 +79,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         for &(name, value) in headers {
             let _ = all_headers.push((name, value));
         }
-        self.inner.send_headers(stream_id, &all_headers, end_stream)
+        self.inner.send_headers(&mut self.io.as_io(), stream_id, &all_headers, end_stream)
     }
 
     /// Send response body data.
@@ -86,7 +89,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(stream_id, data, end_stream)
+        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Configure timeouts. `now` is the current timestamp in microseconds.
@@ -106,7 +109,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
 
     /// Feed data with timestamp tracking.
     pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
-        self.inner.feed_data_timed(data, now)
+        self.inner.feed_data_timed(&mut self.io.as_io(), data, now)
     }
 
     /// Whether the connection is closed.

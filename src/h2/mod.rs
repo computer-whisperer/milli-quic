@@ -7,10 +7,12 @@ pub mod frame;
 pub mod stream;
 pub mod flow_control;
 pub mod connection;
+pub mod io;
 pub mod server;
 pub mod client;
 
 pub use connection::{H2Connection, H2Event, H2Settings};
 pub use frame::{H2Frame, H2FrameHeader, H2Priority};
+pub use io::{H2Io, H2IoBufs};
 pub use server::H2Server;
 pub use client::H2Client;

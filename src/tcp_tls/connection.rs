@@ -9,6 +9,7 @@ use crate::error::Error;
 use crate::tls::handshake::{TlsConfig, ServerTlsConfig, TlsEngine};
 use crate::tls::{DerivedKeys, TlsSession};
 
+use super::io::TlsIo;
 use super::record::{self, ContentType, RECORD_HEADER_LEN};
 
 /// Events produced by TlsConnection.
@@ -46,23 +47,15 @@ struct DirectionalRecordKeys<A: Aead> {
 /// TLS 1.3 connection state machine.
 ///
 /// `C`: CryptoProvider implementation.
-/// `BUF`: internal buffer size (should be >= 18432 for one max-size TLS record + header).
-pub struct TlsConnection<C: CryptoProvider, const BUF: usize = 18432> {
+///
+/// I/O buffers are **not** owned by this struct; callers provide them via
+/// [`TlsIo`] on every method that touches network or application data.
+pub struct TlsConnection<C: CryptoProvider> {
     provider: C,
     engine: TlsEngine<C>,
     state: ConnState,
 
-    // Raw TCP data received
-    recv_buf: Buf<BUF>,
-    // Data to send on TCP
-    send_buf: Buf<BUF>,
     send_offset: usize,
-
-    // Decrypted application data buffer
-    app_recv_buf: Buf<BUF>,
-
-    // Application data to encrypt and send
-    app_send_buf: Buf<BUF>,
 
     // AEAD keys for handshake traffic
     hs_send: Option<DirectionalRecordKeys<C::Aead>>,
@@ -88,7 +81,7 @@ pub struct TlsConnection<C: CryptoProvider, const BUF: usize = 18432> {
     ccs_sent: bool,
 }
 
-impl<C: CryptoProvider, const BUF: usize> TlsConnection<C, BUF>
+impl<C: CryptoProvider> TlsConnection<C>
 where
     C::Hkdf: Default,
 {
@@ -109,11 +102,7 @@ where
             provider,
             engine,
             state: ConnState::Handshake,
-            recv_buf: Buf::new(),
-            send_buf: Buf::new(),
             send_offset: 0,
-            app_recv_buf: Buf::new(),
-            app_send_buf: Buf::new(),
             hs_send: None,
             hs_recv: None,
             app_send: None,
@@ -129,32 +118,32 @@ where
     }
 
     /// Feed raw TCP data into the connection.
-    pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.recv_buf.len() + data.len() > BUF {
+    pub fn feed_data<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, data: &[u8]) -> Result<(), Error> {
+        if io.recv_buf.len() + data.len() > BUF {
             return Err(Error::BufferTooSmall {
-                needed: self.recv_buf.len() + data.len(),
+                needed: io.recv_buf.len() + data.len(),
             });
         }
-        let _ = self.recv_buf.extend_from_slice(data);
-        self.process_recv()
+        let _ = io.recv_buf.extend_from_slice(data);
+        self.process_recv(io)
     }
 
     /// Pull the next chunk of outgoing TCP data.
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        self.flush_engine_output();
-        self.flush_app_send();
+    pub fn poll_output<'a, const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        self.flush_engine_output(io);
+        self.flush_app_send(io);
 
-        if self.send_offset >= self.send_buf.len() {
+        if self.send_offset >= io.send_buf.len() {
             return None;
         }
 
-        let avail = self.send_buf.len() - self.send_offset;
+        let avail = io.send_buf.len() - self.send_offset;
         let n = avail.min(buf.len());
-        buf[..n].copy_from_slice(&self.send_buf[self.send_offset..self.send_offset + n]);
+        buf[..n].copy_from_slice(&io.send_buf[self.send_offset..self.send_offset + n]);
         self.send_offset += n;
 
-        if self.send_offset >= self.send_buf.len() {
-            self.send_buf.clear();
+        if self.send_offset >= io.send_buf.len() {
+            io.send_buf.clear();
             self.send_offset = 0;
         }
 
@@ -167,29 +156,29 @@ where
     }
 
     /// Read decrypted application data.
-    pub fn recv_app_data(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        if self.app_recv_buf.is_empty() {
+    pub fn recv_app_data<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, buf: &mut [u8]) -> Result<usize, Error> {
+        if io.app_recv_buf.is_empty() {
             return Err(Error::WouldBlock);
         }
-        let n = self.app_recv_buf.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.app_recv_buf[..n]);
+        let n = io.app_recv_buf.len().min(buf.len());
+        buf[..n].copy_from_slice(&io.app_recv_buf[..n]);
 
-        self.app_recv_buf.copy_within(n.., 0);
-        self.app_recv_buf.truncate(self.app_recv_buf.len() - n);
+        io.app_recv_buf.copy_within(n.., 0);
+        io.app_recv_buf.truncate(io.app_recv_buf.len() - n);
         Ok(n)
     }
 
     /// Queue application data for encryption and sending.
-    pub fn send_app_data(&mut self, data: &[u8]) -> Result<usize, Error> {
+    pub fn send_app_data<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, data: &[u8]) -> Result<usize, Error> {
         if self.state != ConnState::Active {
             return Err(Error::InvalidState);
         }
-        if self.app_send_buf.len() + data.len() > BUF {
+        if io.app_send_buf.len() + data.len() > BUF {
             return Err(Error::BufferTooSmall {
-                needed: self.app_send_buf.len() + data.len(),
+                needed: io.app_send_buf.len() + data.len(),
             });
         }
-        let _ = self.app_send_buf.extend_from_slice(data);
+        let _ = io.app_send_buf.extend_from_slice(data);
         Ok(data.len())
     }
 
@@ -209,11 +198,11 @@ where
     }
 
     /// Initiate a graceful close (send close_notify).
-    pub fn close(&mut self) -> Result<(), Error> {
+    pub fn close<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>) -> Result<(), Error> {
         if self.state == ConnState::Closed || self.state == ConnState::Closing {
             return Ok(());
         }
-        self.send_alert(1, 0)?; // warning(1) close_notify(0)
+        self.send_alert(io, 1, 0)?; // warning(1) close_notify(0)
         self.state = ConnState::Closing;
         Ok(())
     }
@@ -222,33 +211,28 @@ where
     // Internal: processing received data
     // ------------------------------------------------------------------
 
-    /// Process received TLS records directly in `recv_buf` using field-level
-    /// borrows, avoiding the previous 18 KiB stack temporary.
-    fn process_recv(&mut self) -> Result<(), Error> {
+    /// Process received TLS records from `io.recv_buf`.
+    fn process_recv<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>) -> Result<(), Error> {
         loop {
-            if self.recv_buf.len() < RECORD_HEADER_LEN {
+            if io.recv_buf.len() < RECORD_HEADER_LEN {
                 return Ok(());
             }
 
-            let hdr = record::decode_record_header(&self.recv_buf[..RECORD_HEADER_LEN])?;
+            let hdr = record::decode_record_header(&io.recv_buf[..RECORD_HEADER_LEN])?;
             let total = RECORD_HEADER_LEN + hdr.length as usize;
 
-            if self.recv_buf.len() < total {
+            if io.recv_buf.len() < total {
                 return Ok(());
             }
 
-            // Save 5-byte header for AAD (tiny stack alloc)
             let header_bytes: [u8; 5] = [
-                self.recv_buf[0], self.recv_buf[1], self.recv_buf[2],
-                self.recv_buf[3], self.recv_buf[4],
+                io.recv_buf[0], io.recv_buf[1], io.recv_buf[2],
+                io.recv_buf[3], io.recv_buf[4],
             ];
             let payload_len = hdr.length as usize;
             let ct = hdr.content_type;
-            let ps = RECORD_HEADER_LEN; // payload start
+            let ps = RECORD_HEADER_LEN;
 
-            // Process the record in-place using field-level borrows.
-            // Each arm accesses disjoint fields of `self` so the borrow
-            // checker can verify safety without a copy to a stack temp.
             let mut need_check_keys = false;
 
             match self.state {
@@ -257,15 +241,15 @@ where
                         ContentType::Handshake => {
                             self.engine.read_handshake(
                                 Level::Initial,
-                                &self.recv_buf[ps..ps + payload_len],
+                                &io.recv_buf[ps..ps + payload_len],
                             ).map_err(|_| Error::Tls)?;
                             need_check_keys = true;
                         }
                         ContentType::ChangeCipherSpec => {}
                         ContentType::Alert => {
                             if payload_len < 2 { return Err(Error::Tls); }
-                            let desc = self.recv_buf[ps + 1];
-                            self.drain_recv(total);
+                            let desc = io.recv_buf[ps + 1];
+                            io.drain_recv(total);
                             return self.handle_alert_desc(desc);
                         }
                         _ => return Err(Error::Tls),
@@ -274,31 +258,29 @@ where
                 ConnState::HandshakeEncrypted => {
                     match ct {
                         ContentType::ApplicationData => {
-                            // Decrypt in-place within recv_buf (field borrows:
-                            // &self.hs_recv for keys, &mut self.recv_buf for payload).
                             let keys = self.hs_recv.as_ref().ok_or(Error::Tls)?;
                             let nonce = record::build_nonce(&keys.iv, self.hs_recv_seq);
                             self.hs_recv_seq += 1;
                             let plain_len = keys.aead.open_in_place(
                                 &nonce, &header_bytes,
-                                &mut self.recv_buf[ps..ps + payload_len],
+                                &mut io.recv_buf[ps..ps + payload_len],
                                 payload_len,
                             )?;
                             let (data_len, inner_ct) = find_inner_content_type(
-                                &self.recv_buf[ps..ps + plain_len],
+                                &io.recv_buf[ps..ps + plain_len],
                             )?;
                             match inner_ct {
                                 ContentType::Handshake => {
                                     self.engine.read_handshake(
                                         Level::Handshake,
-                                        &self.recv_buf[ps..ps + data_len],
+                                        &io.recv_buf[ps..ps + data_len],
                                     ).map_err(|_| Error::Tls)?;
                                     need_check_keys = true;
                                 }
                                 ContentType::Alert => {
                                     if data_len < 2 { return Err(Error::Tls); }
-                                    let desc = self.recv_buf[ps + 1];
-                                    self.drain_recv(total);
+                                    let desc = io.recv_buf[ps + 1];
+                                    io.drain_recv(total);
                                     return self.handle_alert_desc(desc);
                                 }
                                 _ => return Err(Error::Tls),
@@ -308,7 +290,7 @@ where
                         ContentType::Handshake => {
                             self.engine.read_handshake(
                                 Level::Initial,
-                                &self.recv_buf[ps..ps + payload_len],
+                                &io.recv_buf[ps..ps + payload_len],
                             ).map_err(|_| Error::Tls)?;
                             need_check_keys = true;
                         }
@@ -318,37 +300,33 @@ where
                 ConnState::Active => {
                     match ct {
                         ContentType::ApplicationData => {
-                            // Decrypt in-place (field borrows: &self.app_recv
-                            // for keys, &mut self.recv_buf for payload).
                             let keys = self.app_recv.as_ref().ok_or(Error::Tls)?;
                             let nonce = record::build_nonce(&keys.iv, self.recv_seq);
                             self.recv_seq += 1;
                             let plain_len = keys.aead.open_in_place(
                                 &nonce, &header_bytes,
-                                &mut self.recv_buf[ps..ps + payload_len],
+                                &mut io.recv_buf[ps..ps + payload_len],
                                 payload_len,
                             )?;
                             let (data_len, inner_ct) = find_inner_content_type(
-                                &self.recv_buf[ps..ps + plain_len],
+                                &io.recv_buf[ps..ps + plain_len],
                             )?;
                             match inner_ct {
                                 ContentType::ApplicationData => {
-                                    if self.app_recv_buf.len() + data_len > BUF {
+                                    if io.app_recv_buf.len() + data_len > BUF {
                                         return Err(Error::BufferTooSmall {
-                                            needed: self.app_recv_buf.len() + data_len,
+                                            needed: io.app_recv_buf.len() + data_len,
                                         });
                                     }
-                                    // Copy decrypted plaintext directly from recv_buf
-                                    // to app_recv_buf (disjoint fields).
-                                    let _ = self.app_recv_buf.extend_from_slice(
-                                        &self.recv_buf[ps..ps + data_len],
+                                    let _ = io.app_recv_buf.extend_from_slice(
+                                        &io.recv_buf[ps..ps + data_len],
                                     );
                                     let _ = self.events.push_back(TlsEvent::AppData);
                                 }
                                 ContentType::Alert => {
                                     if data_len < 2 { return Err(Error::Tls); }
-                                    let desc = self.recv_buf[ps + 1];
-                                    self.drain_recv(total);
+                                    let desc = io.recv_buf[ps + 1];
+                                    io.drain_recv(total);
                                     return self.handle_alert_desc(desc);
                                 }
                                 ContentType::Handshake => {} // Post-handshake
@@ -362,8 +340,7 @@ where
                 ConnState::Closing | ConnState::Closed => {}
             }
 
-            // Drain consumed record from recv_buf
-            self.drain_recv(total);
+            io.drain_recv(total);
 
             if need_check_keys {
                 self.check_keys()?;
@@ -371,7 +348,6 @@ where
         }
     }
 
-    /// Handle an alert given only the description byte (level is unused in TLS 1.3).
     fn handle_alert_desc(&mut self, desc: u8) -> Result<(), Error> {
         if desc == 0 {
             self.state = ConnState::Closing;
@@ -383,21 +359,16 @@ where
         }
     }
 
-    fn drain_recv(&mut self, n: usize) {
-        self.recv_buf.copy_within(n.., 0);
-        self.recv_buf.truncate(self.recv_buf.len() - n);
-    }
-
-    fn send_alert(&mut self, level: u8, desc: u8) -> Result<(), Error> {
+    fn send_alert<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, level: u8, desc: u8) -> Result<(), Error> {
         let alert_data = [level, desc];
         if self.state == ConnState::Active {
-            self.encrypt_and_send(&alert_data, ContentType::Alert, false)
+            self.encrypt_and_send(io, &alert_data, ContentType::Alert, false)
         } else {
             let mut buf = [0u8; 16];
             let n = record::encode_record_header(ContentType::Alert, 2, &mut buf)?;
             buf[n] = level;
             buf[n + 1] = desc;
-            self.queue_send(&buf[..n + 2])
+            io.queue_send(&buf[..n + 2])
         }
     }
 
@@ -471,7 +442,7 @@ where
     // Internal: output generation
     // ------------------------------------------------------------------
 
-    fn flush_engine_output(&mut self) {
+    fn flush_engine_output<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>) {
         if !self.engine_output_pending {
             return;
         }
@@ -488,7 +459,7 @@ where
 
             match level {
                 Level::Initial => {
-                    let _ = self.wrap_plaintext_record(ContentType::Handshake, &buf[..n]);
+                    let _ = self.wrap_plaintext_record(io, ContentType::Handshake, &buf[..n]);
                 }
                 Level::Handshake => {
                     if !self.ccs_sent {
@@ -496,10 +467,10 @@ where
                             ContentType::ChangeCipherSpec as u8,
                             0x03, 0x03, 0x00, 0x01, 0x01,
                         ];
-                        let _ = self.queue_send(&ccs);
+                        let _ = io.queue_send(&ccs);
                         self.ccs_sent = true;
                     }
-                    let _ = self.encrypt_and_send(&buf[..n], ContentType::Handshake, true);
+                    let _ = self.encrypt_and_send(io, &buf[..n], ContentType::Handshake, true);
                 }
                 _ => {}
             }
@@ -509,15 +480,13 @@ where
         self.engine_output_pending = false;
     }
 
-    /// Encrypt pending application data directly from `app_send_buf` into
-    /// `send_buf` using field-level borrows (no 16 KiB stack temp).
-    fn flush_app_send(&mut self) {
-        if self.app_send_buf.is_empty() || self.state != ConnState::Active {
+    fn flush_app_send<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>) {
+        if io.app_send_buf.is_empty() || self.state != ConnState::Active {
             return;
         }
 
-        while !self.app_send_buf.is_empty() {
-            let chunk_len = self.app_send_buf.len().min(16384);
+        while !io.app_send_buf.is_empty() {
+            let chunk_len = io.app_send_buf.len().min(16384);
             let keys = match self.app_send.as_ref() {
                 Some(k) => k,
                 None => break,
@@ -525,37 +494,31 @@ where
             let nonce = record::build_nonce(&keys.iv, self.send_seq);
             self.send_seq += 1;
 
-            // Field-level borrows: &self.app_send_buf (shared data),
-            // &keys.aead via &self.app_send (shared), &mut self.send_buf (mutable output).
             if encrypt_into::<C::Aead, BUF>(
-                &self.app_send_buf[..chunk_len],
+                &io.app_send_buf[..chunk_len],
                 ContentType::ApplicationData,
                 &keys.aead,
                 &nonce,
-                &mut self.send_buf,
+                io.send_buf,
             ).is_err() {
                 break;
             }
 
-            self.app_send_buf.copy_within(chunk_len.., 0);
-            self.app_send_buf.truncate(self.app_send_buf.len() - chunk_len);
+            io.app_send_buf.copy_within(chunk_len.., 0);
+            io.app_send_buf.truncate(io.app_send_buf.len() - chunk_len);
         }
     }
 
-    fn wrap_plaintext_record(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
+    fn wrap_plaintext_record<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, ct: ContentType, data: &[u8]) -> Result<(), Error> {
         let mut header = [0u8; 5];
         record::encode_record_header(ct, data.len() as u16, &mut header)?;
-        self.queue_send(&header)?;
-        self.queue_send(data)
+        io.queue_send(&header)?;
+        io.queue_send(data)
     }
 
-    /// Encrypt a TLS record and append it to `send_buf`.
-    ///
-    /// For calls from `flush_engine_output` and `send_alert` where the data is
-    /// in a local variable (not a self field). Uses the `encrypt_into` free
-    /// function to write directly into `send_buf` — no 16 KiB stack temp.
-    fn encrypt_and_send(
+    fn encrypt_and_send<const BUF: usize>(
         &mut self,
+        io: &mut TlsIo<'_, BUF>,
         data: &[u8],
         inner_ct: ContentType,
         use_hs_keys: bool,
@@ -564,23 +527,13 @@ where
             let keys = self.hs_send.as_ref().ok_or(Error::Tls)?;
             let nonce = record::build_nonce(&keys.iv, self.hs_send_seq);
             self.hs_send_seq += 1;
-            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, &mut self.send_buf)
+            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, io.send_buf)
         } else {
             let keys = self.app_send.as_ref().ok_or(Error::Tls)?;
             let nonce = record::build_nonce(&keys.iv, self.send_seq);
             self.send_seq += 1;
-            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, &mut self.send_buf)
+            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, io.send_buf)
         }
-    }
-
-    fn queue_send(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.send_buf.len() + data.len() > BUF {
-            return Err(Error::BufferTooSmall {
-                needed: self.send_buf.len() + data.len(),
-            });
-        }
-        let _ = self.send_buf.extend_from_slice(data);
-        Ok(())
     }
 }
 
@@ -648,12 +601,13 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+    use super::super::io::TlsIoBufs;
     use crate::crypto::rustcrypto::Aes128GcmProvider;
     use crate::tls::handshake::{TlsConfig, ServerTlsConfig};
     use crate::tls::TransportParams;
 
-    type TestClient = TlsConnection<Aes128GcmProvider, 32768>;
-    type TestServer = TlsConnection<Aes128GcmProvider, 32768>;
+    type TestConn = TlsConnection<Aes128GcmProvider>;
+    type TestIo = TlsIoBufs<32768>;
 
     const TEST_SEED: [u8; 32] = [0x01u8; 32];
 
@@ -664,61 +618,48 @@ mod tests {
         buf[..len].to_vec()
     }
 
-    fn make_client() -> TestClient {
+    fn make_client() -> TestConn {
         let config = TlsConfig {
             server_name: heapless::String::try_from("test.local").unwrap(),
             alpn_protocols: &[b"h2"],
             transport_params: TransportParams::default_params(),
             pinned_certs: &[],
         };
-        TestClient::new_client(Aes128GcmProvider, config, [0xAA; 32], [0xBB; 32])
+        TestConn::new_client(Aes128GcmProvider, config, [0xAA; 32], [0xBB; 32])
     }
 
-    fn make_server(cert: &'static [u8]) -> TestServer {
+    fn make_server(cert: &'static [u8]) -> TestConn {
         let config = ServerTlsConfig {
             cert_der: cert,
             private_key_der: &TEST_SEED,
             alpn_protocols: &[b"h2"],
             transport_params: TransportParams::default_params(),
         };
-        TestServer::new_server(Aes128GcmProvider, config, [0xCC; 32], [0xDD; 32])
+        TestConn::new_server(Aes128GcmProvider, config, [0xCC; 32], [0xDD; 32])
     }
 
-    /// Transfer all pending output from src to dst.
-    fn transfer(src: &mut TestClient, dst: &mut TestServer) -> bool {
+    fn transfer(src: &mut TestConn, sio: &mut TestIo, dst: &mut TestConn, dio: &mut TestIo) -> bool {
         let mut any = false;
         let mut buf = [0u8; 32768];
-        while let Some(data) = src.poll_output(&mut buf) {
+        while let Some(data) = src.poll_output(&mut sio.as_io(), &mut buf) {
             let copy = data.to_vec();
-            dst.feed_data(&copy).unwrap();
+            dst.feed_data(&mut dio.as_io(), &copy).unwrap();
             any = true;
         }
         any
     }
 
-    fn transfer_rev(src: &mut TestServer, dst: &mut TestClient) -> bool {
-        let mut any = false;
-        let mut buf = [0u8; 32768];
-        while let Some(data) = src.poll_output(&mut buf) {
-            let copy = data.to_vec();
-            dst.feed_data(&copy).unwrap();
-            any = true;
-        }
-        any
-    }
-
-    /// Run the handshake to completion by exchanging data back and forth.
-    fn handshake(client: &mut TestClient, server: &mut TestServer) {
+    fn handshake(client: &mut TestConn, cio: &mut TestIo, server: &mut TestConn, sio: &mut TestIo) {
         for _ in 0..20 {
-            let a = transfer(client, server);
-            let b = transfer_rev(server, client);
+            let a = transfer(client, cio, server, sio);
+            let b = transfer(server, sio, client, cio);
             if !a && !b {
                 break;
             }
         }
     }
 
-    fn drain_events_client(c: &mut TestClient) -> Vec<TlsEvent> {
+    fn drain_events(c: &mut TestConn) -> Vec<TlsEvent> {
         let mut events = Vec::new();
         while let Some(ev) = c.poll_event() {
             events.push(ev);
@@ -726,28 +667,21 @@ mod tests {
         events
     }
 
-    fn drain_events_server(s: &mut TestServer) -> Vec<TlsEvent> {
-        let mut events = Vec::new();
-        while let Some(ev) = s.poll_event() {
-            events.push(ev);
-        }
-        events
-    }
-
     #[test]
     fn handshake_completes() {
-        // We need a 'static cert_der reference. Use a leaked allocation for test.
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
         assert!(!client.is_active());
         assert!(!server.is_active());
 
-        handshake(&mut client, &mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        let client_events = drain_events_client(&mut client);
-        let server_events = drain_events_server(&mut server);
+        let client_events = drain_events(&mut client);
+        let server_events = drain_events(&mut server);
 
         assert!(
             client_events.contains(&TlsEvent::HandshakeComplete),
@@ -768,33 +702,31 @@ mod tests {
     fn app_data_roundtrip() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        // Drain handshake events
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        client.send_app_data(&mut cio.as_io(), b"Hello from client").unwrap();
+        transfer(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Client sends data
-        client.send_app_data(b"Hello from client").unwrap();
-        transfer(&mut client, &mut server);
-
-        let server_events = drain_events_server(&mut server);
+        let server_events = drain_events(&mut server);
         assert!(server_events.contains(&TlsEvent::AppData));
 
         let mut recv_buf = [0u8; 256];
-        let n = server.recv_app_data(&mut recv_buf).unwrap();
+        let n = server.recv_app_data(&mut sio.as_io(), &mut recv_buf).unwrap();
         assert_eq!(&recv_buf[..n], b"Hello from client");
 
-        // Server sends data back
-        server.send_app_data(b"Hello from server").unwrap();
-        transfer_rev(&mut server, &mut client);
+        server.send_app_data(&mut sio.as_io(), b"Hello from server").unwrap();
+        transfer(&mut server, &mut sio, &mut client, &mut cio);
 
-        let client_events = drain_events_client(&mut client);
+        let client_events = drain_events(&mut client);
         assert!(client_events.contains(&TlsEvent::AppData));
 
-        let n = client.recv_app_data(&mut recv_buf).unwrap();
+        let n = client.recv_app_data(&mut cio.as_io(), &mut recv_buf).unwrap();
         assert_eq!(&recv_buf[..n], b"Hello from server");
     }
 
@@ -802,11 +734,13 @@ mod tests {
     fn alpn_negotiation() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
         assert_eq!(client.alpn(), Some(b"h2".as_slice()));
         assert_eq!(server.alpn(), Some(b"h2".as_slice()));
@@ -818,7 +752,6 @@ mod tests {
         let client = make_client();
         let _server = make_server(cert);
 
-        // Client should not be active before handshake
         assert!(!client.is_active());
     }
 
@@ -826,20 +759,20 @@ mod tests {
     fn graceful_close() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        // Client initiates close
-        client.close().unwrap();
+        client.close(&mut cio.as_io()).unwrap();
         assert!(client.is_closed());
 
-        // Transfer close_notify to server
-        transfer(&mut client, &mut server);
+        transfer(&mut client, &mut cio, &mut server, &mut sio);
 
-        let server_events = drain_events_server(&mut server);
+        let server_events = drain_events(&mut server);
         assert!(
             server_events.contains(&TlsEvent::PeerClosed),
             "server should see PeerClosed, got: {:?}",
@@ -851,23 +784,23 @@ mod tests {
     fn multiple_app_data_messages() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        // Send multiple messages
         for i in 0..5u8 {
             let msg = [b'A' + i; 100];
-            client.send_app_data(&msg).unwrap();
+            client.send_app_data(&mut cio.as_io(), &msg).unwrap();
         }
 
-        transfer(&mut client, &mut server);
+        transfer(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Server should receive all data
         let mut recv_buf = [0u8; 1024];
-        let n = server.recv_app_data(&mut recv_buf).unwrap();
+        let n = server.recv_app_data(&mut sio.as_io(), &mut recv_buf).unwrap();
         assert_eq!(n, 500);
     }
 
@@ -875,9 +808,10 @@ mod tests {
     fn send_app_data_before_handshake_returns_error() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let _server = make_server(cert);
 
-        let result = client.send_app_data(b"too early");
+        let result = client.send_app_data(&mut cio.as_io(), b"too early");
         assert!(result.is_err());
     }
 
@@ -885,14 +819,16 @@ mod tests {
     fn recv_app_data_when_empty_returns_would_block() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
         let mut buf = [0u8; 64];
-        let result = server.recv_app_data(&mut buf);
+        let result = server.recv_app_data(&mut sio.as_io(), &mut buf);
         assert!(result.is_err());
     }
 
@@ -900,24 +836,23 @@ mod tests {
     fn fragmented_feed_data() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        // Do the handshake but feed server data one byte at a time
         for _ in 0..20 {
-            // Client → Server: feed byte-by-byte
             let mut buf = [0u8; 32768];
-            while let Some(data) = client.poll_output(&mut buf) {
+            while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
                 let copy = data.to_vec();
                 for byte in &copy {
-                    server.feed_data(core::slice::from_ref(byte)).unwrap();
+                    server.feed_data(&mut sio.as_io(), core::slice::from_ref(byte)).unwrap();
                 }
             }
-            // Server → Client: feed byte-by-byte
             let mut buf2 = [0u8; 32768];
-            while let Some(data) = server.poll_output(&mut buf2) {
+            while let Some(data) = server.poll_output(&mut sio.as_io(), &mut buf2) {
                 let copy = data.to_vec();
                 for byte in &copy {
-                    client.feed_data(core::slice::from_ref(byte)).unwrap();
+                    client.feed_data(&mut cio.as_io(), core::slice::from_ref(byte)).unwrap();
                 }
             }
             if client.is_active() && server.is_active() {
@@ -928,24 +863,23 @@ mod tests {
         assert!(client.is_active(), "handshake should complete with fragmented data");
         assert!(server.is_active());
 
-        // Now send app data fragmented too
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        client.send_app_data(b"fragmented test").unwrap();
+        client.send_app_data(&mut cio.as_io(), b"fragmented test").unwrap();
         let mut buf = [0u8; 32768];
-        while let Some(data) = client.poll_output(&mut buf) {
+        while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
             let copy = data.to_vec();
             for byte in &copy {
-                server.feed_data(core::slice::from_ref(byte)).unwrap();
+                server.feed_data(&mut sio.as_io(), core::slice::from_ref(byte)).unwrap();
             }
         }
 
-        let events = drain_events_server(&mut server);
+        let events = drain_events(&mut server);
         assert!(events.contains(&TlsEvent::AppData));
 
         let mut recv = [0u8; 64];
-        let n = server.recv_app_data(&mut recv).unwrap();
+        let n = server.recv_app_data(&mut sio.as_io(), &mut recv).unwrap();
         assert_eq!(&recv[..n], b"fragmented test");
     }
 
@@ -953,18 +887,20 @@ mod tests {
     fn server_initiated_close() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        server.close().unwrap();
+        server.close(&mut sio.as_io()).unwrap();
         assert!(server.is_closed());
 
-        transfer_rev(&mut server, &mut client);
+        transfer(&mut server, &mut sio, &mut client, &mut cio);
 
-        let client_events = drain_events_client(&mut client);
+        let client_events = drain_events(&mut client);
         assert!(
             client_events.contains(&TlsEvent::PeerClosed),
             "client should see PeerClosed, got: {:?}",
@@ -976,22 +912,23 @@ mod tests {
     fn large_payload_near_record_limit() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        // Send 16000 bytes (near the 16384 TLS record limit)
         let big_data = [0x42u8; 16000];
-        client.send_app_data(&big_data).unwrap();
-        transfer(&mut client, &mut server);
+        client.send_app_data(&mut cio.as_io(), &big_data).unwrap();
+        transfer(&mut client, &mut cio, &mut server, &mut sio);
 
-        let events = drain_events_server(&mut server);
+        let events = drain_events(&mut server);
         assert!(events.contains(&TlsEvent::AppData));
 
         let mut recv = [0u8; 16384];
-        let n = server.recv_app_data(&mut recv).unwrap();
+        let n = server.recv_app_data(&mut sio.as_io(), &mut recv).unwrap();
         assert_eq!(n, 16000);
         assert!(recv[..n].iter().all(|&b| b == 0x42));
     }
@@ -1000,22 +937,20 @@ mod tests {
     fn data_after_close_ignored() {
         let cert = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        // Close and transfer close_notify
-        client.close().unwrap();
-        transfer(&mut client, &mut server);
-        drain_events_server(&mut server);
+        client.close(&mut cio.as_io()).unwrap();
+        transfer(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut server);
 
-        // Server trying to send after receiving close_notify should still work
-        // (it's half-closed), but the closed side shouldn't produce new data
         assert!(client.is_closed());
-        // close() again is idempotent
-        client.close().unwrap();
+        client.close(&mut cio.as_io()).unwrap();
     }
 
     #[test]
@@ -1043,7 +978,6 @@ mod tests {
         let mut server: TlsServer<Aes128GcmProvider, 32768> =
             TlsServer::new(Aes128GcmProvider, server_config, [0xCC; 32], [0xDD; 32]);
 
-        // Handshake
         for _ in 0..20 {
             let mut any = false;
             let mut buf = [0u8; 32768];
@@ -1065,7 +999,6 @@ mod tests {
         assert!(server.is_active());
         assert_eq!(client.alpn(), Some(b"h2".as_slice()));
 
-        // App data through wrappers
         client.send_app_data(b"wrapper test").unwrap();
         let mut buf = [0u8; 32768];
         while let Some(data) = client.poll_output(&mut buf) {
@@ -1080,7 +1013,6 @@ mod tests {
 
     #[test]
     fn find_inner_content_type_basic() {
-        // ApplicationData byte at the end
         let data = [0x41, 0x42, 0x43, ContentType::ApplicationData as u8];
         let (len, ct) = find_inner_content_type(&data).unwrap();
         assert_eq!(len, 3);
@@ -1089,7 +1021,6 @@ mod tests {
 
     #[test]
     fn find_inner_content_type_with_padding() {
-        // Data + CT byte + zero padding
         let data = [0x41, ContentType::Handshake as u8, 0x00, 0x00];
         let (len, ct) = find_inner_content_type(&data).unwrap();
         assert_eq!(len, 1);
@@ -1098,25 +1029,21 @@ mod tests {
 
     #[test]
     fn find_inner_content_type_empty() {
-        let data = [0u8; 4]; // all zeros
+        let data = [0u8; 4];
         assert!(find_inner_content_type(&data).is_err());
     }
-
-    // ====== Item 6: TLS Malformed Records ======
 
     #[test]
     fn malformed_record_invalid_content_type() {
         let cert: &'static [u8] = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let _server = make_server(cert);
 
-        // Drain the ClientHello output
         let mut buf = [0u8; 32768];
-        while let Some(_) = client.poll_output(&mut buf) {}
+        while let Some(_) = client.poll_output(&mut cio.as_io(), &mut buf) {}
 
-        // Feed a record with invalid content type (0xFF)
-        // Header: CT=0xFF, version=0x0303, length=1, payload=0x00
-        let result = client.feed_data(&[0xFF, 0x03, 0x03, 0x00, 0x01, 0x00]);
+        let result = client.feed_data(&mut cio.as_io(), &[0xFF, 0x03, 0x03, 0x00, 0x01, 0x00]);
         assert_eq!(result, Err(Error::Tls));
     }
 
@@ -1124,40 +1051,34 @@ mod tests {
     fn malformed_record_truncated_header() {
         let cert: &'static [u8] = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let _server = make_server(cert);
 
-        // Drain the ClientHello
         let mut buf = [0u8; 32768];
-        while let Some(_) = client.poll_output(&mut buf) {}
+        while let Some(_) = client.poll_output(&mut cio.as_io(), &mut buf) {}
 
-        // Feed partial header (3 of 5 bytes) — should buffer without error
-        let result = client.feed_data(&[0x16, 0x03, 0x03]);
+        let result = client.feed_data(&mut cio.as_io(), &[0x16, 0x03, 0x03]);
         assert!(result.is_ok(), "partial header should be buffered");
 
-        // Complete the header + payload: length=1, payload=0x00
-        // Full record: CT=Handshake(0x16), ver=0x0303, len=1, payload=[0x00]
-        // The TLS engine rejects the 1-byte handshake message
-        let result = client.feed_data(&[0x00, 0x01, 0x00]);
+        let result = client.feed_data(&mut cio.as_io(), &[0x00, 0x01, 0x00]);
         assert!(result.is_err(), "malformed handshake record should error");
     }
-
-    // ====== Item 7: Operations After Close ======
 
     #[test]
     fn send_after_close_fails() {
         let cert: &'static [u8] = test_cert_der().leak();
         let mut client = make_client();
+        let mut cio = TestIo::new();
         let mut server = make_server(cert);
+        let mut sio = TestIo::new();
 
-        handshake(&mut client, &mut server);
-        drain_events_client(&mut client);
-        drain_events_server(&mut server);
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        drain_events(&mut client);
+        drain_events(&mut server);
 
-        // Close the connection
-        client.close().unwrap();
+        client.close(&mut cio.as_io()).unwrap();
 
-        // send_app_data checks state != Active → InvalidState
-        let result = client.send_app_data(b"hello");
+        let result = client.send_app_data(&mut cio.as_io(), b"hello");
         assert_eq!(result, Err(Error::InvalidState));
     }
 }

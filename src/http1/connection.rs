@@ -10,14 +10,14 @@
 //! data (via [`recv_body`]). This prevents data from one message leaking into
 //! the next on keep-alive connections.
 //!
-//! # Stack usage
+//! # I/O buffers
 //!
-//! [`try_parse_start_line`] allocates a temporary `heapless::Vec<u8, BUF>` on
-//! the stack to work around borrow-checker limitations. With the default
-//! `BUF = 8192` this adds 8 KiB to the call stack.
+//! I/O buffers are **not** owned by this struct; callers provide them via
+//! [`Http1Io`] on every method that touches network data.
 
 use crate::buf::Buf;
 use crate::error::Error;
+use super::io::Http1Io;
 use super::parse;
 
 /// Events produced by the HTTP/1.1 connection.
@@ -74,19 +74,18 @@ enum ChunkState {
 
 /// HTTP/1.1 connection state machine.
 ///
+/// I/O buffers are **not** owned by this struct; callers provide them via
+/// [`Http1Io`] on every method that touches network data.
+///
 /// Generic parameters:
-/// - `BUF`: size of internal send/recv buffers
 /// - `HDRBUF`: header storage buffer size
 /// - `DATABUF`: body data buffer size
 pub struct Http1Connection<
-    const BUF: usize = 8192,
     const HDRBUF: usize = 2048,
     const DATABUF: usize = 4096,
 > {
     role: Role,
     state: ParseState,
-    recv_buf: Buf<BUF>,
-    send_buf: Buf<BUF>,
     send_offset: usize,
     /// Parsed headers stored as `name\0value\0` pairs.
     header_buf: Buf<HDRBUF>,
@@ -112,8 +111,8 @@ pub struct Http1Connection<
     closed: bool,
 }
 
-impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
-    Http1Connection<BUF, HDRBUF, DATABUF>
+impl<const HDRBUF: usize, const DATABUF: usize>
+    Http1Connection<HDRBUF, DATABUF>
 {
     /// Create a new client-side HTTP/1.1 connection.
     pub fn new_client() -> Self {
@@ -129,8 +128,6 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         Self {
             role,
             state: ParseState::Idle,
-            recv_buf: Buf::new(),
-            send_buf: Buf::new(),
             send_offset: 0,
             header_buf: Buf::new(),
             headers_available: false,
@@ -150,27 +147,27 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Feed received TCP data into the connection.
-    pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.recv_buf.len() + data.len() > BUF {
+    pub fn feed_data<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>, data: &[u8]) -> Result<(), Error> {
+        if io.recv_buf.len() + data.len() > BUF {
             return Err(Error::BufferTooSmall {
-                needed: self.recv_buf.len() + data.len(),
+                needed: io.recv_buf.len() + data.len(),
             });
         }
-        let _ = self.recv_buf.extend_from_slice(data);
-        self.process_recv()
+        let _ = io.recv_buf.extend_from_slice(data);
+        self.process_recv(io)
     }
 
     /// Pull the next chunk of outgoing data.
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        if self.send_offset >= self.send_buf.len() {
+    pub fn poll_output<'a, const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        if self.send_offset >= io.send_buf.len() {
             return None;
         }
-        let avail = self.send_buf.len() - self.send_offset;
+        let avail = io.send_buf.len() - self.send_offset;
         let n = avail.min(buf.len());
-        buf[..n].copy_from_slice(&self.send_buf[self.send_offset..self.send_offset + n]);
+        buf[..n].copy_from_slice(&io.send_buf[self.send_offset..self.send_offset + n]);
         self.send_offset += n;
-        if self.send_offset >= self.send_buf.len() {
-            self.send_buf.clear();
+        if self.send_offset >= io.send_buf.len() {
+            io.send_buf.clear();
             self.send_offset = 0;
         }
         Some(&buf[..n])
@@ -193,28 +190,30 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     ///
     /// Headers should include pseudo-headers (`:method`, `:path`, `:status`) which
     /// will be used to construct the request/status line.
-    pub fn send_headers(
+    pub fn send_headers<const BUF: usize>(
         &mut self,
+        io: &mut Http1Io<'_, BUF>,
         stream_id: u64,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
         self.check_stream_id(stream_id)?;
         match self.role {
-            Role::Client => self.encode_request(headers, end_stream),
-            Role::Server => self.encode_response(headers, end_stream),
+            Role::Client => self.encode_request(io, headers, end_stream),
+            Role::Server => self.encode_response(io, headers, end_stream),
         }
     }
 
     /// Send body data.
-    pub fn send_data(
+    pub fn send_data<const BUF: usize>(
         &mut self,
+        io: &mut Http1Io<'_, BUF>,
         stream_id: u64,
         data: &[u8],
         _end_stream: bool,
     ) -> Result<usize, Error> {
         self.check_stream_id(stream_id)?;
-        self.queue_send(data)?;
+        io.queue_send(data)?;
         Ok(data.len())
     }
 
@@ -289,14 +288,15 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Open a new stream (client-side: encode request).
-    pub fn open_stream(
+    pub fn open_stream<const BUF: usize>(
         &mut self,
+        io: &mut Http1Io<'_, BUF>,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<u64, Error> {
         self.current_stream_id += 1;
         let sid = self.current_stream_id;
-        self.send_headers(sid, headers, end_stream)?;
+        self.send_headers(io, sid, headers, end_stream)?;
         Ok(sid)
     }
 
@@ -362,9 +362,9 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Feed data with timestamp tracking. Updates `last_activity` then calls `feed_data`.
-    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+    pub fn feed_data_timed<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>, data: &[u8], now: u64) -> Result<(), Error> {
         self.last_activity = now;
-        self.feed_data(data)
+        self.feed_data(io, data)
     }
 
     /// Whether the connection has been closed (by timeout or other means).
@@ -393,8 +393,9 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     // Internal: encoding
     // ------------------------------------------------------------------
 
-    fn encode_request(
+    fn encode_request<const BUF: usize>(
         &mut self,
+        io: &mut Http1Io<'_, BUF>,
         headers: &[(&[u8], &[u8])],
         _end_stream: bool,
     ) -> Result<(), Error> {
@@ -413,16 +414,16 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         }
 
         // Request line: METHOD PATH HTTP/1.1\r\n
-        self.queue_send(method)?;
-        self.queue_send(b" ")?;
-        self.queue_send(path)?;
-        self.queue_send(b" HTTP/1.1\r\n")?;
+        io.queue_send(method)?;
+        io.queue_send(b" ")?;
+        io.queue_send(path)?;
+        io.queue_send(b" HTTP/1.1\r\n")?;
 
         // Host header
         if !host.is_empty() {
-            self.queue_send(b"Host: ")?;
-            self.queue_send(host)?;
-            self.queue_send(b"\r\n")?;
+            io.queue_send(b"Host: ")?;
+            io.queue_send(host)?;
+            io.queue_send(b"\r\n")?;
         }
 
         // Regular headers
@@ -430,20 +431,21 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
             if name.starts_with(b":") {
                 continue; // Skip pseudo-headers
             }
-            self.queue_send(name)?;
-            self.queue_send(b": ")?;
-            self.queue_send(value)?;
-            self.queue_send(b"\r\n")?;
+            io.queue_send(name)?;
+            io.queue_send(b": ")?;
+            io.queue_send(value)?;
+            io.queue_send(b"\r\n")?;
         }
 
         // End of headers
-        self.queue_send(b"\r\n")?;
+        io.queue_send(b"\r\n")?;
 
         Ok(())
     }
 
-    fn encode_response(
+    fn encode_response<const BUF: usize>(
         &mut self,
+        io: &mut Http1Io<'_, BUF>,
         headers: &[(&[u8], &[u8])],
         _end_stream: bool,
     ) -> Result<(), Error> {
@@ -458,36 +460,26 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         let reason = status_reason(status);
 
         // Status line: HTTP/1.1 STATUS REASON\r\n
-        self.queue_send(b"HTTP/1.1 ")?;
-        self.queue_send(status)?;
-        self.queue_send(b" ")?;
-        self.queue_send(reason)?;
-        self.queue_send(b"\r\n")?;
+        io.queue_send(b"HTTP/1.1 ")?;
+        io.queue_send(status)?;
+        io.queue_send(b" ")?;
+        io.queue_send(reason)?;
+        io.queue_send(b"\r\n")?;
 
         // Regular headers
         for &(name, value) in headers {
             if name.starts_with(b":") {
                 continue;
             }
-            self.queue_send(name)?;
-            self.queue_send(b": ")?;
-            self.queue_send(value)?;
-            self.queue_send(b"\r\n")?;
+            io.queue_send(name)?;
+            io.queue_send(b": ")?;
+            io.queue_send(value)?;
+            io.queue_send(b"\r\n")?;
         }
 
         // End of headers
-        self.queue_send(b"\r\n")?;
+        io.queue_send(b"\r\n")?;
 
-        Ok(())
-    }
-
-    fn queue_send(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.send_buf.len() + data.len() > BUF {
-            return Err(Error::BufferTooSmall {
-                needed: self.send_buf.len() + data.len(),
-            });
-        }
-        let _ = self.send_buf.extend_from_slice(data);
         Ok(())
     }
 
@@ -495,26 +487,26 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     // Internal: receive processing
     // ------------------------------------------------------------------
 
-    fn process_recv(&mut self) -> Result<(), Error> {
+    fn process_recv<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>) -> Result<(), Error> {
         loop {
             match self.state {
                 ParseState::Idle => {
-                    if !self.try_parse_start_line()? {
+                    if !self.try_parse_start_line(io)? {
                         return Ok(());
                     }
                 }
                 ParseState::BodyContentLength { remaining } => {
-                    if !self.process_content_length_body(remaining)? {
+                    if !self.process_content_length_body(io, remaining)? {
                         return Ok(());
                     }
                 }
                 ParseState::BodyChunked => {
-                    if !self.process_chunked_body()? {
+                    if !self.process_chunked_body(io)? {
                         return Ok(());
                     }
                 }
                 ParseState::BodyUntilClose => {
-                    self.process_until_close_body();
+                    self.process_until_close_body(io);
                     return Ok(());
                 }
                 ParseState::Done => {
@@ -537,19 +529,15 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
 
     /// Try to parse a request line (server) or status line (client) + headers.
     /// Returns true if we transitioned out of Idle.
-    fn try_parse_start_line(&mut self) -> Result<bool, Error> {
+    ///
+    /// Now that `recv_buf` is external (on `io`), we can parse directly from
+    /// `io.recv_buf` while writing to `self.header_buf` — no stack copy needed.
+    fn try_parse_start_line<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>) -> Result<bool, Error> {
         // Need at least the full headers block
-        let end = match parse::find_end_of_headers(&self.recv_buf) {
+        let end = match parse::find_end_of_headers(&io.recv_buf) {
             Some(e) => e,
             None => return Ok(false),
         };
-
-        // Copy the header block out so we can parse from a separate buffer
-        // while mutating self.header_buf. This puts BUF bytes on the stack.
-        let mut hdr_copy: heapless::Vec<u8, BUF> = heapless::Vec::new();
-        if hdr_copy.extend_from_slice(&self.recv_buf[..end]).is_err() {
-            return Err(Error::BufferTooSmall { needed: end });
-        }
 
         self.header_buf.clear();
         self.headers_available = false;
@@ -557,16 +545,13 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         let mut offset = 0;
 
         if self.role == Role::Server {
-            // Parse request line from the copy (no borrow on self)
-            let (method, path, consumed) = parse::parse_request_line(&hdr_copy[offset..])?;
-            self.store_header(b":method", method)?;
-            self.store_header(b":path", path)?;
+            let (method, path, consumed) = parse::parse_request_line(&io.recv_buf[offset..end])?;
+            self.store_header(method, path)?;
             offset += consumed;
         } else {
-            // Parse status line
-            let (status, _reason, consumed) = parse::parse_status_line(&hdr_copy[offset..])?;
+            let (status, _reason, consumed) = parse::parse_status_line(&io.recv_buf[offset..end])?;
             let status_bytes = crate::http::StatusCode(status).to_bytes();
-            self.store_header(b":status", &status_bytes)?;
+            self.store_header_kv(b":status", &status_bytes)?;
             offset += consumed;
         }
 
@@ -576,7 +561,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         let mut connection_close = false;
 
         loop {
-            let (name, value, consumed) = parse::parse_header_line(&hdr_copy[offset..])?;
+            let (name, value, consumed) = parse::parse_header_line(&io.recv_buf[offset..end])?;
             offset += consumed;
 
             if name.is_empty() {
@@ -602,7 +587,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
                 connection_close = true;
             }
 
-            self.store_header(name, value)?;
+            self.store_header_kv(name, value)?;
         }
 
         // RFC 9112 §6.1: reject messages with both Content-Length and
@@ -612,7 +597,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         }
 
         // Consume parsed bytes from recv_buf
-        self.drain_recv(end);
+        io.drain_recv(end);
 
         self.headers_available = true;
         self.keep_alive = !connection_close;
@@ -656,17 +641,17 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         Ok(true)
     }
 
-    fn process_content_length_body(&mut self, remaining: usize) -> Result<bool, Error> {
-        if self.recv_buf.is_empty() {
+    fn process_content_length_body<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>, remaining: usize) -> Result<bool, Error> {
+        if io.recv_buf.is_empty() {
             return Ok(false);
         }
 
-        let to_consume = self.recv_buf.len().min(remaining);
+        let to_consume = io.recv_buf.len().min(remaining);
         let can_store = (DATABUF - self.data_buf.len()).min(to_consume);
 
         if can_store > 0 {
-            let _ = self.data_buf.extend_from_slice(&self.recv_buf[..can_store]);
-            self.drain_recv(can_store);
+            let _ = self.data_buf.extend_from_slice(&io.recv_buf[..can_store]);
+            io.drain_recv(can_store);
             let new_remaining = remaining - can_store;
 
             let sid = self.current_stream_id;
@@ -687,13 +672,13 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         }
     }
 
-    fn process_chunked_body(&mut self) -> Result<bool, Error> {
+    fn process_chunked_body<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>) -> Result<bool, Error> {
         match self.chunk_state {
             ChunkState::Size => {
-                let result = parse::parse_chunk_size(&self.recv_buf);
+                let result = parse::parse_chunk_size(&io.recv_buf);
                 match result {
                     Ok((size, consumed)) => {
-                        self.drain_recv(consumed);
+                        io.drain_recv(consumed);
                         if size == 0 {
                             self.chunk_state = ChunkState::Trailers;
                         } else {
@@ -706,15 +691,15 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
                 }
             }
             ChunkState::Data { remaining } => {
-                if self.recv_buf.is_empty() {
+                if io.recv_buf.is_empty() {
                     return Ok(false);
                 }
-                let to_consume = self.recv_buf.len().min(remaining);
+                let to_consume = io.recv_buf.len().min(remaining);
                 let can_store = (DATABUF - self.data_buf.len()).min(to_consume);
 
                 if can_store > 0 {
-                    let _ = self.data_buf.extend_from_slice(&self.recv_buf[..can_store]);
-                    self.drain_recv(can_store);
+                    let _ = self.data_buf.extend_from_slice(&io.recv_buf[..can_store]);
+                    io.drain_recv(can_store);
                     let new_remaining = remaining - can_store;
 
                     let sid = self.current_stream_id;
@@ -734,11 +719,11 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
             }
             ChunkState::DataTrailer => {
                 // Expecting CRLF after chunk data
-                if self.recv_buf.len() < 2 {
+                if io.recv_buf.len() < 2 {
                     return Ok(false);
                 }
-                if self.recv_buf[0] == b'\r' && self.recv_buf[1] == b'\n' {
-                    self.drain_recv(2);
+                if io.recv_buf[0] == b'\r' && io.recv_buf[1] == b'\n' {
+                    io.drain_recv(2);
                     self.chunk_state = ChunkState::Size;
                     Ok(true)
                 } else {
@@ -747,11 +732,11 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
             }
             ChunkState::Trailers => {
                 // After last chunk (size=0), expect CRLF (no trailers supported)
-                if self.recv_buf.len() < 2 {
+                if io.recv_buf.len() < 2 {
                     return Ok(false);
                 }
-                if self.recv_buf[0] == b'\r' && self.recv_buf[1] == b'\n' {
-                    self.drain_recv(2);
+                if io.recv_buf[0] == b'\r' && io.recv_buf[1] == b'\n' {
+                    io.drain_recv(2);
                     self.body_finished = true;
                     self.state = ParseState::Done;
                     let sid = self.current_stream_id;
@@ -759,20 +744,20 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
                     Ok(true)
                 } else {
                     // Skip trailer headers
-                    let (_, _, consumed) = parse::parse_header_line(&self.recv_buf)?;
-                    self.drain_recv(consumed);
+                    let (_, _, consumed) = parse::parse_header_line(&io.recv_buf)?;
+                    io.drain_recv(consumed);
                     Ok(true)
                 }
             }
         }
     }
 
-    fn process_until_close_body(&mut self) {
-        if !self.recv_buf.is_empty() {
-            let n = self.recv_buf.len().min(DATABUF - self.data_buf.len());
+    fn process_until_close_body<const BUF: usize>(&mut self, io: &mut Http1Io<'_, BUF>) {
+        if !io.recv_buf.is_empty() {
+            let n = io.recv_buf.len().min(DATABUF - self.data_buf.len());
             if n > 0 {
-                let _ = self.data_buf.extend_from_slice(&self.recv_buf[..n]);
-                self.drain_recv(n);
+                let _ = self.data_buf.extend_from_slice(&io.recv_buf[..n]);
+                io.drain_recv(n);
                 let sid = self.current_stream_id;
                 let _ = self.events.push_back(Http1Event::Data(sid));
             }
@@ -783,7 +768,14 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     // Internal helpers
     // ------------------------------------------------------------------
 
-    fn store_header(&mut self, name: &[u8], value: &[u8]) -> Result<(), Error> {
+    /// Store a request-line pair (:method + :path) into header_buf.
+    fn store_header(&mut self, method: &[u8], path: &[u8]) -> Result<(), Error> {
+        self.store_header_kv(b":method", method)?;
+        self.store_header_kv(b":path", path)?;
+        Ok(())
+    }
+
+    fn store_header_kv(&mut self, name: &[u8], value: &[u8]) -> Result<(), Error> {
         let needed = name.len() + 1 + value.len() + 1; // name\0value\0
         if self.header_buf.len() + needed > HDRBUF {
             return Err(Error::BufferTooSmall { needed });
@@ -793,11 +785,6 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         let _ = self.header_buf.extend_from_slice(value);
         let _ = self.header_buf.push(0);
         Ok(())
-    }
-
-    fn drain_recv(&mut self, count: usize) {
-        self.recv_buf.copy_within(count.., 0);
-        self.recv_buf.truncate(self.recv_buf.len() - count);
     }
 }
 
@@ -879,22 +866,22 @@ fn status_reason(status: &[u8]) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::io::Http1IoBufs;
 
     #[test]
     fn server_parses_get_request() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
-        conn.feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
+        conn.feed_data(&mut io.as_io(), b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
         let event = conn.poll_event().unwrap();
         assert_eq!(event, Http1Event::Headers(1));
 
-        // Should also get Finished since GET has no body
         let event2 = conn.poll_event().unwrap();
         assert_eq!(event2, Http1Event::Finished(1));
 
-        // Read headers
         let mut method = heapless::Vec::<u8, 16>::new();
         let mut path = heapless::Vec::<u8, 64>::new();
         let mut host = heapless::Vec::<u8, 64>::new();
@@ -920,25 +907,19 @@ mod tests {
 
     #[test]
     fn server_parses_post_with_body() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /data HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello",
         )
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(1));
 
-        // Data event
-        let event2 = conn.poll_event().unwrap();
-        assert_eq!(event2, Http1Event::Data(1));
-
-        // Finished event
-        let event3 = conn.poll_event().unwrap();
-        assert_eq!(event3, Http1Event::Finished(1));
-
-        // Read body
         let mut buf = [0u8; 64];
         let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
@@ -947,23 +928,22 @@ mod tests {
 
     #[test]
     fn server_parses_chunked_body() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n\
               5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
         )
         .unwrap();
 
-        // Collect all events
         let mut events = heapless::Vec::<Http1Event, 16>::new();
         while let Some(ev) = conn.poll_event() {
             let _ = events.push(ev);
         }
-
         assert!(events.contains(&Http1Event::Headers(1)));
         assert!(events.contains(&Http1Event::Finished(1)));
 
-        // Read body
         let mut buf = [0u8; 64];
         let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello world");
@@ -972,16 +952,15 @@ mod tests {
 
     #[test]
     fn client_parses_response() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
-        conn.current_stream_id = 1; // Simulate having sent a request
-        conn.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+        let mut conn = Http1Connection::<1024, 1024>::new_client();
+        let mut io = Http1IoBufs::<4096>::new();
+        conn.current_stream_id = 1;
+        conn.feed_data(&mut io.as_io(), b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
             .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
-        // Read status
         let mut status = heapless::Vec::<u8, 16>::new();
         conn.recv_headers(1, |name, value| {
             if name == b":status" {
@@ -991,12 +970,8 @@ mod tests {
         .unwrap();
         assert_eq!(status.as_slice(), b"200");
 
-        // Data + finished
-        let event2 = conn.poll_event().unwrap();
-        assert_eq!(event2, Http1Event::Data(1));
-
-        let event3 = conn.poll_event().unwrap();
-        assert_eq!(event3, Http1Event::Finished(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(1));
 
         let mut buf = [0u8; 64];
         let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
@@ -1006,10 +981,12 @@ mod tests {
 
     #[test]
     fn server_sends_response() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.current_stream_id = 1;
 
         conn.send_headers(
+            &mut io.as_io(),
             1,
             &[
                 (b":status", b"200"),
@@ -1020,10 +997,10 @@ mod tests {
         )
         .unwrap();
 
-        conn.send_data(1, b"hello", true).unwrap();
+        conn.send_data(&mut io.as_io(), 1, b"hello", true).unwrap();
 
         let mut out = [0u8; 4096];
-        let data = conn.poll_output(&mut out).unwrap();
+        let data = conn.poll_output(&mut io.as_io(), &mut out).unwrap();
 
         let expected =
             b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello";
@@ -1032,10 +1009,12 @@ mod tests {
 
     #[test]
     fn client_sends_request() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        let mut conn = Http1Connection::<1024, 1024>::new_client();
+        let mut io = Http1IoBufs::<4096>::new();
 
         let sid = conn
             .open_stream(
+                &mut io.as_io(),
                 &[
                     (b":method", b"GET"),
                     (b":path", b"/index.html"),
@@ -1047,7 +1026,7 @@ mod tests {
         assert_eq!(sid, 1);
 
         let mut out = [0u8; 4096];
-        let data = conn.poll_output(&mut out).unwrap();
+        let data = conn.poll_output(&mut io.as_io(), &mut out).unwrap();
 
         let expected = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(data, expected);
@@ -1055,130 +1034,103 @@ mod tests {
 
     #[test]
     fn incremental_feed() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
 
-        // Feed partial request
-        conn.feed_data(b"GET / HTTP/1.1\r\n").unwrap();
+        conn.feed_data(&mut io.as_io(), b"GET / HTTP/1.1\r\n").unwrap();
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        assert!(conn.poll_event().is_none()); // Not complete yet
+        assert!(conn.poll_event().is_none());
 
-        conn.feed_data(b"Host: example.com\r\n").unwrap();
-        assert!(conn.poll_event().is_none()); // Still incomplete
+        conn.feed_data(&mut io.as_io(), b"Host: example.com\r\n").unwrap();
+        assert!(conn.poll_event().is_none());
 
-        conn.feed_data(b"\r\n").unwrap();
-        let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Headers(1));
+        conn.feed_data(&mut io.as_io(), b"\r\n").unwrap();
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
     }
 
     #[test]
     fn keep_alive_multiple_requests() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
 
-        // First request
-        conn.feed_data(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        conn.feed_data(&mut io.as_io(), b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
-
-        // Drain all events
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
         while conn.poll_event().is_some() {}
-
-        // Drain headers so they're consumed
         conn.recv_headers(1, |_, _| {}).unwrap();
 
-        // Second request on same connection
-        conn.feed_data(b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        conn.feed_data(&mut io.as_io(), b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Headers(2));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(2));
     }
 
     #[test]
     fn keep_alive_post_then_get() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
 
-        // First request: POST with body
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /a HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc",
         )
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
-
-        // Drain events
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
         while conn.poll_event().is_some() {}
-
-        // App reads headers and body
         conn.recv_headers(1, |_, _| {}).unwrap();
         let mut buf = [0u8; 64];
         let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"abc");
         assert!(fin);
 
-        // Second request: GET (no body)
-        conn.feed_data(b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        conn.feed_data(&mut io.as_io(), b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Headers(2));
-
-        // body_finished should be false for the new request context
-        // (recv_body should WouldBlock if called before Finished, but GET
-        // goes straight to Done so body_finished is true again)
-        let ev3 = conn.poll_event().unwrap();
-        assert_eq!(ev3, Http1Event::Finished(2));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(2));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(2));
     }
 
     #[test]
     fn keep_alive_blocks_until_headers_consumed() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
 
-        // Feed two requests at once (pipelining)
         conn.feed_data(
+            &mut io.as_io(),
             b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n\
               GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n",
         )
         .unwrap();
 
-        // Should only see first request
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Finished(1));
-        // No more events yet — second request is blocked
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(1));
         assert!(conn.poll_event().is_none());
 
-        // Consume first request's headers
         conn.recv_headers(1, |_, _| {}).unwrap();
-
-        // Now feed_data (or process) can parse the second request
-        conn.feed_data(b"").unwrap(); // Trigger processing
-        let ev3 = conn.poll_event().unwrap();
-        assert_eq!(ev3, Http1Event::Headers(2));
+        conn.feed_data(&mut io.as_io(), b"").unwrap();
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(2));
     }
 
     #[test]
     fn stream_id_validation() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
-        conn.feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
+        conn.feed_data(&mut io.as_io(), b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .unwrap();
-
-        // Drain events
         while conn.poll_event().is_some() {}
 
-        // Wrong stream_id should fail
         assert_eq!(conn.recv_headers(99, |_, _| {}), Err(Error::InvalidState));
-        // Correct stream_id should work
         assert!(conn.recv_headers(1, |_, _| {}).is_ok());
     }
 
     #[test]
     fn reject_content_length_and_transfer_encoding() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         let result = conn.feed_data(
+            &mut io.as_io(),
             b"POST /data HTTP/1.1\r\nHost: example.com\r\n\
               Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
         );
@@ -1187,35 +1139,35 @@ mod tests {
 
     #[test]
     fn reject_null_byte_in_header_value() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         let data = b"GET / HTTP/1.1\r\nHost: exam\x00ple.com\r\n\r\n".to_vec();
-        // The null byte is in the header value
-        let result = conn.feed_data(&data);
+        let result = conn.feed_data(&mut io.as_io(), &data);
         assert_eq!(result, Err(Error::InvalidState));
     }
 
     #[test]
     fn content_length_zero() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /data HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Finished(1));
-        // No Data event
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(1));
         assert!(conn.poll_event().is_none());
     }
 
     #[test]
     fn feed_data_buffer_overflow() {
-        let mut conn = Http1Connection::<64, 64, 64>::new_server();
+        let mut conn = Http1Connection::<64, 64>::new_server();
+        let mut io = Http1IoBufs::<64>::new();
         let big = [b'X'; 100];
-        let result = conn.feed_data(&big);
+        let result = conn.feed_data(&mut io.as_io(), &big);
         assert_eq!(
             result,
             Err(Error::BufferTooSmall { needed: 100 })
@@ -1224,9 +1176,10 @@ mod tests {
 
     #[test]
     fn header_buf_overflow() {
-        let mut conn = Http1Connection::<4096, 32, 1024>::new_server();
-        // HDRBUF=32 is too small for the pseudo-headers + Host header
+        let mut conn = Http1Connection::<32, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         let result = conn.feed_data(
+            &mut io.as_io(),
             b"GET /very-long-path-that-will-overflow HTTP/1.1\r\n\
               Host: example.com\r\n\r\n",
         );
@@ -1235,34 +1188,27 @@ mod tests {
 
     #[test]
     fn data_buf_backpressure() {
-        let mut conn = Http1Connection::<4096, 1024, 8>::new_server();
-        // DATABUF=8, body is 12 bytes
+        let mut conn = Http1Connection::<1024, 8>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /data HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\nhello world!",
         )
         .unwrap();
 
-        // Should get Connected + request + data event (first 8 bytes fill data_buf)
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Data(1));
-        // No finished yet — 4 bytes remain but data_buf is full
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
         assert!(conn.poll_event().is_none());
 
-        // Drain the data_buf
         let mut buf = [0u8; 16];
         let (n, fin) = conn.recv_body(1, &mut buf).unwrap();
         assert_eq!(n, 8);
         assert!(!fin);
 
-        // Now feed empty to trigger processing of remaining bytes
-        conn.feed_data(b"").unwrap();
-        let ev3 = conn.poll_event().unwrap();
-        assert_eq!(ev3, Http1Event::Data(1));
-        let ev4 = conn.poll_event().unwrap();
-        assert_eq!(ev4, Http1Event::Finished(1));
+        conn.feed_data(&mut io.as_io(), b"").unwrap();
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(1));
 
         let (n2, fin2) = conn.recv_body(1, &mut buf).unwrap();
         assert_eq!(n2, 4);
@@ -1271,24 +1217,19 @@ mod tests {
 
     #[test]
     fn client_body_until_close() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        let mut conn = Http1Connection::<1024, 1024>::new_client();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.current_stream_id = 1;
 
-        // Response with no Content-Length and no Transfer-Encoding
-        conn.feed_data(b"HTTP/1.1 200 OK\r\n\r\nhello").unwrap();
+        conn.feed_data(&mut io.as_io(), b"HTTP/1.1 200 OK\r\n\r\nhello").unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Data(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
 
-        // More data arrives
-        conn.feed_data(b" world").unwrap();
-        let ev3 = conn.poll_event().unwrap();
-        assert_eq!(ev3, Http1Event::Data(1));
+        conn.feed_data(&mut io.as_io(), b" world").unwrap();
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
 
-        // Read all body data so far
         let mut buf = [0u8; 64];
         let (n, _fin) = conn.recv_body(1, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello world");
@@ -1296,24 +1237,21 @@ mod tests {
 
     #[test]
     fn incremental_chunked_body() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
 
-        // Feed headers
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /data HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
         )
         .unwrap();
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
-        // Feed chunk size + partial data
-        conn.feed_data(b"5\r\nhel").unwrap();
-        let ev2 = conn.poll_event().unwrap();
-        assert_eq!(ev2, Http1Event::Data(1));
+        conn.feed_data(&mut io.as_io(), b"5\r\nhel").unwrap();
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Data(1));
 
-        // Feed rest of chunk + trailer CRLF + terminator
-        conn.feed_data(b"lo\r\n0\r\n\r\n").unwrap();
+        conn.feed_data(&mut io.as_io(), b"lo\r\n0\r\n\r\n").unwrap();
 
         let mut events = heapless::Vec::<Http1Event, 8>::new();
         while let Some(ev) = conn.poll_event() {
@@ -1329,26 +1267,30 @@ mod tests {
 
     #[test]
     fn malformed_request_no_spaces() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
-        let result = conn.feed_data(b"GET\r\n\r\n");
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
+        let result = conn.feed_data(&mut io.as_io(), b"GET\r\n\r\n");
         assert_eq!(result, Err(Error::InvalidState));
     }
 
     #[test]
     fn malformed_header_no_colon() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
-        let result = conn.feed_data(b"GET / HTTP/1.1\r\nBadHeader\r\n\r\n");
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
+        let result = conn.feed_data(&mut io.as_io(), b"GET / HTTP/1.1\r\nBadHeader\r\n\r\n");
         assert_eq!(result, Err(Error::InvalidState));
     }
 
     #[test]
     fn client_server_e2e() {
-        let mut client = Http1Connection::<4096, 1024, 1024>::new_client();
-        let mut server = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut client = Http1Connection::<1024, 1024>::new_client();
+        let mut cio = Http1IoBufs::<4096>::new();
+        let mut server = Http1Connection::<1024, 1024>::new_server();
+        let mut sio = Http1IoBufs::<4096>::new();
 
-        // Client sends request
         let stream_id = client
             .open_stream(
+                &mut cio.as_io(),
                 &[
                     (b":method", b"GET"),
                     (b":path", b"/"),
@@ -1358,26 +1300,21 @@ mod tests {
             )
             .unwrap();
 
-        // Transfer client → server
         let mut buf = [0u8; 4096];
-        while let Some(data) = client.poll_output(&mut buf) {
+        while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
             let copy: heapless::Vec<u8, 4096> = {
                 let mut v = heapless::Vec::new();
                 let _ = v.extend_from_slice(data);
                 v
             };
-            server.feed_data(&copy).unwrap();
+            server.feed_data(&mut sio.as_io(), &copy).unwrap();
         }
 
-        // Server gets Connected then request
         assert!(matches!(server.poll_event(), Some(Http1Event::Connected)));
         let ev = server.poll_event().unwrap();
         assert!(matches!(ev, Http1Event::Headers(_)));
-
-        // Drain remaining events
         while server.poll_event().is_some() {}
 
-        // Server reads headers
         let mut got_method = false;
         server
             .recv_headers(1, |name, value| {
@@ -1388,9 +1325,9 @@ mod tests {
             .unwrap();
         assert!(got_method);
 
-        // Server sends response
         server
             .send_headers(
+                &mut sio.as_io(),
                 1,
                 &[
                     (b":status", b"200"),
@@ -1400,20 +1337,18 @@ mod tests {
                 false,
             )
             .unwrap();
-        server.send_data(1, b"Hello World!", true).unwrap();
+        server.send_data(&mut sio.as_io(), 1, b"Hello World!", true).unwrap();
 
-        // Transfer server → client
         let mut buf2 = [0u8; 4096];
-        while let Some(data) = server.poll_output(&mut buf2) {
+        while let Some(data) = server.poll_output(&mut sio.as_io(), &mut buf2) {
             let copy: heapless::Vec<u8, 4096> = {
                 let mut v = heapless::Vec::new();
                 let _ = v.extend_from_slice(data);
                 v
             };
-            client.feed_data(&copy).unwrap();
+            client.feed_data(&mut cio.as_io(), &copy).unwrap();
         }
 
-        // Client gets headers
         let mut got_headers = false;
         let mut got_data = false;
         let mut got_finished = false;
@@ -1429,7 +1364,6 @@ mod tests {
         assert!(got_data);
         assert!(got_finished);
 
-        // Read response headers
         let mut status = heapless::Vec::<u8, 16>::new();
         client
             .recv_headers(stream_id, |name, value| {
@@ -1440,7 +1374,6 @@ mod tests {
             .unwrap();
         assert_eq!(status.as_slice(), b"200");
 
-        // Read body
         let mut body = [0u8; 64];
         let (n, fin) = client.recv_body(stream_id, &mut body).unwrap();
         assert_eq!(&body[..n], b"Hello World!");
@@ -1477,15 +1410,17 @@ mod tests {
         assert_eq!(status_reason(b"200"), b"OK");
         assert_eq!(status_reason(b"404"), b"Not Found");
         assert_eq!(status_reason(b"500"), b"Internal Server Error");
-        assert_eq!(status_reason(b"999"), b""); // Unknown → empty
+        assert_eq!(status_reason(b"999"), b"");
     }
 
     // ====== Wire-Format Compatibility Tests ======
 
     #[test]
     fn wire_curl_get_request() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"GET /index.html HTTP/1.1\r\n\
               Host: example.com\r\n\
               User-Agent: curl/8.0\r\n\
@@ -1495,10 +1430,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let event = conn.poll_event().unwrap();
-        assert_eq!(event, Http1Event::Headers(1));
-        let event2 = conn.poll_event().unwrap();
-        assert_eq!(event2, Http1Event::Finished(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Finished(1));
 
         let mut method = heapless::Vec::<u8, 16>::new();
         let mut path = heapless::Vec::<u8, 64>::new();
@@ -1533,9 +1466,11 @@ mod tests {
 
     #[test]
     fn wire_nginx_200_response() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        let mut conn = Http1Connection::<1024, 1024>::new_client();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.current_stream_id = 1;
         conn.feed_data(
+            &mut io.as_io(),
             b"HTTP/1.1 200 OK\r\n\
               Server: nginx/1.24\r\n\
               Content-Type: text/html\r\n\
@@ -1546,8 +1481,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
         let mut status = heapless::Vec::<u8, 16>::new();
         let mut server = heapless::Vec::<u8, 32>::new();
@@ -1569,7 +1503,6 @@ mod tests {
         assert_eq!(server.as_slice(), b"nginx/1.24");
         assert_eq!(ctype.as_slice(), b"text/html");
 
-        // Drain remaining events
         while conn.poll_event().is_some() {}
 
         let mut body = [0u8; 64];
@@ -1580,9 +1513,11 @@ mod tests {
 
     #[test]
     fn wire_nginx_301_redirect() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        let mut conn = Http1Connection::<1024, 1024>::new_client();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.current_stream_id = 1;
         conn.feed_data(
+            &mut io.as_io(),
             b"HTTP/1.1 301 Moved Permanently\r\n\
               Location: https://example.com/\r\n\
               Content-Length: 0\r\n\
@@ -1591,8 +1526,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
         let mut status = heapless::Vec::<u8, 16>::new();
         let mut location = heapless::Vec::<u8, 64>::new();
@@ -1612,9 +1546,11 @@ mod tests {
 
     #[test]
     fn wire_chunked_response() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_client();
+        let mut conn = Http1Connection::<1024, 1024>::new_client();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.current_stream_id = 1;
         conn.feed_data(
+            &mut io.as_io(),
             b"HTTP/1.1 200 OK\r\n\
               Transfer-Encoding: chunked\r\n\
               \r\n\
@@ -1639,13 +1575,13 @@ mod tests {
 
     #[test]
     fn wire_connection_close() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
-        conn.feed_data(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
+        conn.feed_data(&mut io.as_io(), b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
         let mut connection_hdr = heapless::Vec::<u8, 16>::new();
         conn.recv_headers(1, |name, value| {
@@ -1659,8 +1595,10 @@ mod tests {
 
     #[test]
     fn wire_post_json() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"POST /api HTTP/1.1\r\n\
               Host: api.example.com\r\n\
               Content-Type: application/json\r\n\
@@ -1671,8 +1609,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
         let mut method = heapless::Vec::<u8, 16>::new();
         let mut path = heapless::Vec::<u8, 64>::new();
@@ -1694,7 +1631,6 @@ mod tests {
         assert_eq!(path.as_slice(), b"/api");
         assert_eq!(ctype.as_slice(), b"application/json");
 
-        // Drain remaining events
         while conn.poll_event().is_some() {}
 
         let mut body = [0u8; 64];
@@ -1705,17 +1641,17 @@ mod tests {
 
     #[test]
     fn wire_case_insensitive_headers() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.feed_data(
+            &mut io.as_io(),
             b"GET / HTTP/1.1\r\nHOST: example.com\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
 
         assert_eq!(conn.poll_event(), Some(Http1Event::Connected));
-        let ev = conn.poll_event().unwrap();
-        assert_eq!(ev, Http1Event::Headers(1));
+        assert_eq!(conn.poll_event().unwrap(), Http1Event::Headers(1));
 
-        // Parser should accept uppercase HOST header
         let mut host = heapless::Vec::<u8, 64>::new();
         conn.recv_headers(1, |name, value| {
             if eq_ignore_case(name, b"host") {
@@ -1728,10 +1664,12 @@ mod tests {
 
     #[test]
     fn wire_server_response_encoding() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         conn.current_stream_id = 1;
 
         conn.send_headers(
+            &mut io.as_io(),
             1,
             &[
                 (b":status", b"200"),
@@ -1741,10 +1679,10 @@ mod tests {
             false,
         )
         .unwrap();
-        conn.send_data(1, b"OK", true).unwrap();
+        conn.send_data(&mut io.as_io(), 1, b"OK", true).unwrap();
 
         let mut out = [0u8; 4096];
-        let data = conn.poll_output(&mut out).unwrap();
+        let data = conn.poll_output(&mut io.as_io(), &mut out).unwrap();
         assert_eq!(
             data,
             b"HTTP/1.1 200 OK\r\nServer: milli-http\r\nContent-Length: 2\r\n\r\nOK"
@@ -1755,27 +1693,25 @@ mod tests {
 
     #[test]
     fn idle_timeout_between_keepalive() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: Some(1_000_000),
             header_timeout_us: None,
         };
         conn.set_timeouts(config, 0);
 
-        // First request arrives
         conn.feed_data_timed(
+            &mut io.as_io(),
             b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n",
             100_000,
         ).unwrap();
 
-        // Drain events + headers
         while conn.poll_event().is_some() {}
         conn.recv_headers(1, |_, _| {}).unwrap();
 
-        // Trigger Idle→Idle transition so connection_start resets
-        conn.feed_data_timed(b"", 200_000).unwrap();
+        conn.feed_data_timed(&mut io.as_io(), b"", 200_000).unwrap();
 
-        // 2 seconds of inactivity
         conn.handle_timeout(2_200_000);
         assert!(conn.is_closed());
 
@@ -1790,17 +1726,16 @@ mod tests {
 
     #[test]
     fn header_timeout_on_slow_headers() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: None,
             header_timeout_us: Some(500_000),
         };
         conn.set_timeouts(config, 0);
 
-        // Partial request
-        conn.feed_data_timed(b"GET / HTTP/1.1\r\n", 100_000).unwrap();
+        conn.feed_data_timed(&mut io.as_io(), b"GET / HTTP/1.1\r\n", 100_000).unwrap();
 
-        // No complete headers after 600ms
         conn.handle_timeout(600_000);
         assert!(conn.is_closed());
 
@@ -1815,39 +1750,35 @@ mod tests {
 
     #[test]
     fn header_timeout_resets_on_keepalive() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: None,
             header_timeout_us: Some(500_000),
         };
         conn.set_timeouts(config, 0);
 
-        // First request completes at t=100ms
         conn.feed_data_timed(
+            &mut io.as_io(),
             b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n",
             100_000,
         ).unwrap();
 
-        // Drain events + headers
         while conn.poll_event().is_some() {}
         conn.recv_headers(1, |_, _| {}).unwrap();
 
-        // Trigger transition to Idle for keep-alive
-        conn.feed_data_timed(b"", 200_000).unwrap();
+        conn.feed_data_timed(&mut io.as_io(), b"", 200_000).unwrap();
 
-        // At t=600ms: 400ms since keep-alive Idle started (connection_start reset to 200ms)
-        // Header timeout is 500ms, so 200_000 + 500_000 = 700_000 — NOT fired yet
         conn.handle_timeout(600_000);
         assert!(!conn.is_closed());
 
-        // At t=800ms: 600ms since keep-alive Idle — timeout fires
         conn.handle_timeout(800_000);
         assert!(conn.is_closed());
     }
 
     #[test]
     fn is_closed_and_is_established() {
-        let mut conn = Http1Connection::<4096, 1024, 1024>::new_server();
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
         assert!(conn.is_established());
         assert!(!conn.is_closed());
 

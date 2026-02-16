@@ -3,10 +3,10 @@
 //! Pure codec following the milli-http pattern:
 //! `feed_data()` → `poll_output()` → `poll_event()`
 
-use crate::buf::Buf;
 use crate::error::Error;
 use crate::hpack::codec::{HpackDecoder, HpackEncoder};
 use super::frame::{self, *};
+use super::io::H2Io;
 use super::stream::{H2Stream, H2StreamState};
 use super::flow_control::{FlowController, DEFAULT_INITIAL_WINDOW_SIZE, DEFAULT_CONNECTION_WINDOW_SIZE};
 
@@ -126,14 +126,15 @@ enum H2ConnState {
 
 /// HTTP/2 connection state machine.
 ///
+/// I/O buffers are **not** owned by this struct; callers provide them via
+/// [`H2Io`] on every method that touches network data.
+///
 /// Generic parameters:
 /// - `MAX_STREAMS`: maximum number of concurrent streams tracked
-/// - `BUF`: size of internal send/recv buffers
 /// - `HDRBUF`: per-stream header buffer size
 /// - `DATABUF`: per-stream data buffer size
 pub struct H2Connection<
     const MAX_STREAMS: usize = 8,
-    const BUF: usize = 16384,
     const HDRBUF: usize = 2048,
     const DATABUF: usize = 4096,
 > {
@@ -144,9 +145,6 @@ pub struct H2Connection<
     streams: heapless::Vec<H2Stream<HDRBUF, DATABUF>, MAX_STREAMS>,
     encoder: HpackEncoder,
     decoder: HpackDecoder,
-    // I/O accumulation
-    recv_buf: Buf<BUF>,
-    send_buf: Buf<BUF>,
     send_offset: usize,
     // Flow control
     conn_send_fc: FlowController,
@@ -156,7 +154,6 @@ pub struct H2Connection<
     // Connection state
     next_stream_id: u64,
     last_peer_stream_id: u64,
-    /// Stream expecting CONTINUATION frames (RFC 9113 §4.3).
     continuation_stream_id: Option<u64>,
     settings_sent: bool,
     settings_ack_received: bool,
@@ -172,8 +169,8 @@ pub struct H2Connection<
     headers_phase_complete: bool,
 }
 
-impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
-    H2Connection<MAX_STREAMS, BUF, HDRBUF, DATABUF>
+impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
+    H2Connection<MAX_STREAMS, HDRBUF, DATABUF>
 {
     /// Create a new client-side connection.
     pub fn new_client() -> Self {
@@ -198,8 +195,6 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
             streams: heapless::Vec::new(),
             encoder: HpackEncoder::new(),
             decoder: HpackDecoder::new(),
-            recv_buf: Buf::new(),
-            send_buf: Buf::new(),
             send_offset: 0,
             conn_send_fc: FlowController::new(DEFAULT_CONNECTION_WINDOW_SIZE),
             conn_recv_fc: FlowController::new(DEFAULT_CONNECTION_WINDOW_SIZE),
@@ -222,40 +217,32 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 
     /// Feed received TCP data into the connection.
-    pub fn feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        // Ensure our own SETTINGS is queued before processing any peer data
-        // (RFC 9113 §3.4: server SETTINGS must be the first frame sent)
-        self.generate_output();
+    pub fn feed_data<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, data: &[u8]) -> Result<(), Error> {
+        self.generate_output(io);
 
-        // Append to recv buffer
-        if self.recv_buf.len() + data.len() > BUF {
-            return Err(Error::BufferTooSmall { needed: self.recv_buf.len() + data.len() });
+        if io.recv_buf.len() + data.len() > BUF {
+            return Err(Error::BufferTooSmall { needed: io.recv_buf.len() + data.len() });
         }
-        let _ = self.recv_buf.extend_from_slice(data);
+        let _ = io.recv_buf.extend_from_slice(data);
 
-        // Process received data
-        self.process_recv()
+        self.process_recv(io)
     }
 
     /// Pull the next chunk of outgoing data.
-    ///
-    /// Returns `Some(slice)` with data to send, or `None` if nothing pending.
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-        // First, generate any pending output
-        self.generate_output();
+    pub fn poll_output<'a, const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        self.generate_output(io);
 
-        if self.send_offset >= self.send_buf.len() {
+        if self.send_offset >= io.send_buf.len() {
             return None;
         }
 
-        let avail = self.send_buf.len() - self.send_offset;
+        let avail = io.send_buf.len() - self.send_offset;
         let n = avail.min(buf.len());
-        buf[..n].copy_from_slice(&self.send_buf[self.send_offset..self.send_offset + n]);
+        buf[..n].copy_from_slice(&io.send_buf[self.send_offset..self.send_offset + n]);
         self.send_offset += n;
 
-        // If we've consumed everything, clear the buffer
-        if self.send_offset >= self.send_buf.len() {
-            self.send_buf.clear();
+        if self.send_offset >= io.send_buf.len() {
+            io.send_buf.clear();
             self.send_offset = 0;
         }
 
@@ -272,32 +259,27 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     // ------------------------------------------------------------------
 
     /// Send headers on a new or existing stream.
-    ///
-    /// For clients: opens a new request stream.
-    /// For servers: sends response headers.
-    pub fn send_headers(
+    pub fn send_headers<const BUF: usize>(
         &mut self,
+        io: &mut H2Io<'_, BUF>,
         stream_id: u64,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
-        // Reserve 9 bytes for frame header (filled in after HPACK encoding)
-        let hdr_start = self.send_buf.len();
+        let hdr_start = io.send_buf.len();
         if hdr_start + 9 > BUF {
             return Err(Error::BufferTooSmall { needed: hdr_start + 9 });
         }
-        for _ in 0..9 { let _ = self.send_buf.push(0); }
+        for _ in 0..9 { let _ = io.send_buf.push(0); }
 
-        // Encode HPACK directly into send_buf's remaining capacity (disjoint field borrow)
-        let encode_start = self.send_buf.len();
+        let encode_start = io.send_buf.len();
         let max_hpack = BUF - encode_start;
-        while self.send_buf.len() < BUF {
-            let _ = self.send_buf.push(0);
+        while io.send_buf.len() < BUF {
+            let _ = io.send_buf.push(0);
         }
-        let hpack_len = self.encoder.encode(headers, &mut self.send_buf[encode_start..encode_start + max_hpack])?;
-        self.send_buf.truncate(encode_start + hpack_len);
+        let hpack_len = self.encoder.encode(headers, &mut io.send_buf[encode_start..encode_start + max_hpack])?;
+        io.send_buf.truncate(encode_start + hpack_len);
 
-        // Fill in the frame header now that we know the fragment length
         let mut flags = 0u8;
         if end_stream { flags |= FLAG_END_STREAM; }
         flags |= FLAG_END_HEADERS;
@@ -307,9 +289,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
             flags,
             stream_id,
         };
-        frame::encode_frame_header(&hdr, &mut self.send_buf[hdr_start..hdr_start + 9])?;
+        frame::encode_frame_header(&hdr, &mut io.send_buf[hdr_start..hdr_start + 9])?;
 
-        // Update stream state
         self.ensure_stream(stream_id);
         if let Some(stream) = self.get_stream_mut(stream_id) {
             if stream.state == H2StreamState::Idle {
@@ -324,33 +305,32 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 
     /// Open a new stream and send headers. Returns the stream ID.
-    pub fn open_stream(
+    pub fn open_stream<const BUF: usize>(
         &mut self,
+        io: &mut H2Io<'_, BUF>,
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<u64, Error> {
-        // RFC 9113 §5.1.1: stream IDs must not exceed 2^31-1
         if self.next_stream_id > 0x7fff_ffff {
             return Err(Error::StreamLimitExhausted);
         }
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2;
-        self.send_headers(stream_id, headers, end_stream)?;
+        self.send_headers(io, stream_id, headers, end_stream)?;
         Ok(stream_id)
     }
 
     /// Send data on a stream.
-    pub fn send_data(
+    pub fn send_data<const BUF: usize>(
         &mut self,
+        io: &mut H2Io<'_, BUF>,
         stream_id: u64,
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        // Check stream state
         if let Some(stream) = self.get_stream(stream_id) && !stream.can_send() {
             return Err(Error::InvalidState);
         }
-        // Check flow control
         let max_by_conn = self.conn_send_fc.window().max(0) as usize;
         let max_by_stream = self.get_stream(stream_id)
             .map(|s| s.send_window.max(0) as usize)
@@ -365,10 +345,9 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         let to_send = if data.is_empty() { data } else { &data[..can_send] };
         let actual_end = end_stream && (to_send.len() == data.len());
 
-        // Write DATA frame directly into send_buf (no stack temp needed).
         let total_needed = 9 + to_send.len();
-        if self.send_buf.len() + total_needed > BUF {
-            return Err(Error::BufferTooSmall { needed: self.send_buf.len() + total_needed });
+        if io.send_buf.len() + total_needed > BUF {
+            return Err(Error::BufferTooSmall { needed: io.send_buf.len() + total_needed });
         }
         let flags = if actual_end { FLAG_END_STREAM } else { 0 };
         let hdr = frame::H2FrameHeader {
@@ -377,12 +356,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
             flags,
             stream_id,
         };
-        let hdr_start = self.send_buf.len();
-        for _ in 0..9 { let _ = self.send_buf.push(0); }
-        frame::encode_frame_header(&hdr, &mut self.send_buf[hdr_start..hdr_start + 9])?;
-        let _ = self.send_buf.extend_from_slice(to_send);
+        let hdr_start = io.send_buf.len();
+        for _ in 0..9 { let _ = io.send_buf.push(0); }
+        frame::encode_frame_header(&hdr, &mut io.send_buf[hdr_start..hdr_start + 9])?;
+        let _ = io.send_buf.extend_from_slice(to_send);
 
-        // Update flow control
         if !to_send.is_empty() {
             self.conn_send_fc.consume(to_send.len() as u32)?;
             if let Some(stream) = self.get_stream_mut(stream_id) {
@@ -390,7 +368,6 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
             }
         }
 
-        // Update stream state
         if actual_end && let Some(stream) = self.get_stream_mut(stream_id) {
             stream.send_end_stream();
         }
@@ -418,8 +395,9 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 
     /// Read received body data for a stream.
-    pub fn recv_body(
+    pub fn recv_body<const BUF: usize>(
         &mut self,
+        io: &mut H2Io<'_, BUF>,
         stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
@@ -435,24 +413,22 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         let copy_len = stream.data_buf.len().min(buf.len());
         buf[..copy_len].copy_from_slice(&stream.data_buf[..copy_len]);
 
-        // Shift remaining data
         stream.data_buf.copy_within(copy_len.., 0);
         stream.data_buf.truncate(stream.data_buf.len() - copy_len);
 
         let fin = stream.data_buf.is_empty() && stream.fin_received;
         stream.data_available = !stream.data_buf.is_empty();
 
-        // Send WINDOW_UPDATE for connection and stream
         if copy_len > 0 {
-            self.send_window_update(0, copy_len as u32);
-            self.send_window_update(stream_id, copy_len as u32);
+            self.send_window_update(io, 0, copy_len as u32);
+            self.send_window_update(io, stream_id, copy_len as u32);
         }
 
         Ok((copy_len, fin))
     }
 
     /// Send a GOAWAY frame.
-    pub fn send_goaway(&mut self, error_code: u32) -> Result<(), Error> {
+    pub fn send_goaway<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, error_code: u32) -> Result<(), Error> {
         let frame = H2Frame::GoAway {
             last_stream_id: self.last_peer_stream_id,
             error_code,
@@ -460,7 +436,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&frame, &mut buf)?;
-        self.queue_send(&buf[..n])?;
+        io.queue_send(&buf[..n])?;
         self.goaway_sent = true;
         self.state = H2ConnState::Closing;
         Ok(())
@@ -470,54 +446,50 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     // Internal: output generation
     // ------------------------------------------------------------------
 
-    fn generate_output(&mut self) {
-        // Send connection preface + SETTINGS if not done
+    fn generate_output<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) {
         if !self.preface_sent {
             if self.role == Role::Client {
-                // Client sends the preface magic string
-                let _ = self.queue_send(CONNECTION_PREFACE);
+                let _ = io.queue_send(CONNECTION_PREFACE);
             }
-            // Both roles send SETTINGS
-            let _ = self.send_initial_settings();
+            let _ = self.send_initial_settings(io);
             self.preface_sent = true;
         }
     }
 
-    fn send_initial_settings(&mut self) -> Result<(), Error> {
+    fn send_initial_settings<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
         let mut params = [0u8; 64];
         let params_len = self.local_settings.encode_params(&mut params)?;
         let frame = H2Frame::Settings { ack: false, params: &params[..params_len] };
         let mut buf = [0u8; 128];
         let n = frame::encode_frame(&frame, &mut buf)?;
-        self.queue_send(&buf[..n])?;
+        io.queue_send(&buf[..n])?;
         self.settings_sent = true;
         Ok(())
     }
 
-    fn send_settings_ack(&mut self) -> Result<(), Error> {
+    fn send_settings_ack<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
         let frame = H2Frame::Settings { ack: true, params: &[] };
         let mut buf = [0u8; 16];
         let n = frame::encode_frame(&frame, &mut buf)?;
-        self.queue_send(&buf[..n])
+        io.queue_send(&buf[..n])
     }
 
-    fn send_ping_ack(&mut self, data: [u8; 8]) -> Result<(), Error> {
+    fn send_ping_ack<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, data: [u8; 8]) -> Result<(), Error> {
         let frame = H2Frame::Ping { data, ack: true };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&frame, &mut buf)?;
-        self.queue_send(&buf[..n])
+        io.queue_send(&buf[..n])
     }
 
-    fn send_window_update(&mut self, stream_id: u64, increment: u32) {
+    fn send_window_update<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, stream_id: u64, increment: u32) {
         if increment == 0 {
             return;
         }
         let frame = H2Frame::WindowUpdate { stream_id, increment };
         let mut buf = [0u8; 16];
         if let Ok(n) = frame::encode_frame(&frame, &mut buf) {
-            let _ = self.queue_send(&buf[..n]);
+            let _ = io.queue_send(&buf[..n]);
         }
-        // Update our recv window tracker
         if stream_id == 0 {
             let _ = self.conn_recv_fc.replenish(increment);
         } else if let Some(stream) = self.get_stream_mut(stream_id) {
@@ -526,55 +498,41 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         }
     }
 
-    fn queue_send(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.send_buf.len() + data.len() > BUF {
-            return Err(Error::BufferTooSmall { needed: self.send_buf.len() + data.len() });
-        }
-        let _ = self.send_buf.extend_from_slice(data);
-        Ok(())
-    }
-
     // ------------------------------------------------------------------
     // Internal: receive processing
     // ------------------------------------------------------------------
 
-    fn process_recv(&mut self) -> Result<(), Error> {
-        // Phase 1: Validate connection preface (server only)
+    fn process_recv<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
         if self.role == Role::Server && !self.preface_validated {
-            self.validate_client_preface()?;
+            self.validate_client_preface(io)?;
             if !self.preface_validated {
-                return Ok(()); // Need more data
+                return Ok(());
             }
         }
 
-        // Phase 2: Parse and handle frames inline (no stack temp needed).
-        // Field-level borrows allow reading recv_buf while mutating other fields.
         loop {
-            if self.recv_buf.len() < 9 {
-                break; // Need at least a frame header
+            if io.recv_buf.len() < 9 {
+                break;
             }
 
-            // Parse frame header from recv_buf
-            let payload_len = ((self.recv_buf[0] as usize) << 16)
-                | ((self.recv_buf[1] as usize) << 8)
-                | (self.recv_buf[2] as usize);
+            let payload_len = ((io.recv_buf[0] as usize) << 16)
+                | ((io.recv_buf[1] as usize) << 8)
+                | (io.recv_buf[2] as usize);
             let total = 9 + payload_len;
 
-            if self.recv_buf.len() < total {
-                break; // Incomplete frame
+            if io.recv_buf.len() < total {
+                break;
             }
 
-            let frame_type = self.recv_buf[3];
-            let flags = self.recv_buf[4];
+            let frame_type = io.recv_buf[3];
+            let flags = io.recv_buf[4];
             let stream_id = u32::from_be_bytes([
-                self.recv_buf[5] & 0x7f, self.recv_buf[6],
-                self.recv_buf[7], self.recv_buf[8],
+                io.recv_buf[5] & 0x7f, io.recv_buf[6],
+                io.recv_buf[7], io.recv_buf[8],
             ]) as u64;
-            let ps = 9; // payload start
-            let pe = total; // payload end
+            let ps = 9;
+            let pe = total;
 
-            // RFC 9113 §4.3: If we're expecting CONTINUATION, only CONTINUATION
-            // for the same stream is allowed.
             if let Some(expected_sid) = self.continuation_stream_id {
                 if frame_type != FRAME_CONTINUATION || stream_id != expected_sid {
                     return Err(Error::Http2(crate::error::H2Error::ProtocolError));
@@ -587,12 +545,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                         return Err(Error::Http2(crate::error::H2Error::ProtocolError));
                     }
                     let end_stream = flags & FLAG_END_STREAM != 0;
-                    // Handle padding
                     let (data_start, data_end) = if flags & FLAG_PADDED != 0 {
                         if payload_len == 0 {
                             return Err(Error::BufferTooSmall { needed: 1 });
                         }
-                        let pad_len = self.recv_buf[ps] as usize;
+                        let pad_len = io.recv_buf[ps] as usize;
                         if pad_len >= payload_len {
                             return Err(Error::InvalidState);
                         }
@@ -602,12 +559,10 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                     };
                     let data_len = data_end - data_start;
 
-                    // Update connection recv flow control
                     self.conn_recv_fc.consume(data_len as u32)?;
 
-                    // Copy payload directly from recv_buf to stream data_buf (disjoint fields)
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
-                        let _ = stream.data_buf.extend_from_slice(&self.recv_buf[data_start..data_end]);
+                        let _ = stream.data_buf.extend_from_slice(&io.recv_buf[data_start..data_end]);
                         stream.data_available = true;
                         stream.recv_window -= data_len as i32;
                         if end_stream {
@@ -625,12 +580,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                     }
                     let end_stream = flags & FLAG_END_STREAM != 0;
                     let end_headers = flags & FLAG_END_HEADERS != 0;
-                    // Handle padding
                     let (data_start, data_end) = if flags & FLAG_PADDED != 0 {
                         if payload_len == 0 {
                             return Err(Error::BufferTooSmall { needed: 1 });
                         }
-                        let pad_len = self.recv_buf[ps] as usize;
+                        let pad_len = io.recv_buf[ps] as usize;
                         if pad_len >= payload_len {
                             return Err(Error::InvalidState);
                         }
@@ -638,7 +592,6 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                     } else {
                         (ps, pe)
                     };
-                    // Skip priority data if present
                     let frag_start = if flags & FLAG_PRIORITY != 0 {
                         if data_end - data_start < 5 {
                             return Err(Error::BufferTooSmall { needed: 5 });
@@ -650,13 +603,12 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 
                     self.last_peer_stream_id = self.last_peer_stream_id.max(stream_id);
                     self.ensure_stream(stream_id);
-                    // Copy fragment directly from recv_buf to stream headers_data (disjoint fields)
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
                         if stream.state == H2StreamState::Idle {
                             stream.open();
                         }
                         stream.headers_data.clear();
-                        let _ = stream.headers_data.extend_from_slice(&self.recv_buf[frag_start..data_end]);
+                        let _ = stream.headers_data.extend_from_slice(&io.recv_buf[frag_start..data_end]);
                         if end_headers {
                             stream.headers_received = true;
                         }
@@ -690,12 +642,11 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                         }
                     } else {
                         let old_initial = self.peer_settings.initial_window_size as i32;
-                        // Decode settings directly from recv_buf (disjoint field borrow)
-                        frame::decode_settings_params(&self.recv_buf[ps..pe], |id, value| {
+                        frame::decode_settings_params(&io.recv_buf[ps..pe], |id, value| {
                             self.peer_settings.apply(id, value)
                         })?;
                         self.peer_settings_received = true;
-                        self.send_settings_ack()?;
+                        self.send_settings_ack(io)?;
                         match self.state {
                             H2ConnState::WaitingPreface | H2ConnState::WaitingSettings => {
                                 self.state = H2ConnState::Active;
@@ -718,8 +669,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                         return Err(Error::InvalidState);
                     }
                     let increment = u32::from_be_bytes([
-                        self.recv_buf[ps] & 0x7f, self.recv_buf[ps + 1],
-                        self.recv_buf[ps + 2], self.recv_buf[ps + 3],
+                        io.recv_buf[ps] & 0x7f, io.recv_buf[ps + 1],
+                        io.recv_buf[ps + 2], io.recv_buf[ps + 3],
                     ]);
                     if increment == 0 {
                         return Err(Error::Http2(crate::error::H2Error::ProtocolError));
@@ -743,8 +694,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                     }
                     if flags & FLAG_ACK == 0 {
                         let mut data = [0u8; 8];
-                        data.copy_from_slice(&self.recv_buf[ps..ps + 8]);
-                        self.send_ping_ack(data)?;
+                        data.copy_from_slice(&io.recv_buf[ps..ps + 8]);
+                        self.send_ping_ack(io, data)?;
                     }
                 }
                 FRAME_GOAWAY => {
@@ -755,12 +706,12 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                         return Err(Error::BufferTooSmall { needed: 8 });
                     }
                     let last_stream_id = u32::from_be_bytes([
-                        self.recv_buf[ps] & 0x7f, self.recv_buf[ps + 1],
-                        self.recv_buf[ps + 2], self.recv_buf[ps + 3],
+                        io.recv_buf[ps] & 0x7f, io.recv_buf[ps + 1],
+                        io.recv_buf[ps + 2], io.recv_buf[ps + 3],
                     ]) as u64;
                     let error_code = u32::from_be_bytes([
-                        self.recv_buf[ps + 4], self.recv_buf[ps + 5],
-                        self.recv_buf[ps + 6], self.recv_buf[ps + 7],
+                        io.recv_buf[ps + 4], io.recv_buf[ps + 5],
+                        io.recv_buf[ps + 6], io.recv_buf[ps + 7],
                     ]);
                     self.state = H2ConnState::Closing;
                     let _ = self.events.push_back(H2Event::GoAway(last_stream_id, error_code));
@@ -773,25 +724,22 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                         return Err(Error::InvalidState);
                     }
                     let error_code = u32::from_be_bytes([
-                        self.recv_buf[ps], self.recv_buf[ps + 1],
-                        self.recv_buf[ps + 2], self.recv_buf[ps + 3],
+                        io.recv_buf[ps], io.recv_buf[ps + 1],
+                        io.recv_buf[ps + 2], io.recv_buf[ps + 3],
                     ]);
                     if let Some(stream) = self.get_stream_mut(stream_id) {
                         stream.reset();
                     }
                     let _ = self.events.push_back(H2Event::StreamReset(stream_id, error_code));
                 }
-                FRAME_PRIORITY => {
-                    // Priority frames are advisory; we ignore them.
-                }
+                FRAME_PRIORITY => {}
                 FRAME_CONTINUATION => {
                     if stream_id == 0 {
                         return Err(Error::Http2(crate::error::H2Error::ProtocolError));
                     }
                     let end_headers = flags & FLAG_END_HEADERS != 0;
-                    // Copy fragment directly from recv_buf to stream headers_data (disjoint fields)
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
-                        let _ = stream.headers_data.extend_from_slice(&self.recv_buf[ps..pe]);
+                        let _ = stream.headers_data.extend_from_slice(&io.recv_buf[ps..pe]);
                         if end_headers {
                             stream.headers_received = true;
                             self.continuation_stream_id = None;
@@ -799,48 +747,38 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
                         }
                     }
                 }
-                FRAME_PUSH_PROMISE => {
-                    // We don't support server push; ignore.
-                }
-                _ => {
-                    // Unknown frames are silently ignored (RFC 9113 §4.1).
-                }
+                FRAME_PUSH_PROMISE => {}
+                _ => {}
             }
 
-            self.drain_recv(total);
+            io.drain_recv(total);
         }
 
-        // Clean up closed streams to free slots
         self.streams.retain(|s| s.state != H2StreamState::Closed || s.data_available);
 
         Ok(())
     }
 
-    fn validate_client_preface(&mut self) -> Result<(), Error> {
+    fn validate_client_preface<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
         let expected = CONNECTION_PREFACE;
         let remaining_preface = &expected[self.preface_bytes_seen..];
-        let check_len = remaining_preface.len().min(self.recv_buf.len());
+        let check_len = remaining_preface.len().min(io.recv_buf.len());
 
         for i in 0..check_len {
-            if self.recv_buf[i] != remaining_preface[i] {
-                return Err(Error::InvalidState); // Invalid preface
+            if io.recv_buf[i] != remaining_preface[i] {
+                return Err(Error::InvalidState);
             }
         }
 
         self.preface_bytes_seen += check_len;
         if check_len > 0 {
-            self.drain_recv(check_len);
+            io.drain_recv(check_len);
         }
 
         if self.preface_bytes_seen >= expected.len() {
             self.preface_validated = true;
         }
         Ok(())
-    }
-
-    fn drain_recv(&mut self, n: usize) {
-        self.recv_buf.copy_within(n.., 0);
-        self.recv_buf.truncate(self.recv_buf.len() - n);
     }
 
     // ------------------------------------------------------------------
@@ -904,16 +842,15 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 
     /// Check timeouts. If a timeout fires, queues a GOAWAY frame, transitions
     /// to Closed, and emits `H2Event::Timeout`.
-    pub fn handle_timeout(&mut self, now: u64) {
+    pub fn handle_timeout<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, now: u64) {
         if self.state == H2ConnState::Closed {
             return;
         }
 
-        // Header timeout: fires if headers phase not complete
         if !self.headers_phase_complete {
             if let Some(hdr_us) = self.timeout_config.header_timeout_us {
                 if now >= self.connection_start.saturating_add(hdr_us) {
-                    let _ = self.send_goaway(0);
+                    let _ = self.send_goaway(io, 0);
                     self.state = H2ConnState::Closed;
                     let _ = self.events.push_back(H2Event::Timeout);
                     return;
@@ -924,7 +861,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         // Idle timeout
         if let Some(idle_us) = self.timeout_config.idle_timeout_us {
             if now >= self.last_activity.saturating_add(idle_us) {
-                let _ = self.send_goaway(0);
+                let _ = self.send_goaway(io, 0);
                 self.state = H2ConnState::Closed;
                 let _ = self.events.push_back(H2Event::Timeout);
             }
@@ -932,9 +869,9 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 
     /// Feed data with timestamp tracking. Updates `last_activity` then calls `feed_data`.
-    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+    pub fn feed_data_timed<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, data: &[u8], now: u64) -> Result<(), Error> {
         self.last_activity = now;
-        self.feed_data(data)
+        self.feed_data(io, data)
     }
 
     /// Whether the connection has been closed (GOAWAY sent/received, or timeout).
@@ -955,60 +892,61 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::io::H2IoBufs;
 
     #[test]
     fn client_generates_preface() {
-        let mut conn = H2Connection::<16, 4096>::new_client();
+        let mut conn = H2Connection::<16>::new_client();
+        let mut io = H2IoBufs::<4096>::new();
         let mut buf = [0u8; 4096];
-        let output = conn.poll_output(&mut buf);
+        let output = conn.poll_output(&mut io.as_io(), &mut buf);
         assert!(output.is_some());
         let data = output.unwrap();
-        // Should start with the connection preface
         assert!(data.starts_with(CONNECTION_PREFACE));
-        // Followed by SETTINGS frame
         let after_preface = &data[CONNECTION_PREFACE.len()..];
         assert!(after_preface.len() >= 9);
-        // SETTINGS frame type is 0x04
         assert_eq!(after_preface[3], FRAME_SETTINGS);
     }
 
     #[test]
     fn server_generates_settings_only() {
-        let mut conn = H2Connection::<16, 4096>::new_server();
+        let mut conn = H2Connection::<16>::new_server();
+        let mut io = H2IoBufs::<4096>::new();
         let mut buf = [0u8; 4096];
-        let output = conn.poll_output(&mut buf);
+        let output = conn.poll_output(&mut io.as_io(), &mut buf);
         assert!(output.is_some());
         let data = output.unwrap();
-        // Server should NOT send the preface magic, just SETTINGS
         assert_eq!(data[3], FRAME_SETTINGS);
     }
 
     #[test]
     fn client_server_handshake() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
 
         // Client → Server
         let mut buf = [0u8; 4096];
-        let data = client.poll_output(&mut buf).unwrap();
+        let data = client.poll_output(&mut cio.as_io(), &mut buf).unwrap();
         let client_data: heapless::Vec<u8, 4096> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(data);
             v
         };
-        server.feed_data(&client_data).unwrap();
+        server.feed_data(&mut sio.as_io(), &client_data).unwrap();
 
         // Server → Client
         let mut buf2 = [0u8; 4096];
-        let data = server.poll_output(&mut buf2).unwrap();
+        let data = server.poll_output(&mut sio.as_io(), &mut buf2).unwrap();
         let server_data: heapless::Vec<u8, 4096> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(data);
             v
         };
-        client.feed_data(&server_data).unwrap();
+        client.feed_data(&mut cio.as_io(), &server_data).unwrap();
 
-        // Client should get Connected event (received server SETTINGS)
+        // Client should get Connected event
         let mut client_connected = false;
         while let Some(ev) = client.poll_event() {
             if ev == H2Event::Connected {
@@ -1019,13 +957,13 @@ mod tests {
 
         // Client sends SETTINGS ACK back
         let mut buf3 = [0u8; 4096];
-        if let Some(data) = client.poll_output(&mut buf3) {
+        if let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf3) {
             let ack_data: heapless::Vec<u8, 4096> = {
                 let mut v = heapless::Vec::new();
                 let _ = v.extend_from_slice(data);
                 v
             };
-            server.feed_data(&ack_data).unwrap();
+            server.feed_data(&mut sio.as_io(), &ack_data).unwrap();
         }
 
         // Server should get Connected event
@@ -1040,26 +978,27 @@ mod tests {
 
     #[test]
     fn full_request_response() {
-        let mut client = H2Connection::<16, 16384>::new_client();
-        let mut server = H2Connection::<16, 16384>::new_server();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
 
-        // Run handshake
-        run_handshake(&mut client, &mut server);
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
         // Client sends request
         let stream_id = client.open_stream(
+            &mut cio.as_io(),
             &[
                 (b":method", b"GET"),
                 (b":path", b"/"),
                 (b":scheme", b"https"),
                 (b":authority", b"example.com"),
             ],
-            true, // end_stream — GET has no body
+            true,
         ).unwrap();
         assert_eq!(stream_id, 1);
 
-        // Exchange
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
 
         // Server should see Headers
         let mut got_headers = false;
@@ -1083,14 +1022,14 @@ mod tests {
 
         // Server sends response
         server.send_headers(
+            &mut sio.as_io(),
             header_stream,
             &[(b":status", b"200"), (b"content-type", b"text/plain")],
             false,
         ).unwrap();
-        server.send_data(header_stream, b"Hello!", true).unwrap();
+        server.send_data(&mut sio.as_io(), header_stream, b"Hello!", true).unwrap();
 
-        // Exchange
-        exchange(&mut server, &mut client);
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
 
         // Client should see response
         let mut got_resp = false;
@@ -1107,44 +1046,50 @@ mod tests {
 
         // Client reads response body
         let mut body = [0u8; 256];
-        let (n, fin) = client.recv_body(stream_id, &mut body).unwrap();
+        let (n, fin) = client.recv_body(&mut cio.as_io(), stream_id, &mut body).unwrap();
         assert_eq!(&body[..n], b"Hello!");
         assert!(fin);
     }
 
     #[test]
     fn ping_pong() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
-        run_handshake(&mut client, &mut server);
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Client sends PING
+        // Client sends PING by injecting raw frame into send_buf
         let ping_data = [1, 2, 3, 4, 5, 6, 7, 8];
         let frame = H2Frame::Ping { data: ping_data, ack: false };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&frame, &mut buf).unwrap();
-        client.queue_send(&buf[..n]).unwrap();
+        cio.as_io().queue_send(&buf[..n]).unwrap();
 
-        // Exchange
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
 
         // Server should have sent PING ACK
         let mut buf2 = [0u8; 4096];
-        if let Some(data) = server.poll_output(&mut buf2) {
-            client.feed_data(data).unwrap();
+        if let Some(data) = server.poll_output(&mut sio.as_io(), &mut buf2) {
+            let copy: heapless::Vec<u8, 4096> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(data);
+                v
+            };
+            client.feed_data(&mut cio.as_io(), &copy).unwrap();
         }
-        // We just verify no error occurred — the pong was sent automatically
     }
 
     #[test]
     fn goaway() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
-        run_handshake(&mut client, &mut server);
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Server sends GOAWAY
-        server.send_goaway(0).unwrap();
-        exchange(&mut server, &mut client);
+        server.send_goaway(&mut sio.as_io(), 0).unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
 
         let mut got_goaway = false;
         while let Some(ev) = client.poll_event() {
@@ -1157,28 +1102,32 @@ mod tests {
 
     // Test helpers
 
-    fn run_handshake<const M: usize, const B: usize, const H: usize, const D: usize>(
-        client: &mut H2Connection<M, B, H, D>,
-        server: &mut H2Connection<M, B, H, D>,
+    fn run_handshake<const M: usize, const BUF: usize, const H: usize, const D: usize>(
+        client: &mut H2Connection<M, H, D>,
+        cio: &mut H2IoBufs<BUF>,
+        server: &mut H2Connection<M, H, D>,
+        sio: &mut H2IoBufs<BUF>,
     ) {
         for _ in 0..5 {
-            exchange(client, server);
-            exchange(server, client);
+            exchange(client, cio, server, sio);
+            exchange(server, sio, client, cio);
         }
     }
 
-    fn exchange<const M: usize, const B: usize, const H: usize, const D: usize>(
-        sender: &mut H2Connection<M, B, H, D>,
-        receiver: &mut H2Connection<M, B, H, D>,
+    fn exchange<const M: usize, const BUF: usize, const H: usize, const D: usize>(
+        sender: &mut H2Connection<M, H, D>,
+        sender_io: &mut H2IoBufs<BUF>,
+        receiver: &mut H2Connection<M, H, D>,
+        receiver_io: &mut H2IoBufs<BUF>,
     ) {
         let mut buf = [0u8; 8192];
-        while let Some(data) = sender.poll_output(&mut buf) {
+        while let Some(data) = sender.poll_output(&mut sender_io.as_io(), &mut buf) {
             let copy: heapless::Vec<u8, 8192> = {
                 let mut v = heapless::Vec::new();
                 let _ = v.extend_from_slice(data);
                 v
             };
-            let _ = receiver.feed_data(&copy);
+            let _ = receiver.feed_data(&mut receiver_io.as_io(), &copy);
         }
     }
 
@@ -1186,18 +1135,19 @@ mod tests {
 
     #[test]
     fn idle_timeout_fires() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
 
         let config = crate::http::TimeoutConfig {
-            idle_timeout_us: Some(1_000_000), // 1 second
+            idle_timeout_us: Some(1_000_000),
             header_timeout_us: None,
         };
         server.set_timeouts(config, 0);
-        run_handshake(&mut client, &mut server);
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // No activity for 2 seconds
-        server.handle_timeout(2_000_000);
+        server.handle_timeout(&mut sio.as_io(), 2_000_000);
 
         let mut got_timeout = false;
         while let Some(ev) = server.poll_event() {
@@ -1211,16 +1161,16 @@ mod tests {
 
     #[test]
     fn header_timeout_fires_during_preface() {
-        let mut server = H2Connection::<16, 8192>::new_server();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
 
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: None,
-            header_timeout_us: Some(500_000), // 0.5 seconds
+            header_timeout_us: Some(500_000),
         };
         server.set_timeouts(config, 0);
 
-        // No data sent, header timeout fires
-        server.handle_timeout(600_000);
+        server.handle_timeout(&mut sio.as_io(), 600_000);
 
         let mut got_timeout = false;
         while let Some(ev) = server.poll_event() {
@@ -1234,54 +1184,54 @@ mod tests {
 
     #[test]
     fn activity_resets_idle_timer() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
 
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: Some(1_000_000),
             header_timeout_us: None,
         };
         server.set_timeouts(config, 0);
-        run_handshake(&mut client, &mut server);
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
         // Activity at t=800ms
-        server.feed_data_timed(b"", 800_000).unwrap();
+        server.feed_data_timed(&mut sio.as_io(), b"", 800_000).unwrap();
 
-        // Check at t=1.5s — should NOT timeout (last activity was 800ms, idle is 1s)
-        server.handle_timeout(1_500_000);
+        // Check at t=1.5s — should NOT timeout
+        server.handle_timeout(&mut sio.as_io(), 1_500_000);
         assert!(!server.is_closed());
 
-        // Check at t=2s — SHOULD timeout (1.2s since last activity)
-        server.handle_timeout(2_000_000);
+        // Check at t=2s — SHOULD timeout
+        server.handle_timeout(&mut sio.as_io(), 2_000_000);
         assert!(server.is_closed());
     }
 
     #[test]
     fn is_closed_and_is_established() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
 
-        // Before handshake
         assert!(!server.is_established());
         assert!(!server.is_closed());
 
-        run_handshake(&mut client, &mut server);
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // After handshake
         assert!(server.is_established());
         assert!(!server.is_closed());
 
-        // After GOAWAY
-        server.send_goaway(0).unwrap();
+        server.send_goaway(&mut sio.as_io(), 0).unwrap();
         assert!(!server.is_established());
         assert!(server.is_closed());
     }
 
     #[test]
     fn next_timeout_returns_correct_deadline() {
-        let mut server = H2Connection::<16, 8192>::new_server();
+        let mut server = H2Connection::<16>::new_server();
 
-        // No config → no timeout
         assert_eq!(server.next_timeout(), None);
 
         let config = crate::http::TimeoutConfig {
@@ -1290,9 +1240,6 @@ mod tests {
         };
         server.set_timeouts(config, 100_000);
 
-        // header timeout is 100_000 + 500_000 = 600_000
-        // idle timeout is 100_000 + 1_000_000 = 1_100_000
-        // earliest is 600_000
         assert_eq!(server.next_timeout(), Some(600_000));
     }
 
@@ -1300,8 +1247,10 @@ mod tests {
 
     #[test]
     fn timeout_idle_after_request_response() {
-        let mut client = H2Connection::<16, 32768>::new_client();
-        let mut server = H2Connection::<16, 32768>::new_server();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
 
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: Some(1_000_000),
@@ -1309,10 +1258,10 @@ mod tests {
         };
         server.set_timeouts(config, 0);
 
-        run_handshake(&mut client, &mut server);
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Full request/response cycle
         let stream_id = client.open_stream(
+            &mut cio.as_io(),
             &[
                 (b":method", b"GET"),
                 (b":path", b"/"),
@@ -1321,20 +1270,16 @@ mod tests {
             ],
             true,
         ).unwrap();
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Drain server events so we can see the response
         while let Some(_) = server.poll_event() {}
 
-        // Server sends response
-        server.send_headers(stream_id, &[(b":status", b"200")], true).unwrap();
-        exchange(&mut server, &mut client);
+        server.send_headers(&mut sio.as_io(), stream_id, &[(b":status", b"200")], true).unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
 
-        // Drain client events
         while let Some(_) = client.poll_event() {}
 
-        // Idle for 2 seconds — timeout should fire
-        server.handle_timeout(2_000_000);
+        server.handle_timeout(&mut sio.as_io(), 2_000_000);
 
         let mut got_timeout = false;
         while let Some(ev) = server.poll_event() {
@@ -1348,7 +1293,8 @@ mod tests {
 
     #[test]
     fn timeout_client_header_timeout() {
-        let mut client = H2Connection::<16, 8192>::new_client();
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
 
         let config = crate::http::TimeoutConfig {
             idle_timeout_us: None,
@@ -1356,8 +1302,7 @@ mod tests {
         };
         client.set_timeouts(config, 0);
 
-        // No server interaction — header timeout fires
-        client.handle_timeout(600_000);
+        client.handle_timeout(&mut cio.as_io(), 600_000);
 
         let mut got_timeout = false;
         while let Some(ev) = client.poll_event() {
@@ -1373,12 +1318,14 @@ mod tests {
 
     #[test]
     fn send_data_blocked_by_flow_control() {
-        let mut client = H2Connection::<16, 32768>::new_client();
-        let mut server = H2Connection::<16, 32768>::new_server();
-        run_handshake(&mut client, &mut server);
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Client opens a stream (POST with body)
         let stream_id = client.open_stream(
+            &mut cio.as_io(),
             &[
                 (b":method", b"POST"),
                 (b":path", b"/"),
@@ -1387,34 +1334,34 @@ mod tests {
             ],
             false,
         ).unwrap();
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = server.poll_event() {}
 
-        // Exhaust the flow control window (default 65535 bytes)
         let chunk = [0u8; 16384];
         let mut total_sent = 0usize;
         while total_sent < 65535 {
             let remaining = 65535 - total_sent;
             let to_send = remaining.min(16384);
-            let n = client.send_data(stream_id, &chunk[..to_send], false).unwrap();
+            let n = client.send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false).unwrap();
             total_sent += n;
-            // Drain client output to prevent send_buf overflow
-            exchange(&mut client, &mut server);
+            exchange(&mut client, &mut cio, &mut server, &mut sio);
         }
         assert_eq!(total_sent, 65535);
 
-        // Try to send 1 more byte — should be blocked by flow control
-        let result = client.send_data(stream_id, &[0u8; 1], false);
+        let result = client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false);
         assert_eq!(result, Err(Error::WouldBlock));
     }
 
     #[test]
     fn send_data_resumes_after_window_update() {
-        let mut client = H2Connection::<16, 32768>::new_client();
-        let mut server = H2Connection::<16, 32768>::new_server();
-        run_handshake(&mut client, &mut server);
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
         let stream_id = client.open_stream(
+            &mut cio.as_io(),
             &[
                 (b":method", b"POST"),
                 (b":path", b"/"),
@@ -1423,34 +1370,32 @@ mod tests {
             ],
             false,
         ).unwrap();
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = server.poll_event() {}
 
-        // Exhaust the window
         let chunk = [0u8; 16384];
         let mut total_sent = 0usize;
         while total_sent < 65535 {
             let remaining = 65535 - total_sent;
             let to_send = remaining.min(16384);
-            let n = client.send_data(stream_id, &chunk[..to_send], false).unwrap();
+            let n = client.send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false).unwrap();
             total_sent += n;
-            exchange(&mut client, &mut server);
+            exchange(&mut client, &mut cio, &mut server, &mut sio);
         }
-        assert_eq!(client.send_data(stream_id, &[0u8; 1], false), Err(Error::WouldBlock));
+        assert_eq!(client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false), Err(Error::WouldBlock));
 
-        // Inject WINDOW_UPDATE frames (both stream-level and connection-level)
+        // Inject WINDOW_UPDATE frames
         let wu_stream = H2Frame::WindowUpdate { stream_id, increment: 1024 };
         let wu_conn = H2Frame::WindowUpdate { stream_id: 0, increment: 1024 };
         let mut buf = [0u8; 16];
 
         let n = frame::encode_frame(&wu_stream, &mut buf).unwrap();
-        client.feed_data(&buf[..n]).unwrap();
+        client.feed_data(&mut cio.as_io(), &buf[..n]).unwrap();
 
         let n = frame::encode_frame(&wu_conn, &mut buf).unwrap();
-        client.feed_data(&buf[..n]).unwrap();
+        client.feed_data(&mut cio.as_io(), &buf[..n]).unwrap();
 
-        // Now send should succeed
-        let result = client.send_data(stream_id, &[0u8; 1024], true);
+        let result = client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1024], true);
         assert_eq!(result, Ok(1024));
     }
 
@@ -1458,12 +1403,14 @@ mod tests {
 
     #[test]
     fn rst_stream_emits_event() {
-        let mut client = H2Connection::<16, 8192>::new_client();
-        let mut server = H2Connection::<16, 8192>::new_server();
-        run_handshake(&mut client, &mut server);
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Client opens a stream
         let stream_id = client.open_stream(
+            &mut cio.as_io(),
             &[
                 (b":method", b"GET"),
                 (b":path", b"/"),
@@ -1472,14 +1419,13 @@ mod tests {
             ],
             true,
         ).unwrap();
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = client.poll_event() {}
 
-        // Inject RST_STREAM (CANCEL=0x8) targeting the client's stream
         let rst = H2Frame::RstStream { stream_id, error_code: 0x8 };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&rst, &mut buf).unwrap();
-        client.feed_data(&buf[..n]).unwrap();
+        client.feed_data(&mut cio.as_io(), &buf[..n]).unwrap();
 
         let mut got_reset = false;
         while let Some(ev) = client.poll_event() {
@@ -1496,44 +1442,46 @@ mod tests {
     fn invalid_settings_rejected() {
         // Sub-check 1: ENABLE_PUSH = 2 → ProtocolError
         {
-            let mut conn = H2Connection::<16, 8192>::new_client();
+            let mut conn = H2Connection::<16>::new_client();
+            let mut io = H2IoBufs::<8192>::new();
             let frame: &[u8] = &[
-                0x00, 0x00, 0x06, // length = 6
-                0x04,             // type = SETTINGS
-                0x00,             // flags = 0
-                0x00, 0x00, 0x00, 0x00, // stream_id = 0
-                0x00, 0x02,       // SETTINGS_ENABLE_PUSH
-                0x00, 0x00, 0x00, 0x02, // value = 2 (invalid, must be 0 or 1)
+                0x00, 0x00, 0x06,
+                0x04, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x02,
+                0x00, 0x00, 0x00, 0x02,
             ];
-            let result = conn.feed_data(frame);
+            let result = conn.feed_data(&mut io.as_io(), frame);
             assert_eq!(result, Err(Error::Http2(crate::error::H2Error::ProtocolError)));
         }
 
         // Sub-check 2: INITIAL_WINDOW_SIZE = 0x8000_0000 → FlowControlError
         {
-            let mut conn = H2Connection::<16, 8192>::new_client();
+            let mut conn = H2Connection::<16>::new_client();
+            let mut io = H2IoBufs::<8192>::new();
             let frame: &[u8] = &[
                 0x00, 0x00, 0x06,
                 0x04, 0x00,
                 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x04,             // SETTINGS_INITIAL_WINDOW_SIZE
-                0x80, 0x00, 0x00, 0x00, // value = 0x8000_0000 (exceeds 2^31-1)
+                0x00, 0x04,
+                0x80, 0x00, 0x00, 0x00,
             ];
-            let result = conn.feed_data(frame);
+            let result = conn.feed_data(&mut io.as_io(), frame);
             assert_eq!(result, Err(Error::Http2(crate::error::H2Error::FlowControlError)));
         }
 
         // Sub-check 3: MAX_FRAME_SIZE = 100 → ProtocolError
         {
-            let mut conn = H2Connection::<16, 8192>::new_client();
+            let mut conn = H2Connection::<16>::new_client();
+            let mut io = H2IoBufs::<8192>::new();
             let frame: &[u8] = &[
                 0x00, 0x00, 0x06,
                 0x04, 0x00,
                 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x05,             // SETTINGS_MAX_FRAME_SIZE
-                0x00, 0x00, 0x00, 0x64, // value = 100 (below 16384 minimum)
+                0x00, 0x05,
+                0x00, 0x00, 0x00, 0x64,
             ];
-            let result = conn.feed_data(frame);
+            let result = conn.feed_data(&mut io.as_io(), frame);
             assert_eq!(result, Err(Error::Http2(crate::error::H2Error::ProtocolError)));
         }
     }
@@ -1542,9 +1490,11 @@ mod tests {
 
     #[test]
     fn stream_vec_full_returns_error() {
-        let mut client = H2Connection::<4, 8192>::new_client();
-        let mut server = H2Connection::<4, 8192>::new_server();
-        run_handshake(&mut client, &mut server);
+        let mut client = H2Connection::<4>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<4>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
         let headers: &[(&[u8], &[u8])] = &[
             (b":method", b"GET"),
@@ -1553,24 +1503,17 @@ mod tests {
             (b":authority", b"example.com"),
         ];
 
-        // Open MAX_STREAMS (4) streams — all should succeed
         for i in 0..4u64 {
-            let result = client.open_stream(headers, true);
+            let result = client.open_stream(&mut cio.as_io(), headers, true);
             assert!(result.is_ok(), "stream {} should open successfully", i);
         }
-        exchange(&mut client, &mut server);
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
 
-        // 5th open: ensure_stream silently drops the stream slot.
-        // The stream ID is allocated and HEADERS frame queued, but
-        // no stream entry is created — send_data on it returns WouldBlock
-        // because get_stream returns None (window = 0).
-        let result = client.open_stream(headers, true);
+        let result = client.open_stream(&mut cio.as_io(), headers, true);
         assert!(result.is_ok(), "open_stream succeeds (HEADERS encoded)");
         let overflow_id = result.unwrap();
 
-        // Verify the stream slot was NOT created: send_data gets
-        // max_by_stream=0 from the missing stream → WouldBlock
-        let send_result = client.send_data(overflow_id, b"x", true);
+        let send_result = client.send_data(&mut cio.as_io(), overflow_id, b"x", true);
         assert_eq!(send_result, Err(Error::WouldBlock));
     }
 }
