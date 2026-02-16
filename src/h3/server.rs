@@ -32,7 +32,7 @@ where
     C::Hkdf: Default,
 {
     /// Wrap a QUIC connection as an HTTP/3 server.
-    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>) -> Self {
+    pub fn new(quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>) -> Self {
         Self {
             inner: H3Connection::new(quic),
         }
@@ -112,7 +112,8 @@ where
 
     /// Process an incoming UDP datagram.
     pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], now: Instant, pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
-        self.inner.quic.recv(datagram, now, pool)
+        let mut sio = self.inner.sio_bufs.as_io();
+        self.inner.quic.recv(&mut sio, datagram, now, pool)
     }
 
     /// Build the next outgoing UDP datagram.
@@ -122,7 +123,8 @@ where
         now: Instant,
         pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
     ) -> Option<Transmit<'a>> {
-        self.inner.quic.poll_transmit(buf, now, pool)
+        let mut sio = self.inner.sio_bufs.as_io();
+        self.inner.quic.poll_transmit(&mut sio, buf, now, pool)
     }
 
     /// Get the next timer deadline.

@@ -11,8 +11,8 @@ use crate::transport::recovery::SentPacket;
 use super::recv::level_index;
 use super::{Connection, ConnectionState, Transmit};
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
@@ -21,8 +21,9 @@ where
     /// The `pool` parameter provides access to the shared handshake state for
     /// sending TLS CRYPTO frames. For post-handshake connections, only
     /// application-level frames are sent.
-    pub fn poll_transmit<'a, const CRYPTO_BUF: usize>(
+    pub fn poll_transmit<'a, const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
         &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
         buf: &'a mut [u8],
         now: Instant,
         pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
@@ -133,7 +134,7 @@ where
 
         // 4. Application-level data (STREAM frames, ACKs, HANDSHAKE_DONE, etc.)
         if self.keys.has_send_keys(Level::Application)
-            && let Some(pkt_len) = self.build_short_packet(&mut buf[total_written..], now)
+            && let Some(pkt_len) = self.build_short_packet(sio, &mut buf[total_written..], now)
         {
             total_written += pkt_len;
         }
@@ -252,7 +253,7 @@ where
     }
 
     /// Build a short (1-RTT) packet if there's something to send.
-    fn build_short_packet(&mut self, buf: &mut [u8], now: Instant) -> Option<usize> {
+    fn build_short_packet<const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, buf: &mut [u8], now: Instant) -> Option<usize> {
         let level = Level::Application;
 
         let mut frame_buf = [0u8; 2048];
@@ -290,7 +291,7 @@ where
         }
 
         // STREAM frames from pending send buffers
-        let stream_written = self.build_stream_frames(&mut frame_buf[frame_len..]);
+        let stream_written = self.build_stream_frames(sio, &mut frame_buf[frame_len..]);
         frame_len += stream_written;
 
         if frame_len == 0 {
@@ -448,12 +449,12 @@ where
     }
 
     /// Build STREAM frames from pending send data.
-    fn build_stream_frames(&mut self, buf: &mut [u8]) -> usize {
+    fn build_stream_frames<const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, buf: &mut [u8]) -> usize {
         let mut total = 0;
         let mut idx = 0;
 
-        while idx < self.stream_send_queue.len() {
-            let entry = &self.stream_send_queue[idx];
+        while idx < sio.send_queue.len() {
+            let entry = &sio.send_queue[idx];
             let stream_id = entry.stream_id;
             let data_len = entry.len;
             let fin = entry.fin;
@@ -483,8 +484,8 @@ where
 
         // Remove sent entries
         for _ in 0..idx {
-            if !self.stream_send_queue.is_empty() {
-                self.stream_send_queue.remove(0);
+            if !sio.send_queue.is_empty() {
+                sio.send_queue.remove(0);
             }
         }
 
@@ -762,11 +763,15 @@ mod tests {
     use crate::packet::MIN_INITIAL_PACKET_SIZE;
     use crate::tls::transport_params::TransportParams;
     use crate::transport::Rng;
+    use super::super::io::QuicStreamIoBufs;
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     use crate::crypto::rustcrypto::Aes128GcmProvider;
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     use crate::tls::handshake::ServerTlsConfig;
+
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    type SioBufs = QuicStreamIoBufs<32, 1024, 16>;
 
     // -----------------------------------------------------------------------
     // Test infrastructure
@@ -805,9 +810,9 @@ mod tests {
     }
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn make_client(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
+    fn make_client(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> (Connection<Aes128GcmProvider>, SioBufs) {
         let mut rng = TestRng(0x10);
-        Connection::client(
+        let conn = Connection::client(
             Aes128GcmProvider,
             "test.local",
             &[b"h3"],
@@ -815,11 +820,12 @@ mod tests {
             &mut rng,
             pool,
         )
-        .unwrap()
+        .unwrap();
+        (conn, SioBufs::new())
     }
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn make_server(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
+    fn make_server(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> (Connection<Aes128GcmProvider>, SioBufs) {
         let mut rng = TestRng(0x50);
         let config = ServerTlsConfig {
             cert_der: get_test_ed25519_cert_der(),
@@ -827,49 +833,52 @@ mod tests {
             alpn_protocols: &[b"h3"],
             transport_params: TransportParams::default_params(),
         };
-        Connection::server(
+        let conn = Connection::server(
             Aes128GcmProvider,
             config,
             TransportParams::default_params(),
             &mut rng,
             pool,
         )
-        .unwrap()
+        .unwrap();
+        (conn, SioBufs::new())
     }
 
     /// Exchange packets between client and server until both are established.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     fn run_handshake(
         client: &mut Connection<Aes128GcmProvider>,
+        c_sio: &mut SioBufs,
         server: &mut Connection<Aes128GcmProvider>,
+        s_sio: &mut SioBufs,
         now: crate::transport::Instant,
         pool: &mut HandshakePool<Aes128GcmProvider, 4>,
     ) {
         for _round in 0..20 {
             loop {
                 let mut buf = [0u8; 4096];
-                match client.poll_transmit(&mut buf, now, pool) {
+                match client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, pool) {
                     Some(tx) => {
                         let data: heapless::Vec<u8, 4096> = {
                             let mut v = heapless::Vec::new();
                             let _ = v.extend_from_slice(tx.data);
                             v
                         };
-                        let _ = server.recv(&data, now, pool);
+                        let _ = server.recv(&mut s_sio.as_io(), &data, now, pool);
                     }
                     None => break,
                 }
             }
             loop {
                 let mut buf = [0u8; 4096];
-                match server.poll_transmit(&mut buf, now, pool) {
+                match server.poll_transmit(&mut s_sio.as_io(), &mut buf, now, pool) {
                     Some(tx) => {
                         let data: heapless::Vec<u8, 4096> = {
                             let mut v = heapless::Vec::new();
                             let _ = v.extend_from_slice(tx.data);
                             v
                         };
-                        let _ = client.recv(&data, now, pool);
+                        let _ = client.recv(&mut c_sio.as_io(), &data, now, pool);
                     }
                     None => break,
                 }
@@ -887,10 +896,10 @@ mod tests {
 
     /// Drain all pending transmits from a connection.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn drain_transmits(conn: &mut Connection<Aes128GcmProvider>, now: crate::transport::Instant, pool: &mut HandshakePool<Aes128GcmProvider, 4>) {
+    fn drain_transmits(conn: &mut Connection<Aes128GcmProvider>, sio: &mut SioBufs, now: crate::transport::Instant, pool: &mut HandshakePool<Aes128GcmProvider, 4>) {
         loop {
             let mut buf = [0u8; 4096];
-            if conn.poll_transmit(&mut buf, now, pool).is_none() {
+            if conn.poll_transmit(&mut sio.as_io(), &mut buf, now, pool).is_none() {
                 break;
             }
         }
@@ -904,15 +913,15 @@ mod tests {
     #[test]
     fn poll_transmit_returns_none_when_nothing_to_send() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
         let mut buf = [0u8; 2048];
 
         // First call emits the Initial (ClientHello).
-        let tx1 = client.poll_transmit(&mut buf, 0, &mut pool);
+        let tx1 = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool);
         assert!(tx1.is_some(), "first call should produce Initial");
 
         // Second call: no more data to send.
-        let tx2 = client.poll_transmit(&mut buf, 0, &mut pool);
+        let tx2 = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool);
         assert!(tx2.is_none(), "second call should return None");
     }
 
@@ -924,9 +933,9 @@ mod tests {
     #[test]
     fn client_initial_padded_to_1200_bytes() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, 0, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool).unwrap();
         assert!(
             tx.data.len() >= MIN_INITIAL_PACKET_SIZE,
             "Initial packet must be padded to at least {} bytes, got {}",
@@ -943,9 +952,9 @@ mod tests {
     #[test]
     fn client_initial_has_long_header() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, 0, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool).unwrap();
         // The form bit (bit 7) of a long header is 1.
         assert_ne!(
             tx.data[0] & 0x80,
@@ -962,13 +971,13 @@ mod tests {
     #[test]
     fn server_produces_response_after_client_initial() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
 
         // Client sends Initial.
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool).unwrap();
         let initial: heapless::Vec<u8, 2048> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(tx.data);
@@ -976,11 +985,11 @@ mod tests {
         };
 
         // Server receives it.
-        server.recv(&initial, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &initial, now, &mut pool).unwrap();
 
         // Server should now have something to send back (ServerHello).
         let mut srv_buf = [0u8; 4096];
-        let srv_tx = server.poll_transmit(&mut srv_buf, now, &mut pool);
+        let srv_tx = server.poll_transmit(&mut s_sio.as_io(), &mut srv_buf, now, &mut pool);
         assert!(
             srv_tx.is_some(),
             "server should produce a response after receiving client Initial"
@@ -1003,18 +1012,18 @@ mod tests {
     #[test]
     fn stream_data_produces_short_header_packet() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
 
         // Send stream data.
         let stream_id = client.open_stream().unwrap();
-        client.stream_send(stream_id, b"test data", false).unwrap();
+        client.stream_send(&mut c_sio.as_io(), stream_id, b"test data", false).unwrap();
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool).unwrap();
 
         // Short header: form bit (bit 7) = 0.
         assert_eq!(
@@ -1032,27 +1041,27 @@ mod tests {
     #[test]
     fn stream_data_received_and_readable() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
         let stream_id = client.open_stream().unwrap();
         let payload = b"hello server!";
-        client.stream_send(stream_id, payload, false).unwrap();
+        client.stream_send(&mut c_sio.as_io(), stream_id, payload, false).unwrap();
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool).unwrap();
         let pkt: heapless::Vec<u8, 2048> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(tx.data);
             v
         };
 
-        server.recv(&pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
 
         let mut recv_buf = [0u8; 256];
-        let (len, fin) = server.stream_recv(stream_id, &mut recv_buf).unwrap();
+        let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf).unwrap();
         assert_eq!(&recv_buf[..len], payload);
         assert!(!fin, "FIN should not be set");
     }
@@ -1065,17 +1074,17 @@ mod tests {
     #[test]
     fn connection_close_produces_packet() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
 
         client.close(42, b"goodbye");
         assert_eq!(client.state(), ConnectionState::Closing);
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool);
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool);
         assert!(tx.is_some(), "closing should produce a CONNECTION_CLOSE packet");
         assert_eq!(
             client.state(),
@@ -1092,21 +1101,21 @@ mod tests {
     #[test]
     fn connection_close_no_further_transmits() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
 
         client.close(0, b"done");
 
         // Drain the close packet.
         let mut buf = [0u8; 2048];
-        let _ = client.poll_transmit(&mut buf, now, &mut pool);
+        let _ = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool);
         assert!(client.is_closed());
 
         // Nothing further should be sent after Closed.
-        let tx = client.poll_transmit(&mut buf, now, &mut pool);
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool);
         assert!(
             tx.is_none(),
             "no packets should be sent after connection is Closed"
@@ -1121,13 +1130,13 @@ mod tests {
     #[test]
     fn packet_number_increments_after_transmit() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
 
         // Before any transmit, Initial PN starts at 0.
         assert_eq!(client.next_pn[0], 0, "Initial PN should start at 0");
 
         let mut buf = [0u8; 2048];
-        let _ = client.poll_transmit(&mut buf, 0, &mut pool);
+        let _ = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool);
 
         // After sending one Initial packet, PN should be 1.
         assert_eq!(
@@ -1144,14 +1153,14 @@ mod tests {
     #[test]
     fn server_sends_handshake_done() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
 
         // Server starts with need_handshake_done = true.
         assert!(server.need_handshake_done);
 
-        run_handshake(&mut client, &mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
         // After handshake, the server should have cleared need_handshake_done
         // because it was transmitted as part of the handshake exchange.
@@ -1169,14 +1178,14 @@ mod tests {
     #[test]
     fn anti_amplification_blocks_without_received_bytes() {
         let mut pool = make_pool();
-        let mut server = make_server(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
 
         // Server with no received bytes should not be able to send.
         assert!(!server.address_validated);
         assert_eq!(server.anti_amplification_bytes_received, 0);
 
         let mut buf = [0u8; 2048];
-        let tx = server.poll_transmit(&mut buf, 0, &mut pool);
+        let tx = server.poll_transmit(&mut s_sio.as_io(), &mut buf, 0, &mut pool);
         assert!(
             tx.is_none(),
             "server should not send when no bytes have been received (anti-amplification)"
@@ -1191,7 +1200,7 @@ mod tests {
     #[test]
     fn build_ack_frame_single_range() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, _c_sio) = make_client(&mut pool);
 
         // Record a contiguous range of packet numbers at Initial level.
         client.track_received_pn(Level::Initial, 0);
@@ -1224,7 +1233,7 @@ mod tests {
     #[test]
     fn build_ack_frame_multiple_ranges() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, _c_sio) = make_client(&mut pool);
 
         // Record non-contiguous PNs: [0,1] and [5,6] and [10,10].
         client.track_received_pn(Level::Initial, 0);
@@ -1259,7 +1268,7 @@ mod tests {
     #[test]
     fn build_ack_frame_empty_tracker_returns_none() {
         let mut pool = make_pool();
-        let client = make_client(&mut pool);
+        let (client, _c_sio) = make_client(&mut pool);
 
         // No PNs recorded.
         let mut buf = [0u8; 256];
@@ -1278,31 +1287,31 @@ mod tests {
     #[test]
     fn multiple_streams_in_one_packet() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
 
         // Open two streams and queue data on both.
         let s1 = client.open_stream().unwrap();
         let s2 = client.open_stream().unwrap();
-        client.stream_send(s1, b"stream one", false).unwrap();
-        client.stream_send(s2, b"stream two", false).unwrap();
+        client.stream_send(&mut c_sio.as_io(), s1, b"stream one", false).unwrap();
+        client.stream_send(&mut c_sio.as_io(), s2, b"stream two", false).unwrap();
 
         assert_eq!(
-            client.stream_send_queue.len(),
+            c_sio.send_queue.len(),
             2,
             "two stream entries should be queued"
         );
 
         // A single poll_transmit should drain both streams.
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool);
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool);
         assert!(tx.is_some(), "should produce a packet with both streams");
 
         assert_eq!(
-            client.stream_send_queue.len(),
+            c_sio.send_queue.len(),
             0,
             "send queue should be empty after transmit"
         );
@@ -1316,51 +1325,51 @@ mod tests {
     #[test]
     fn bidirectional_stream_exchange() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
-        drain_transmits(&mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
+        drain_transmits(&mut server, &mut s_sio, now, &mut pool);
 
         // Client sends a request.
         let c_stream = client.open_stream().unwrap();
         client
-            .stream_send(c_stream, b"GET / HTTP/1.0", true)
+            .stream_send(&mut c_sio.as_io(), c_stream, b"GET / HTTP/1.0", true)
             .unwrap();
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool).unwrap();
         let pkt: heapless::Vec<u8, 2048> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(tx.data);
             v
         };
-        server.recv(&pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
 
         // Server reads the request.
         let mut recv_buf = [0u8; 256];
-        let (len, fin) = server.stream_recv(c_stream, &mut recv_buf).unwrap();
+        let (len, fin) = server.stream_recv(&mut s_sio.as_io(), c_stream, &mut recv_buf).unwrap();
         assert_eq!(&recv_buf[..len], b"GET / HTTP/1.0");
         assert!(fin);
 
         // Server sends a response on the same stream.
         server
-            .stream_send(c_stream, b"200 OK", true)
+            .stream_send(&mut s_sio.as_io(), c_stream, b"200 OK", true)
             .unwrap();
 
         let mut buf = [0u8; 2048];
-        let tx = server.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = server.poll_transmit(&mut s_sio.as_io(), &mut buf, now, &mut pool).unwrap();
         let pkt: heapless::Vec<u8, 2048> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(tx.data);
             v
         };
-        client.recv(&pkt, now, &mut pool).unwrap();
+        client.recv(&mut c_sio.as_io(), &pkt, now, &mut pool).unwrap();
 
         // Client reads the response.
         let mut recv_buf = [0u8; 256];
-        let (len, fin) = client.stream_recv(c_stream, &mut recv_buf).unwrap();
+        let (len, fin) = client.stream_recv(&mut c_sio.as_io(), c_stream, &mut recv_buf).unwrap();
         assert_eq!(&recv_buf[..len], b"200 OK");
         assert!(fin);
     }
@@ -1373,11 +1382,11 @@ mod tests {
     #[test]
     fn closed_connection_returns_none() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
         client.state = ConnectionState::Closed;
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, 0, &mut pool);
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool);
         assert!(
             tx.is_none(),
             "Closed connection should not produce any transmits"
@@ -1392,14 +1401,14 @@ mod tests {
     #[test]
     fn close_before_handshake_sends_initial_level_close() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
 
         // Close immediately before any handshake exchange.
         client.close(1, b"early close");
         assert_eq!(client.state(), ConnectionState::Closing);
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, 0, &mut pool);
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool);
         assert!(
             tx.is_some(),
             "CONNECTION_CLOSE should be sent at Initial level"
@@ -1422,8 +1431,8 @@ mod tests {
     #[test]
     fn packet_number_increments_across_levels() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
 
         // Initial PN spaces all start at 0.
@@ -1431,7 +1440,7 @@ mod tests {
         assert_eq!(client.next_pn[1], 0);
         assert_eq!(client.next_pn[2], 0);
 
-        run_handshake(&mut client, &mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
         // After handshake, Initial PN should have been incremented (at least 1 Initial sent).
         assert!(
@@ -1449,17 +1458,17 @@ mod tests {
     #[test]
     fn connection_close_received_by_peer() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
-        drain_transmits(&mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
+        drain_transmits(&mut server, &mut s_sio, now, &mut pool);
 
         // Client closes.
         client.close(99, b"error");
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool).unwrap();
         let pkt: heapless::Vec<u8, 2048> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(tx.data);
@@ -1467,7 +1476,7 @@ mod tests {
         };
 
         // Server receives the CONNECTION_CLOSE.
-        server.recv(&pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
         assert_eq!(
             server.state(),
             ConnectionState::Draining,
@@ -1493,7 +1502,7 @@ mod tests {
     #[test]
     fn anti_amplification_bytes_sent_tracking() {
         let mut pool = make_pool();
-        let mut server = make_server(&mut pool);
+        let (mut server, _s_sio) = make_server(&mut pool);
 
         // Simulate receiving 2000 bytes so the server can send up to 6000.
         server.anti_amplification_bytes_received = 2000;
@@ -1514,26 +1523,26 @@ mod tests {
     #[test]
     fn stream_send_with_fin_received() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
         let stream_id = client.open_stream().unwrap();
-        client.stream_send(stream_id, b"final", true).unwrap();
+        client.stream_send(&mut c_sio.as_io(), stream_id, b"final", true).unwrap();
 
         let mut buf = [0u8; 2048];
-        let tx = client.poll_transmit(&mut buf, now, &mut pool).unwrap();
+        let tx = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool).unwrap();
         let pkt: heapless::Vec<u8, 2048> = {
             let mut v = heapless::Vec::new();
             let _ = v.extend_from_slice(tx.data);
             v
         };
 
-        server.recv(&pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
 
         let mut recv_buf = [0u8; 256];
-        let (len, fin) = server.stream_recv(stream_id, &mut recv_buf).unwrap();
+        let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf).unwrap();
         assert_eq!(&recv_buf[..len], b"final");
         assert!(fin, "FIN should be set on the received stream data");
     }
@@ -1546,13 +1555,13 @@ mod tests {
     #[test]
     fn initial_packet_records_sent_packet() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
 
         // Before transmit, no packets recorded.
         assert_eq!(client.sent_tracker.count(), 0);
 
         let mut buf = [0u8; 2048];
-        let _ = client.poll_transmit(&mut buf, 0, &mut pool);
+        let _ = client.poll_transmit(&mut c_sio.as_io(), &mut buf, 0, &mut pool);
 
         // After transmit, one packet should be recorded.
         assert_eq!(
@@ -1570,10 +1579,10 @@ mod tests {
     #[test]
     fn handshake_packet_pn_separate_from_initial() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
         // Initial and Handshake have separate PN spaces.
         // Both should have been incremented.
@@ -1599,22 +1608,22 @@ mod tests {
     #[test]
     fn stream_data_after_close_is_blocked() {
         let mut pool = make_pool();
-        let mut client = make_client(&mut pool);
-        let mut server = make_server(&mut pool);
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
-        run_handshake(&mut client, &mut server, now, &mut pool);
-        drain_transmits(&mut client, now, &mut pool);
+        run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+        drain_transmits(&mut client, &mut c_sio, now, &mut pool);
 
         let stream_id = client.open_stream().unwrap();
         client.close(0, b"bye");
 
         // Drain the close packet.
         let mut buf = [0u8; 2048];
-        let _ = client.poll_transmit(&mut buf, now, &mut pool);
+        let _ = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool);
         assert!(client.is_closed());
 
         // Sending on a stream after close should fail.
-        let result = client.stream_send(stream_id, b"too late", false);
+        let result = client.stream_send(&mut c_sio.as_io(), stream_id, b"too late", false);
         assert!(
             result.is_err(),
             "stream_send after close should return an error"

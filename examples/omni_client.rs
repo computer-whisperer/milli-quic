@@ -239,7 +239,7 @@ fn run_h3(addr: &str) {
         Aes128GcmProvider, "localhost", &[b"h3"], tp, &mut rng, &mut pool,
     ).expect("create client");
 
-    let mut h3 = H3Client::new(conn);
+    let mut h3: H3Client<Aes128GcmProvider> = H3Client::new(conn);
     let mut request_sent = false;
     let mut request_stream: Option<u64> = None;
 

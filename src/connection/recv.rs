@@ -169,8 +169,8 @@ struct PacketResult {
     pn: u64,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
+    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
@@ -180,7 +180,7 @@ where
     /// For post-handshake connections (handshake_slot is None), handshake
     /// processing is skipped but the pool parameter is still required
     /// for the type signature.
-    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    pub fn recv<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, datagram: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
         if matches!(self.state, ConnectionState::Closed) {
             return Err(Error::Closed);
         }
@@ -211,15 +211,15 @@ where
             let result = if is_long {
                 let pkt_type = (first_byte & 0x30) >> 4;
                 match pkt_type {
-                    0b00 => self.recv_initial(pkt_data, now, pool),
-                    0b10 => self.recv_handshake(pkt_data, now, pool),
+                    0b00 => self.recv_initial(sio, pkt_data, now, pool),
+                    0b10 => self.recv_handshake(sio, pkt_data, now, pool),
                     _ => {
                         // 0-RTT, Retry, Version Negotiation: skip for now
                         continue;
                     }
                 }
             } else {
-                self.recv_short(pkt_data, now, pool)
+                self.recv_short(sio, pkt_data, now, pool)
             };
 
             match result {
@@ -242,7 +242,7 @@ where
                     // Track received PNs for ACK generation
                     self.track_received_pn(pr.level, pr.pn);
                 }
-                Err(e) => {
+                Err(_e) => {
                     // Decryption failure or parse error: silently discard this packet
                     // per RFC 9000 Section 12.2
                     #[cfg(feature = "std")]
@@ -259,7 +259,7 @@ where
     }
 
     /// Process an Initial packet.
-    fn recv_initial<const CRYPTO_BUF: usize>(&mut self, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_initial<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_initial_header(pkt_data)?;
 
         // If we are server and this is the first Initial, derive Initial keys from DCID
@@ -304,7 +304,7 @@ where
                     pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
                 )?
             };
-            let ack_eliciting = self.dispatch_frames(&decrypted, level, now, pool)?;
+            let ack_eliciting = self.dispatch_frames(sio, &decrypted, level, now, pool)?;
             Ok(PacketResult { ack_eliciting, level, pn })
         }
         #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
@@ -315,7 +315,7 @@ where
     }
 
     /// Process a Handshake packet.
-    fn recv_handshake<const CRYPTO_BUF: usize>(&mut self, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_handshake<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_handshake_header(pkt_data)?;
 
         let level = Level::Handshake;
@@ -326,12 +326,12 @@ where
                 pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
             )?
         };
-        let ack_eliciting = self.dispatch_frames(&decrypted, level, now, pool)?;
+        let ack_eliciting = self.dispatch_frames(sio, &decrypted, level, now, pool)?;
         Ok(PacketResult { ack_eliciting, level, pn })
     }
 
     /// Process a short (1-RTT) packet with key phase handling (RFC 9001 section 6).
-    fn recv_short<const CRYPTO_BUF: usize>(&mut self, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_short<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let dcid_len = if self.local_cids.is_empty() {
             0
         } else {
@@ -420,7 +420,7 @@ where
                         self.keys.key_update.update_confirmed = true;
                     }
 
-                    let ack_eliciting = self.dispatch_frames(
+                    let ack_eliciting = self.dispatch_frames(sio,
                         &buf[payload_offset..payload_offset + pt_len],
                         Level::Application,
                         now,
@@ -451,7 +451,7 @@ where
                             payload_len,
                         )?;
 
-                        let ack_eliciting = self.dispatch_frames(
+                        let ack_eliciting = self.dispatch_frames(sio,
                             &buf[payload_offset..payload_offset + pt_len],
                             Level::Application,
                             now,
@@ -484,7 +484,7 @@ where
                 // Decryption succeeded: confirm the peer key update and rotate keys.
                 self.keys.confirm_peer_key_update(&self.crypto, next_recv_keys)?;
 
-                let ack_eliciting = self.dispatch_frames(
+                let ack_eliciting = self.dispatch_frames(sio,
                     &buf[payload_offset..payload_offset + pt_len],
                     Level::Application,
                     now,
@@ -509,8 +509,9 @@ where
 
     /// Parse and dispatch all frames from decrypted payload.
     /// Returns true if any frame was ack-eliciting.
-    fn dispatch_frames<const CRYPTO_BUF: usize>(
+    fn dispatch_frames<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
         &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
         payload: &[u8],
         level: Level,
         now: Instant,
@@ -531,15 +532,16 @@ where
                 }
             }
 
-            self.dispatch_frame(frame, level, now, pool)?;
+            self.dispatch_frame(sio, frame, level, now, pool)?;
         }
 
         Ok(ack_eliciting)
     }
 
     /// Dispatch a single frame.
-    pub(crate) fn dispatch_frame<const CRYPTO_BUF: usize>(
+    pub(crate) fn dispatch_frame<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
         &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
         frame: Frame<'_>,
         level: Level,
         now: Instant,
@@ -628,7 +630,7 @@ where
                     );
 
                     // Store the stream data in our receive buffer
-                    self.store_stream_data(stream.stream_id, stream.offset, stream.data, stream.fin);
+                    self.store_stream_data(sio, stream.stream_id, stream.offset, stream.data, stream.fin);
 
                     // Generate event
                     let _ = self.events.push_back(Event::StreamReadable(stream.stream_id));

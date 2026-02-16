@@ -18,7 +18,9 @@ use milli_http::error::Error;
 use milli_http::tls::handshake::ServerTlsConfig;
 use milli_http::tls::transport_params::TransportParams;
 use milli_http::transport::Rng;
-use milli_http::{ConnectionState, Event};
+use milli_http::{ConnectionState, Event, QuicStreamIoBufs};
+
+type SioBufs = QuicStreamIoBufs<32, 1024, 16>;
 
 // =========================================================================
 // Test infrastructure
@@ -98,15 +100,19 @@ fn make_server(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes
 /// to send.
 fn transfer_one(
     src: &mut Connection<Aes128GcmProvider>,
+    src_sio: &mut SioBufs,
     dst: &mut Connection<Aes128GcmProvider>,
+    dst_sio: &mut SioBufs,
     now: u64,
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) -> bool {
     let mut buf = [0u8; 4096];
-    match src.poll_transmit(&mut buf, now, pool) {
+    let mut sio = src_sio.as_io();
+    match src.poll_transmit(&mut sio, &mut buf, now, pool) {
         Some(tx) => {
             let data: Vec<u8> = tx.data.to_vec();
-            let _ = dst.recv(&data, now, pool);
+            let mut sio = dst_sio.as_io();
+            let _ = dst.recv(&mut sio, &data, now, pool);
             true
         }
         None => false,
@@ -117,12 +123,14 @@ fn transfer_one(
 /// Returns the number of datagrams transferred.
 fn drain_transmits(
     src: &mut Connection<Aes128GcmProvider>,
+    src_sio: &mut SioBufs,
     dst: &mut Connection<Aes128GcmProvider>,
+    dst_sio: &mut SioBufs,
     now: u64,
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) -> usize {
     let mut count = 0;
-    while transfer_one(src, dst, now, pool) {
+    while transfer_one(src, src_sio, dst, dst_sio, now, pool) {
         count += 1;
     }
     count
@@ -133,16 +141,17 @@ fn drain_transmits(
 /// rounds.
 fn run_handshake(
     client: &mut Connection<Aes128GcmProvider>,
+    c_sio: &mut SioBufs,
     server: &mut Connection<Aes128GcmProvider>,
+    s_sio: &mut SioBufs,
     now: u64,
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
     for _round in 0..20 {
-        drain_transmits(client, server, now, pool);
-        drain_transmits(server, client, now, pool);
+        drain_transmits(client, c_sio, server, s_sio, now, pool);
+        drain_transmits(server, s_sio, client, c_sio, now, pool);
 
         if client.is_established() && server.is_established() {
-            // Drain events so tests can check for specific events if needed.
             return;
         }
     }
@@ -166,14 +175,16 @@ fn drain_events(conn: &mut Connection<Aes128GcmProvider>) -> Vec<Event> {
 /// subsequent tests start from a clean state.
 fn drain_post_handshake(
     client: &mut Connection<Aes128GcmProvider>,
+    c_sio: &mut SioBufs,
     server: &mut Connection<Aes128GcmProvider>,
+    s_sio: &mut SioBufs,
     now: u64,
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
     // Drain any ACKs or HANDSHAKE_DONE packets
     for _ in 0..5 {
-        drain_transmits(client, server, now, pool);
-        drain_transmits(server, client, now, pool);
+        drain_transmits(client, c_sio, server, s_sio, now, pool);
+        drain_transmits(server, s_sio, client, c_sio, now, pool);
     }
     // Drain events
     drain_events(client);
@@ -191,12 +202,14 @@ fn full_handshake_completes() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
     assert_eq!(client.state(), ConnectionState::Handshaking);
     assert_eq!(server.state(), ConnectionState::Handshaking);
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     assert!(
         client.is_established(),
@@ -231,21 +244,23 @@ fn client_sends_stream_data() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Client opens stream 0 (first client-initiated bidi stream) and sends data.
     let stream_id = client.open_stream().unwrap();
     assert_eq!(stream_id, 0, "first client bidi stream should be id 0");
 
     let payload = b"hello from client";
-    let sent = client.stream_send(stream_id, payload, false).unwrap();
+    let sent = client.stream_send(&mut c_sio.as_io(), stream_id, payload, false).unwrap();
     assert_eq!(sent, payload.len());
 
     // Transfer the packet.
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Server should emit StreamReadable and/or StreamOpened.
     let events = drain_events(&mut server);
@@ -260,7 +275,7 @@ fn client_sends_stream_data() {
 
     // Server reads the data.
     let mut buf = [0u8; 256];
-    let (len, fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf).unwrap();
     assert_eq!(len, payload.len());
     assert_eq!(&buf[..len], payload);
     assert!(!fin, "fin should not be set");
@@ -272,28 +287,30 @@ fn server_responds_on_stream() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Client sends request.
     let stream_id = client.open_stream().unwrap();
-    client.stream_send(stream_id, b"request", false).unwrap();
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    client.stream_send(&mut c_sio.as_io(), stream_id, b"request", false).unwrap();
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Server reads and then responds.
     drain_events(&mut server);
     let mut buf = [0u8; 256];
-    server.stream_recv(stream_id, &mut buf).unwrap();
+    server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf).unwrap();
 
     // The stream was opened by the client; the server should also be able
     // to send on it (bidirectional).
     let response = b"response from server";
-    let sent = server.stream_send(stream_id, response, false).unwrap();
+    let sent = server.stream_send(&mut s_sio.as_io(), stream_id, response, false).unwrap();
     assert_eq!(sent, response.len());
 
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     let events = drain_events(&mut client);
     let has_readable = events
@@ -302,7 +319,7 @@ fn server_responds_on_stream() {
     assert!(has_readable, "client should see StreamReadable");
 
     let mut rbuf = [0u8; 256];
-    let (len, fin) = client.stream_recv(stream_id, &mut rbuf).unwrap();
+    let (len, fin) = client.stream_recv(&mut c_sio.as_io(), stream_id, &mut rbuf).unwrap();
     assert_eq!(&rbuf[..len], response);
     assert!(!fin);
 }
@@ -313,36 +330,38 @@ fn bidirectional_exchange() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
 
     // Client sends request (not FIN yet).
     client
-        .stream_send(stream_id, b"GET /index.html", false)
+        .stream_send(&mut c_sio.as_io(), stream_id, b"GET /index.html", false)
         .unwrap();
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Server reads request.
     drain_events(&mut server);
     let mut buf = [0u8; 256];
-    let (len, _fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    let (len, _fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf).unwrap();
     assert_eq!(&buf[..len], b"GET /index.html");
 
     // Server sends response with FIN.
     let response = b"<html>Hello</html>";
     server
-        .stream_send(stream_id, response, true)
+        .stream_send(&mut s_sio.as_io(), stream_id, response, true)
         .unwrap();
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     // Client reads response.
     drain_events(&mut client);
     let mut rbuf = [0u8; 256];
-    let (rlen, fin) = client.stream_recv(stream_id, &mut rbuf).unwrap();
+    let (rlen, fin) = client.stream_recv(&mut c_sio.as_io(), stream_id, &mut rbuf).unwrap();
     assert_eq!(&rbuf[..rlen], response);
     assert!(fin, "server sent FIN, client should see it");
 }
@@ -353,10 +372,12 @@ fn multiple_streams() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Client opens stream 0 and stream 4 (the first two client-initiated bidi
     // streams: id=0 and id=4).
@@ -365,21 +386,21 @@ fn multiple_streams() {
     assert_eq!(s0, 0);
     assert_eq!(s4, 4);
 
-    client.stream_send(s0, b"stream zero", false).unwrap();
-    client.stream_send(s4, b"stream four", false).unwrap();
+    client.stream_send(&mut c_sio.as_io(), s0, b"stream zero", false).unwrap();
+    client.stream_send(&mut c_sio.as_io(), s4, b"stream four", false).unwrap();
 
     // Transfer packets (may need multiple poll_transmit calls).
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Server should have received data on both streams.
     drain_events(&mut server);
 
     let mut buf0 = [0u8; 256];
-    let (len0, _) = server.stream_recv(s0, &mut buf0).unwrap();
+    let (len0, _) = server.stream_recv(&mut s_sio.as_io(), s0, &mut buf0).unwrap();
     assert_eq!(&buf0[..len0], b"stream zero");
 
     let mut buf4 = [0u8; 256];
-    let (len4, _) = server.stream_recv(s4, &mut buf4).unwrap();
+    let (len4, _) = server.stream_recv(&mut s_sio.as_io(), s4, &mut buf4).unwrap();
     assert_eq!(&buf4[..len4], b"stream four");
 }
 
@@ -389,21 +410,23 @@ fn stream_fin_propagates() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
     client
-        .stream_send(stream_id, b"final message", true)
+        .stream_send(&mut c_sio.as_io(), stream_id, b"final message", true)
         .unwrap();
 
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
     drain_events(&mut server);
 
     let mut buf = [0u8; 256];
-    let (len, fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf).unwrap();
     assert_eq!(&buf[..len], b"final message");
     assert!(fin, "receiver should see FIN");
 }
@@ -415,17 +438,19 @@ fn connection_close_by_client() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Client closes with error code 0 (no error) and a reason phrase.
     client.close(0, b"goodbye");
     assert_eq!(client.state(), ConnectionState::Closing);
 
     // Transfer the CONNECTION_CLOSE frame.
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     assert!(client.is_closed(), "client should be closed after poll_transmit");
 
@@ -460,17 +485,19 @@ fn connection_close_by_server() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Server closes with an application-layer error code.
     server.close(42, b"server shutdown");
     assert_eq!(server.state(), ConnectionState::Closing);
 
     // Transfer the CONNECTION_CLOSE frame.
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     assert!(server.is_closed());
 
@@ -495,10 +522,12 @@ fn large_data_transfer() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
 
@@ -513,19 +542,19 @@ fn large_data_transfer() {
         arr
     };
 
-    let sent = client.stream_send(stream_id, &payload, false).unwrap();
+    let sent = client.stream_send(&mut c_sio.as_io(), stream_id, &payload, false).unwrap();
     assert_eq!(sent, 1024);
 
     // Transfer.
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Drain any ACKs back.
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     // Server reads the data.
     drain_events(&mut server);
     let mut buf = [0u8; 1024];
-    let (len, fin) = server.stream_recv(stream_id, &mut buf).unwrap();
+    let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf).unwrap();
     assert_eq!(len, 1024);
     assert_eq!(&buf[..len], &payload[..]);
     assert!(!fin);
@@ -538,23 +567,25 @@ fn key_update_during_transfer() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
 
     // Send data before key update.
     client
-        .stream_send(stream_id, b"before-update", false)
+        .stream_send(&mut c_sio.as_io(), stream_id, b"before-update", false)
         .unwrap();
-    drain_transmits(&mut client, &mut server, now, &mut pool);
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     drain_events(&mut server);
     let mut buf = [0u8; 256];
-    let (len, _) = server.stream_recv(stream_id, &mut buf).unwrap();
+    let (len, _) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf).unwrap();
     assert_eq!(&buf[..len], b"before-update");
 
     // Client initiates key update.
@@ -564,9 +595,9 @@ fn key_update_during_transfer() {
 
     // Send data after key update.
     client
-        .stream_send(stream_id, b"after-update", false)
+        .stream_send(&mut c_sio.as_io(), stream_id, b"after-update", false)
         .unwrap();
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Server should detect the key phase change and update keys.
     assert_eq!(
@@ -577,18 +608,18 @@ fn key_update_during_transfer() {
 
     drain_events(&mut server);
     let mut buf2 = [0u8; 256];
-    let (len2, _) = server.stream_recv(stream_id, &mut buf2).unwrap();
+    let (len2, _) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut buf2).unwrap();
     assert_eq!(&buf2[..len2], b"after-update");
 
     // Server sends data back with the new keys.
     server
-        .stream_send(stream_id, b"server-post-ku", false)
+        .stream_send(&mut s_sio.as_io(), stream_id, b"server-post-ku", false)
         .unwrap();
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     drain_events(&mut client);
     let mut buf3 = [0u8; 256];
-    let (len3, _) = client.stream_recv(stream_id, &mut buf3).unwrap();
+    let (len3, _) = client.stream_recv(&mut c_sio.as_io(), stream_id, &mut buf3).unwrap();
     assert_eq!(&buf3[..len3], b"server-post-ku");
 }
 
@@ -605,27 +636,29 @@ fn post_handshake_round_trip_works() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     // Send data in both directions to confirm path is alive.
     let s = client.open_stream().unwrap();
-    client.stream_send(s, b"ping", false).unwrap();
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    client.stream_send(&mut c_sio.as_io(), s, b"ping", false).unwrap();
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     drain_events(&mut server);
     let mut buf = [0u8; 64];
-    let (len, _) = server.stream_recv(s, &mut buf).unwrap();
+    let (len, _) = server.stream_recv(&mut s_sio.as_io(), s, &mut buf).unwrap();
     assert_eq!(&buf[..len], b"ping");
 
-    server.stream_send(s, b"pong", false).unwrap();
-    drain_transmits(&mut server, &mut client, now, &mut pool);
+    server.stream_send(&mut s_sio.as_io(), s, b"pong", false).unwrap();
+    drain_transmits(&mut server, &mut s_sio, &mut client, &mut c_sio, now, &mut pool);
 
     drain_events(&mut client);
     let mut buf2 = [0u8; 64];
-    let (len2, _) = client.stream_recv(s, &mut buf2).unwrap();
+    let (len2, _) = client.stream_recv(&mut c_sio.as_io(), s, &mut buf2).unwrap();
     assert_eq!(&buf2[..len2], b"pong");
 }
 
@@ -643,10 +676,12 @@ fn idle_timeout_not_set_does_not_close() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     assert!(client.is_established());
 
@@ -677,11 +712,13 @@ fn idle_timeout_not_set_does_not_close() {
 fn handshake_timeout_safe_to_call() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
+    let mut c_sio = SioBufs::new();
     // Intentionally do NOT create a server or run the handshake.
 
     // The client sends its Initial packet.
     let mut buf = [0u8; 2048];
-    let _tx = client.poll_transmit(&mut buf, 0, &mut pool);
+    let mut sio = c_sio.as_io();
+    let _tx = client.poll_transmit(&mut sio, &mut buf, 0, &mut pool);
 
     assert_eq!(client.state(), ConnectionState::Handshaking);
 
@@ -712,21 +749,23 @@ fn operations_fail_after_close() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
     let now = 1_000_000u64;
 
-    run_handshake(&mut client, &mut server, now, &mut pool);
-    drain_post_handshake(&mut client, &mut server, now, &mut pool);
+    run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
+    drain_post_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
     let stream_id = client.open_stream().unwrap();
-    client.stream_send(stream_id, b"data", false).unwrap();
+    client.stream_send(&mut c_sio.as_io(), stream_id, b"data", false).unwrap();
 
     // Close the client.
     client.close(0, b"done");
-    drain_transmits(&mut client, &mut server, now, &mut pool);
+    drain_transmits(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
     assert!(client.is_closed());
 
     // Attempts to send data should fail.
-    let result = client.stream_send(stream_id, b"more", false);
+    let result = client.stream_send(&mut c_sio.as_io(), stream_id, b"more", false);
     assert!(
         result.is_err(),
         "stream_send should fail after close"
@@ -734,8 +773,9 @@ fn operations_fail_after_close() {
 
     // poll_transmit should return None.
     let mut buf = [0u8; 2048];
+    let mut sio = c_sio.as_io();
     assert!(
-        client.poll_transmit(&mut buf, now, &mut pool).is_none(),
+        client.poll_transmit(&mut sio, &mut buf, now, &mut pool).is_none(),
         "poll_transmit should return None after close"
     );
 }

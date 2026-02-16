@@ -59,7 +59,7 @@ fn main() {
     )
     .expect("failed to create client Connection");
 
-    let mut h3 = H3Client::new(conn);
+    let mut h3: H3Client<Aes128GcmProvider> = H3Client::new(conn);
     let mut request_sent = false;
     let mut request_stream: Option<u64> = None;
 

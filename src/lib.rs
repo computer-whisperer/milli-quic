@@ -51,5 +51,6 @@ pub mod connection;
 pub use connection::{
     Connection, ConnectionConfig, ConnectionId, ConnectionState, DefaultConfig, Event,
     HandshakeContext, HandshakePool, HandshakePoolAccess, Transmit,
+    io::{QuicStreamIo, QuicStreamIoBufs},
 };
 pub use tls::handshake::Role;

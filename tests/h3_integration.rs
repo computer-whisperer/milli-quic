@@ -13,6 +13,7 @@ use milli_http::crypto::rustcrypto::Aes128GcmProvider;
 use milli_http::h3::{H3Client, H3Event, H3Server};
 use milli_http::tls::handshake::ServerTlsConfig;
 use milli_http::tls::transport_params::TransportParams;
+use milli_http::QuicStreamIoBufs;
 use milli_http::Rng;
 
 // ---------------------------------------------------------------------------
@@ -85,14 +86,19 @@ fn run_quic_handshake(
     now: u64,
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
+    let mut client_sio_bufs = QuicStreamIoBufs::<32, 1024, 16>::new();
+    let mut server_sio_bufs = QuicStreamIoBufs::<32, 1024, 16>::new();
+
     for _round in 0..20 {
         // Client -> Server
         loop {
             let mut buf = [0u8; 4096];
-            match client.poll_transmit(&mut buf, now, pool) {
+            let mut client_sio = client_sio_bufs.as_io();
+            match client.poll_transmit(&mut client_sio, &mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = server.recv(&data, now, pool);
+                    let mut server_sio = server_sio_bufs.as_io();
+                    let _ = server.recv(&mut server_sio, &data, now, pool);
                 }
                 None => break,
             }
@@ -101,10 +107,12 @@ fn run_quic_handshake(
         // Server -> Client
         loop {
             let mut buf = [0u8; 4096];
-            match server.poll_transmit(&mut buf, now, pool) {
+            let mut server_sio = server_sio_bufs.as_io();
+            match server.poll_transmit(&mut server_sio, &mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = client.recv(&data, now, pool);
+                    let mut client_sio = client_sio_bufs.as_io();
+                    let _ = client.recv(&mut client_sio, &data, now, pool);
                 }
                 None => break,
             }

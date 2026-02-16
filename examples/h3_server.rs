@@ -203,7 +203,7 @@ fn main() {
     let conn = Connection::<Aes128GcmProvider>::server(Aes128GcmProvider, tls_config, tp, &mut rng, &mut pool)
         .expect("failed to create server Connection");
 
-    let mut h3 = H3Server::new(conn);
+    let mut h3: H3Server<Aes128GcmProvider> = H3Server::new(conn);
 
     // Feed the first datagram.
     let now = to_micros(epoch, time::Instant::now());
