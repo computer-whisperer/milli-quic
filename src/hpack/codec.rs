@@ -156,6 +156,8 @@ impl HpackDecoder {
 
     /// Decode a literal header field (name from index or literal, plus value).
     /// Returns bytes consumed starting from `start`.
+    ///
+    /// Handles Huffman-encoded strings by decoding into stack-local buffers.
     fn decode_literal_field<F>(
         &self,
         src: &[u8],
@@ -175,18 +177,44 @@ impl HpackDecoder {
             }
             let name = STATIC_TABLE[name_index - 1].name;
 
-            // Decode value string
-            let (value, val_consumed) = self.decode_string(&src[pos..])?;
-            pos += val_consumed;
+            // Decode value string (may be Huffman-encoded)
+            let (huffman, length, len_consumed) = Self::parse_string_header(&src[pos..])?;
+            let raw = &src[pos + len_consumed..pos + len_consumed + length];
+            pos += len_consumed + length;
 
-            emit(name, value);
+            if huffman {
+                let mut val_buf = [0u8; 1024];
+                let decoded_len = super::huffman::decode(raw, &mut val_buf)?;
+                emit(name, &val_buf[..decoded_len]);
+            } else {
+                emit(name, raw);
+            }
         } else {
-            // Literal name
-            let (name, name_consumed) = self.decode_string(&src[pos..])?;
-            pos += name_consumed;
+            // Literal name + value (both may be Huffman-encoded)
+            let (huf_n, len_n, lc_n) = Self::parse_string_header(&src[pos..])?;
+            let raw_name = &src[pos + lc_n..pos + lc_n + len_n];
+            pos += lc_n + len_n;
 
-            let (value, val_consumed) = self.decode_string(&src[pos..])?;
-            pos += val_consumed;
+            let (huf_v, len_v, lc_v) = Self::parse_string_header(&src[pos..])?;
+            let raw_value = &src[pos + lc_v..pos + lc_v + len_v];
+            pos += lc_v + len_v;
+
+            let mut name_buf = [0u8; 256];
+            let mut val_buf = [0u8; 1024];
+
+            let name: &[u8] = if huf_n {
+                let n = super::huffman::decode(raw_name, &mut name_buf)?;
+                &name_buf[..n]
+            } else {
+                raw_name
+            };
+
+            let value: &[u8] = if huf_v {
+                let n = super::huffman::decode(raw_value, &mut val_buf)?;
+                &val_buf[..n]
+            } else {
+                raw_value
+            };
 
             emit(name, value);
         }
@@ -194,14 +222,9 @@ impl HpackDecoder {
         Ok(pos - start)
     }
 
-    /// Decode a string literal (H bit + length + data).
-    /// Returns (slice_into_src_or_huffman_buf, bytes_consumed).
-    ///
-    /// For simplicity in no_std static-only mode, Huffman-encoded strings
-    /// are not supported (returns error). Real HPACK encoders/decoders in
-    /// production should support Huffman, but for our static-only codec
-    /// we emit H=0 and require H=0 on decode for simplicity.
-    fn decode_string<'a>(&self, src: &'a [u8]) -> Result<(&'a [u8], usize), Error> {
+    /// Parse the header of an HPACK string literal (H bit + length).
+    /// Returns `(is_huffman, string_length, header_bytes_consumed)`.
+    fn parse_string_header(src: &[u8]) -> Result<(bool, usize, usize), Error> {
         if src.is_empty() {
             return Err(Error::BufferTooSmall { needed: 1 });
         }
@@ -213,16 +236,7 @@ impl HpackDecoder {
             return Err(Error::BufferTooSmall { needed: len_consumed + length });
         }
 
-        let data = &src[len_consumed..len_consumed + length];
-
-        if huffman {
-            // We could decode Huffman here using the shared huffman module,
-            // but that requires a scratch buffer. For static-only mode we
-            // reject Huffman since we never produce it.
-            return Err(Error::InvalidState);
-        }
-
-        Ok((data, len_consumed + length))
+        Ok((huffman, length, len_consumed))
     }
 }
 

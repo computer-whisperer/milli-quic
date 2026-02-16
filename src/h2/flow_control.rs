@@ -119,4 +119,20 @@ mod tests {
         fc.update_initial_window(-100);
         assert_eq!(fc.window(), -100);
     }
+
+    #[test]
+    fn exhaust_then_replenish() {
+        let mut fc = FlowController::new(100);
+        fc.consume(100).unwrap();
+        assert_eq!(fc.window(), 0);
+
+        // Window exhausted — further consume fails
+        assert!(fc.consume(1).is_err());
+
+        // Replenish partially and consume again
+        fc.replenish(50).unwrap();
+        assert_eq!(fc.window(), 50);
+        fc.consume(50).unwrap();
+        assert_eq!(fc.window(), 0);
+    }
 }

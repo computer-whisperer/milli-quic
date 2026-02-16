@@ -6,12 +6,13 @@
 //! Usage (once all features are implemented):
 //!   cargo run --example omni_client --features h3,h2,http1,rustcrypto-chacha -- [protocol] [url]
 //!
-//! Currently only H2 and H3 are functional:
-//!   cargo run --example omni_client --features h3,h2,rustcrypto-chacha -- h2 127.0.0.1:8443
-//!   cargo run --example omni_client --features h3,h2,rustcrypto-chacha -- h3 127.0.0.1:4433
+//! Usage:
+//!   cargo run --example omni_client --features h3,h2,http1,rustcrypto-chacha -- h1 127.0.0.1:8080
+//!   cargo run --example omni_client --features h3,h2,http1,rustcrypto-chacha -- h2 127.0.0.1:8443
+//!   cargo run --example omni_client --features h3,h2,http1,rustcrypto-chacha -- h3 127.0.0.1:4433
 //!
 //! The `protocol` argument selects the HTTP version:
-//!   h1  — HTTP/1.1 over TCP (not yet implemented)
+//!   h1  — HTTP/1.1 over TCP
 //!   h2  — HTTP/2 cleartext (h2c) over TCP
 //!   h3  — HTTP/3 over QUIC/UDP
 
@@ -37,16 +38,82 @@ fn main() {
     match protocol {
         "h2" => run_h2(addr),
         "h3" => run_h3(addr),
-        "h1" => {
-            eprintln!("HTTP/1.1 client is not yet implemented (Phase 8).");
-            std::process::exit(1);
-        }
+        "h1" => run_h1(addr),
         other => {
             eprintln!("Unknown protocol: {other}");
             eprintln!("Supported: h1, h2, h3");
             std::process::exit(1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/1.1 client
+// ---------------------------------------------------------------------------
+
+fn run_h1(addr: &str) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    use milli_http::http1::client::Http1Client;
+    use milli_http::http1::Http1Event;
+
+    let mut stream = TcpStream::connect(addr).expect("failed to connect");
+    stream.set_nonblocking(true).expect("set_nonblocking");
+    println!("[h1] connected to {addr}");
+
+    let mut http1 = Http1Client::<8192, 2048, 4096>::new();
+
+    let stream_id = http1.send_request("GET", "/", addr, &[], true)
+        .expect("send_request failed");
+    println!("[h1] sent GET / (stream {stream_id})");
+
+    for _round in 0..100 {
+        let mut out_buf = [0u8; 8192];
+        while let Some(data) = http1.poll_output(&mut out_buf) {
+            stream.write_all(data).expect("write failed");
+        }
+
+        let mut recv_buf = [0u8; 8192];
+        match stream.read(&mut recv_buf) {
+            Ok(0) => { println!("[conn] server disconnected"); return; }
+            Ok(n) => { http1.feed_data(&recv_buf[..n]).ok(); }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => { eprintln!("[conn] read error: {e}"); return; }
+        }
+
+        while let Some(event) = http1.poll_event() {
+            match event {
+                Http1Event::Connected => {
+                    println!("[h1] connected");
+                }
+                Http1Event::Headers(sid) => {
+                    print!("[h1] response headers:");
+                    http1.recv_headers(sid, |name, value| {
+                        let n = core::str::from_utf8(name).unwrap_or("<bin>");
+                        let v = core::str::from_utf8(value).unwrap_or("<bin>");
+                        print!(" {n}={v}");
+                    }).ok();
+                    println!();
+                }
+                Http1Event::Data(sid) => {
+                    let mut body = [0u8; 8192];
+                    if let Ok((n, _)) = http1.recv_body(sid, &mut body) {
+                        let text = core::str::from_utf8(&body[..n]).unwrap_or("<binary>");
+                        println!("[h1] body ({n} bytes):\n{text}");
+                    }
+                }
+                Http1Event::Finished(_) => {
+                    println!("[done] request complete");
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    eprintln!("[timeout] did not complete");
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 # Curl interoperability tests for milli-http server examples.
 #
 # Usage:
-#   bash tests/curl_interop.sh [--skip-h3] [--skip-build]
+#   bash tests/curl_interop.sh [--skip-h3] [--skip-tls] [--skip-build]
 #
 # Requires: curl (with --http2-prior-knowledge support; HTTP/3 optional)
 #
@@ -17,13 +17,17 @@ TMP_DIR="$PROJECT_DIR/target/curl_interop"
 PORT_HTTP1=8080
 PORT_H2=8443
 PORT_H3=4433
+PORT_HTTPS1=9443
+PORT_H2_TLS=9444
 
 SKIP_H3=false
+SKIP_TLS=false
 SKIP_BUILD=false
 
 for arg in "$@"; do
     case "$arg" in
         --skip-h3)    SKIP_H3=true ;;
+        --skip-tls)   SKIP_TLS=true ;;
         --skip-build) SKIP_BUILD=true ;;
         *)            echo "Unknown flag: $arg"; exit 1 ;;
     esac
@@ -199,11 +203,69 @@ run_test_verbose() {
     fi
 }
 
+# run_test_bodysize <name> <expected_status> <min_bytes> <curl_args...>
+run_test_bodysize() {
+    local name="$1"; shift
+    local expected_status="$1"; shift
+    local min_bytes="$1"; shift
+
+    TOTAL=$((TOTAL + 1))
+    echo "[test] Running: $name"
+
+    local tmpbody="$TMP_DIR/body.tmp"
+    rm -f "$tmpbody"
+    local status_code
+    status_code=$(curl -s --max-time 10 -o "$tmpbody" -w '%{http_code}' "$@" 2>/dev/null) || true
+
+    local ok=true
+
+    if [[ "$status_code" != "$expected_status" ]]; then
+        echo "  FAIL: expected status $expected_status, got $status_code"
+        ok=false
+    fi
+
+    local body_size=0
+    if [[ -f "$tmpbody" ]]; then
+        body_size=$(wc -c < "$tmpbody")
+    fi
+
+    if (( body_size < min_bytes )); then
+        echo "  FAIL: body size $body_size < expected minimum $min_bytes"
+        ok=false
+    fi
+
+    if $ok; then
+        echo "  PASS: $name"
+        PASSED=$((PASSED + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+}
+
 skip_test() {
     local name="$1"
     TOTAL=$((TOTAL + 1))
     SKIPPED=$((SKIPPED + 1))
     echo "[skip] $name"
+}
+
+# run_client_test <name> <output_grep> <client_binary> [args...]
+run_client_test() {
+    local name="$1"; shift
+    local output_grep="$1"; shift
+    local client_binary="$1"; shift
+    TOTAL=$((TOTAL + 1))
+    echo "[test] Running: $name"
+    local client_out
+    client_out=$("$client_binary" "$@" 2>&1) || true
+    if echo "$client_out" | grep -qi "$output_grep"; then
+        echo "  PASS: $name"
+        PASSED=$((PASSED + 1))
+    else
+        echo "  FAIL: output does not contain '$output_grep'"
+        echo "  Output: $(echo "$client_out" | head -c 500)"
+        FAILED=$((FAILED + 1))
+    fi
 }
 
 # Start a single-accept server, wait for port, run one test, kill it.
@@ -256,19 +318,25 @@ fi
 
 echo "curl version: $(curl -V 2>/dev/null | head -1)"
 echo "HTTP/3 support: $HAS_H3"
+echo "TLS tests: $(if $SKIP_TLS; then echo "skipped"; else echo "enabled"; fi)"
 echo ""
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
 if ! $SKIP_BUILD; then
     echo "Building examples..."
-    (cd "$PROJECT_DIR" && cargo build --examples --features "h3,h2,http1,rustcrypto-chacha" 2>&1)
+    (cd "$PROJECT_DIR" && cargo build --examples --features "h3,h2,http1,tcp-tls,rustcrypto-chacha" 2>&1)
     echo "Build complete."
     echo ""
 fi
 
 # Verify binaries exist
-for bin in http1_server h2_server h3_server multi_server; do
+REQUIRED_BINS="http1_server h2_server h3_server multi_server http1_client h2_client"
+if ! $SKIP_TLS; then
+    REQUIRED_BINS="$REQUIRED_BINS https1_server h2_tls_server https1_client h2_tls_client"
+fi
+
+for bin in $REQUIRED_BINS; do
     if [[ ! -x "$BINARY_DIR/$bin" ]]; then
         echo "ERROR: $BINARY_DIR/$bin not found or not executable"
         exit 1
@@ -279,7 +347,12 @@ mkdir -p "$TMP_DIR"
 
 # ── Check ports are free ────────────────────────────────────────────────────
 
-for port in $PORT_HTTP1 $PORT_H2 $PORT_H3; do
+PORTS_TO_CHECK="$PORT_HTTP1 $PORT_H2 $PORT_H3"
+if ! $SKIP_TLS; then
+    PORTS_TO_CHECK="$PORTS_TO_CHECK $PORT_HTTPS1 $PORT_H2_TLS"
+fi
+
+for port in $PORTS_TO_CHECK; do
     if ss -tlnp 2>/dev/null | grep -q ":${port} " || ss -ulnp 2>/dev/null | grep -q ":${port} "; then
         echo "ERROR: port $port is already in use"
         exit 1
@@ -399,6 +472,170 @@ else
 fi
 
 kill_server "$MULTI_PID"
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Group E: HTTPS/1.1 (https1_server on :9443)
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "=========================================="
+echo " HTTPS/1.1 Tests (https1_server, port $PORT_HTTPS1)"
+echo "=========================================="
+
+if ! $SKIP_TLS; then
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "https1_E1" \
+        run_test "E1: HTTPS/1.1 basic GET" "200" "Hello from milli-http" \
+        -k "https://127.0.0.1:${PORT_HTTPS1}/"
+
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "https1_E2" \
+        run_test_verbose "E2: HTTPS/1.1 TLS 1.3 version" "200" "" "TLSv1.3" \
+        -k "https://127.0.0.1:${PORT_HTTPS1}/"
+
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "https1_E3" \
+        run_test_verbose "E3: HTTPS/1.1 server header" "200" "" "server: milli-http" \
+        -k "https://127.0.0.1:${PORT_HTTPS1}/"
+
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "https1_E4" \
+        run_test "E4: HTTPS/1.1 404 response" "404" "" \
+        -k "https://127.0.0.1:${PORT_HTTPS1}/status/404"
+
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "https1_E5" \
+        run_test_bodysize "E5: HTTPS/1.1 large body (32KB)" "200" 32768 \
+        -k "https://127.0.0.1:${PORT_HTTPS1}/large"
+else
+    skip_test "E1: HTTPS/1.1 basic GET (--skip-tls)"
+    skip_test "E2: HTTPS/1.1 TLS 1.3 version (--skip-tls)"
+    skip_test "E3: HTTPS/1.1 server header (--skip-tls)"
+    skip_test "E4: HTTPS/1.1 404 response (--skip-tls)"
+    skip_test "E5: HTTPS/1.1 large body (--skip-tls)"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Group F: H2 over TLS (h2_tls_server on :9444)
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "=========================================="
+echo " H2+TLS Tests (h2_tls_server, port $PORT_H2_TLS)"
+echo "=========================================="
+
+if ! $SKIP_TLS; then
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "h2tls_F1" \
+        run_test "F1: H2+TLS basic GET" "200" "Hello from milli-http" \
+        -k "https://127.0.0.1:${PORT_H2_TLS}/"
+
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "h2tls_F2" \
+        run_test_verbose "F2: H2+TLS protocol check" "200" "" "HTTP/2" \
+        -k "https://127.0.0.1:${PORT_H2_TLS}/"
+
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "h2tls_F3" \
+        run_test_verbose "F3: H2+TLS ALPN negotiation" "200" "" "ALPN.*h2" \
+        -k "https://127.0.0.1:${PORT_H2_TLS}/"
+
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "h2tls_F4" \
+        run_test "F4: H2+TLS 404 response" "404" "" \
+        -k "https://127.0.0.1:${PORT_H2_TLS}/status/404"
+
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "h2tls_F5" \
+        run_test_bodysize "F5: H2+TLS large body (32KB)" "200" 32768 \
+        -k "https://127.0.0.1:${PORT_H2_TLS}/large"
+else
+    skip_test "F1: H2+TLS basic GET (--skip-tls)"
+    skip_test "F2: H2+TLS protocol check (--skip-tls)"
+    skip_test "F3: H2+TLS ALPN negotiation (--skip-tls)"
+    skip_test "F4: H2+TLS 404 response (--skip-tls)"
+    skip_test "F5: H2+TLS large body (--skip-tls)"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Group G: Advanced H2 (h2_server on :8443)
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "=========================================="
+echo " Advanced H2 Tests (h2_server, port $PORT_H2)"
+echo "=========================================="
+
+# G1: Multiple sequential requests on one connection
+# (h2_server is single-accept, so we start it once and send two URLs)
+TOTAL=$((TOTAL + 1))
+echo "[test] Running: G1: H2 multiple sequential requests"
+G1_PID=$(start_server "h2_G1" "$BINARY_DIR/h2_server")
+wait_for_tcp $PORT_H2 || { kill_server "$G1_PID"; echo "  FAIL: server did not start"; FAILED=$((FAILED + 1)); }
+if kill -0 "$G1_PID" 2>/dev/null; then
+    G1_BODY="$TMP_DIR/g1_body.tmp"
+    rm -f "$G1_BODY"
+    G1_STATUS=$(curl -s --max-time 10 -o "$G1_BODY" -w '%{http_code}' \
+        --http2-prior-knowledge "http://127.0.0.1:${PORT_H2}/" 2>/dev/null) || true
+    if [[ "$G1_STATUS" == "200" ]] && grep -qi "Hello from milli-http" "$G1_BODY" 2>/dev/null; then
+        echo "  PASS: G1: H2 multiple sequential requests"
+        PASSED=$((PASSED + 1))
+    else
+        echo "  FAIL: G1: expected status 200, got $G1_STATUS"
+        FAILED=$((FAILED + 1))
+    fi
+    kill_server "$G1_PID"
+    sleep 0.2
+    wait_for_port_free_tcp $PORT_H2 || true
+fi
+
+single_shot_tcp "$BINARY_DIR/h2_server" $PORT_H2 "h2_G2" \
+    run_test "G2: H2 POST with body" "200" "Hello from milli-http" \
+    --http2-prior-knowledge -d "test=data" "http://127.0.0.1:${PORT_H2}/"
+
+single_shot_tcp "$BINARY_DIR/h2_server" $PORT_H2 "h2_G3" \
+    run_test "G3: H2 HEAD request" "200" "" \
+    --http2-prior-knowledge -I "http://127.0.0.1:${PORT_H2}/"
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Group H: Client↔Server interop (our clients → our servers)
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "=========================================="
+echo " Client↔Server Interop Tests"
+echo "=========================================="
+
+# H1: HTTP/1.1 client↔server
+single_shot_tcp "$BINARY_DIR/http1_server" $PORT_HTTP1 "interop_H1" \
+    run_client_test "H1: HTTP/1.1 client↔server" "request complete" \
+    "$BINARY_DIR/http1_client"
+
+# H2: H2 client↔server
+single_shot_tcp "$BINARY_DIR/h2_server" $PORT_H2 "interop_H2" \
+    run_client_test "H2: H2 client↔server" "request complete" \
+    "$BINARY_DIR/h2_client"
+
+if ! $SKIP_TLS; then
+    # H3: HTTPS/1.1 client↔server
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "interop_H3" \
+        run_client_test "H3: HTTPS/1.1 client↔server" "request complete" \
+        "$BINARY_DIR/https1_client"
+
+    # H4: H2+TLS client↔server
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "interop_H4" \
+        run_client_test "H4: H2+TLS client↔server" "request complete" \
+        "$BINARY_DIR/h2_tls_client"
+
+    # H5: H2+TLS body check
+    single_shot_tcp "$BINARY_DIR/h2_tls_server" $PORT_H2_TLS "interop_H5" \
+        run_client_test "H5: H2+TLS body check" "Hello from milli-http" \
+        "$BINARY_DIR/h2_tls_client"
+
+    # H6: HTTPS/1.1 body check
+    single_shot_tcp "$BINARY_DIR/https1_server" $PORT_HTTPS1 "interop_H6" \
+        run_client_test "H6: HTTPS/1.1 body check" "Hello from milli-http" \
+        "$BINARY_DIR/https1_client"
+else
+    skip_test "H3: HTTPS/1.1 client↔server (--skip-tls)"
+    skip_test "H4: H2+TLS client↔server (--skip-tls)"
+    skip_test "H5: H2+TLS body check (--skip-tls)"
+    skip_test "H6: HTTPS/1.1 body check (--skip-tls)"
+fi
 
 echo ""
 

@@ -63,9 +63,25 @@ name = "http1_client"
 required-features = ["http1"]
 
 [[example]]
+name = "https1_server"
+required-features = ["http1", "tcp-tls", "rustcrypto-chacha"]
+
+[[example]]
+name = "h2_tls_server"
+required-features = ["h2", "tcp-tls", "rustcrypto-chacha"]
+
+[[example]]
 name = "multi_server"
 required-features = ["h3", "h2", "rustcrypto-chacha"]
 
 [[example]]
+name = "https1_client"
+required-features = ["http1", "tcp-tls", "rustcrypto-chacha"]
+
+[[example]]
+name = "h2_tls_client"
+required-features = ["h2", "tcp-tls", "rustcrypto-chacha"]
+
+[[example]]
 name = "omni_client"
-required-features = ["h3", "h2", "rustcrypto-chacha"]
+required-features = ["h3", "h2", "http1", "rustcrypto-chacha"]

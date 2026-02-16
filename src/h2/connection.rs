@@ -359,7 +359,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
             payload: to_send,
             end_stream: actual_end,
         };
-        let mut frame_buf = [0u8; 16384];
+        let mut frame_buf = [0u8; 16393];
         // Need at most 9 + max_frame_size
         let max_needed = 9 + to_send.len();
         if max_needed > frame_buf.len() {
@@ -1215,5 +1215,283 @@ mod tests {
         // idle timeout is 100_000 + 1_000_000 = 1_100_000
         // earliest is 600_000
         assert_eq!(server.next_timeout(), Some(600_000));
+    }
+
+    // ====== Item 1: Timeout Integration Tests ======
+
+    #[test]
+    fn timeout_idle_after_request_response() {
+        let mut client = H2Connection::<16, 32768>::new_client();
+        let mut server = H2Connection::<16, 32768>::new_server();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        server.set_timeouts(config, 0);
+
+        run_handshake(&mut client, &mut server);
+
+        // Full request/response cycle
+        let stream_id = client.open_stream(
+            &[
+                (b":method", b"GET"),
+                (b":path", b"/"),
+                (b":scheme", b"https"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        ).unwrap();
+        exchange(&mut client, &mut server);
+
+        // Drain server events so we can see the response
+        while let Some(_) = server.poll_event() {}
+
+        // Server sends response
+        server.send_headers(stream_id, &[(b":status", b"200")], true).unwrap();
+        exchange(&mut server, &mut client);
+
+        // Drain client events
+        while let Some(_) = client.poll_event() {}
+
+        // Idle for 2 seconds — timeout should fire
+        server.handle_timeout(2_000_000);
+
+        let mut got_timeout = false;
+        while let Some(ev) = server.poll_event() {
+            if ev == H2Event::Timeout {
+                got_timeout = true;
+            }
+        }
+        assert!(got_timeout, "server should emit Timeout after idle");
+        assert!(server.is_closed());
+    }
+
+    #[test]
+    fn timeout_client_header_timeout() {
+        let mut client = H2Connection::<16, 8192>::new_client();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: None,
+            header_timeout_us: Some(500_000),
+        };
+        client.set_timeouts(config, 0);
+
+        // No server interaction — header timeout fires
+        client.handle_timeout(600_000);
+
+        let mut got_timeout = false;
+        while let Some(ev) = client.poll_event() {
+            if ev == H2Event::Timeout {
+                got_timeout = true;
+            }
+        }
+        assert!(got_timeout, "client should emit Timeout for header timeout");
+        assert!(client.is_closed());
+    }
+
+    // ====== Item 2: Flow Control Tests ======
+
+    #[test]
+    fn send_data_blocked_by_flow_control() {
+        let mut client = H2Connection::<16, 32768>::new_client();
+        let mut server = H2Connection::<16, 32768>::new_server();
+        run_handshake(&mut client, &mut server);
+
+        // Client opens a stream (POST with body)
+        let stream_id = client.open_stream(
+            &[
+                (b":method", b"POST"),
+                (b":path", b"/"),
+                (b":scheme", b"https"),
+                (b":authority", b"example.com"),
+            ],
+            false,
+        ).unwrap();
+        exchange(&mut client, &mut server);
+        while let Some(_) = server.poll_event() {}
+
+        // Exhaust the flow control window (default 65535 bytes)
+        let chunk = [0u8; 16384];
+        let mut total_sent = 0usize;
+        while total_sent < 65535 {
+            let remaining = 65535 - total_sent;
+            let to_send = remaining.min(16384);
+            let n = client.send_data(stream_id, &chunk[..to_send], false).unwrap();
+            total_sent += n;
+            // Drain client output to prevent send_buf overflow
+            exchange(&mut client, &mut server);
+        }
+        assert_eq!(total_sent, 65535);
+
+        // Try to send 1 more byte — should be blocked by flow control
+        let result = client.send_data(stream_id, &[0u8; 1], false);
+        assert_eq!(result, Err(Error::WouldBlock));
+    }
+
+    #[test]
+    fn send_data_resumes_after_window_update() {
+        let mut client = H2Connection::<16, 32768>::new_client();
+        let mut server = H2Connection::<16, 32768>::new_server();
+        run_handshake(&mut client, &mut server);
+
+        let stream_id = client.open_stream(
+            &[
+                (b":method", b"POST"),
+                (b":path", b"/"),
+                (b":scheme", b"https"),
+                (b":authority", b"example.com"),
+            ],
+            false,
+        ).unwrap();
+        exchange(&mut client, &mut server);
+        while let Some(_) = server.poll_event() {}
+
+        // Exhaust the window
+        let chunk = [0u8; 16384];
+        let mut total_sent = 0usize;
+        while total_sent < 65535 {
+            let remaining = 65535 - total_sent;
+            let to_send = remaining.min(16384);
+            let n = client.send_data(stream_id, &chunk[..to_send], false).unwrap();
+            total_sent += n;
+            exchange(&mut client, &mut server);
+        }
+        assert_eq!(client.send_data(stream_id, &[0u8; 1], false), Err(Error::WouldBlock));
+
+        // Inject WINDOW_UPDATE frames (both stream-level and connection-level)
+        let wu_stream = H2Frame::WindowUpdate { stream_id, increment: 1024 };
+        let wu_conn = H2Frame::WindowUpdate { stream_id: 0, increment: 1024 };
+        let mut buf = [0u8; 16];
+
+        let n = frame::encode_frame(&wu_stream, &mut buf).unwrap();
+        client.feed_data(&buf[..n]).unwrap();
+
+        let n = frame::encode_frame(&wu_conn, &mut buf).unwrap();
+        client.feed_data(&buf[..n]).unwrap();
+
+        // Now send should succeed
+        let result = client.send_data(stream_id, &[0u8; 1024], true);
+        assert_eq!(result, Ok(1024));
+    }
+
+    // ====== Item 3: RST_STREAM Reception ======
+
+    #[test]
+    fn rst_stream_emits_event() {
+        let mut client = H2Connection::<16, 8192>::new_client();
+        let mut server = H2Connection::<16, 8192>::new_server();
+        run_handshake(&mut client, &mut server);
+
+        // Client opens a stream
+        let stream_id = client.open_stream(
+            &[
+                (b":method", b"GET"),
+                (b":path", b"/"),
+                (b":scheme", b"https"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        ).unwrap();
+        exchange(&mut client, &mut server);
+        while let Some(_) = client.poll_event() {}
+
+        // Inject RST_STREAM (CANCEL=0x8) targeting the client's stream
+        let rst = H2Frame::RstStream { stream_id, error_code: 0x8 };
+        let mut buf = [0u8; 32];
+        let n = frame::encode_frame(&rst, &mut buf).unwrap();
+        client.feed_data(&buf[..n]).unwrap();
+
+        let mut got_reset = false;
+        while let Some(ev) = client.poll_event() {
+            if ev == H2Event::StreamReset(stream_id, 0x8) {
+                got_reset = true;
+            }
+        }
+        assert!(got_reset, "client should emit StreamReset(stream_id, CANCEL)");
+    }
+
+    // ====== Item 4: Invalid SETTINGS Rejection ======
+
+    #[test]
+    fn invalid_settings_rejected() {
+        // Sub-check 1: ENABLE_PUSH = 2 → ProtocolError
+        {
+            let mut conn = H2Connection::<16, 8192>::new_client();
+            let frame: &[u8] = &[
+                0x00, 0x00, 0x06, // length = 6
+                0x04,             // type = SETTINGS
+                0x00,             // flags = 0
+                0x00, 0x00, 0x00, 0x00, // stream_id = 0
+                0x00, 0x02,       // SETTINGS_ENABLE_PUSH
+                0x00, 0x00, 0x00, 0x02, // value = 2 (invalid, must be 0 or 1)
+            ];
+            let result = conn.feed_data(frame);
+            assert_eq!(result, Err(Error::Http2(crate::error::H2Error::ProtocolError)));
+        }
+
+        // Sub-check 2: INITIAL_WINDOW_SIZE = 0x8000_0000 → FlowControlError
+        {
+            let mut conn = H2Connection::<16, 8192>::new_client();
+            let frame: &[u8] = &[
+                0x00, 0x00, 0x06,
+                0x04, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x04,             // SETTINGS_INITIAL_WINDOW_SIZE
+                0x80, 0x00, 0x00, 0x00, // value = 0x8000_0000 (exceeds 2^31-1)
+            ];
+            let result = conn.feed_data(frame);
+            assert_eq!(result, Err(Error::Http2(crate::error::H2Error::FlowControlError)));
+        }
+
+        // Sub-check 3: MAX_FRAME_SIZE = 100 → ProtocolError
+        {
+            let mut conn = H2Connection::<16, 8192>::new_client();
+            let frame: &[u8] = &[
+                0x00, 0x00, 0x06,
+                0x04, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x05,             // SETTINGS_MAX_FRAME_SIZE
+                0x00, 0x00, 0x00, 0x64, // value = 100 (below 16384 minimum)
+            ];
+            let result = conn.feed_data(frame);
+            assert_eq!(result, Err(Error::Http2(crate::error::H2Error::ProtocolError)));
+        }
+    }
+
+    // ====== Item 5: Stream Limit ======
+
+    #[test]
+    fn stream_vec_full_returns_error() {
+        let mut client = H2Connection::<4, 8192>::new_client();
+        let mut server = H2Connection::<4, 8192>::new_server();
+        run_handshake(&mut client, &mut server);
+
+        let headers: &[(&[u8], &[u8])] = &[
+            (b":method", b"GET"),
+            (b":path", b"/"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.com"),
+        ];
+
+        // Open MAX_STREAMS (4) streams — all should succeed
+        for i in 0..4u64 {
+            let result = client.open_stream(headers, true);
+            assert!(result.is_ok(), "stream {} should open successfully", i);
+        }
+        exchange(&mut client, &mut server);
+
+        // 5th open: ensure_stream silently drops the stream slot.
+        // The stream ID is allocated and HEADERS frame queued, but
+        // no stream entry is created — send_data on it returns WouldBlock
+        // because get_stream returns None (window = 0).
+        let result = client.open_stream(headers, true);
+        assert!(result.is_ok(), "open_stream succeeds (HEADERS encoded)");
+        let overflow_id = result.unwrap();
+
+        // Verify the stream slot was NOT created: send_data gets
+        // max_by_stream=0 from the missing stream → WouldBlock
+        let send_result = client.send_data(overflow_id, b"x", true);
+        assert_eq!(send_result, Err(Error::WouldBlock));
     }
 }

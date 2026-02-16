@@ -1040,4 +1040,63 @@ mod tests {
         let data = [0u8; 4]; // all zeros
         assert!(find_inner_content_type(&data).is_err());
     }
+
+    // ====== Item 6: TLS Malformed Records ======
+
+    #[test]
+    fn malformed_record_invalid_content_type() {
+        let cert: &'static [u8] = test_cert_der().leak();
+        let mut client = make_client();
+        let _server = make_server(cert);
+
+        // Drain the ClientHello output
+        let mut buf = [0u8; 32768];
+        while let Some(_) = client.poll_output(&mut buf) {}
+
+        // Feed a record with invalid content type (0xFF)
+        // Header: CT=0xFF, version=0x0303, length=1, payload=0x00
+        let result = client.feed_data(&[0xFF, 0x03, 0x03, 0x00, 0x01, 0x00]);
+        assert_eq!(result, Err(Error::Tls));
+    }
+
+    #[test]
+    fn malformed_record_truncated_header() {
+        let cert: &'static [u8] = test_cert_der().leak();
+        let mut client = make_client();
+        let _server = make_server(cert);
+
+        // Drain the ClientHello
+        let mut buf = [0u8; 32768];
+        while let Some(_) = client.poll_output(&mut buf) {}
+
+        // Feed partial header (3 of 5 bytes) — should buffer without error
+        let result = client.feed_data(&[0x16, 0x03, 0x03]);
+        assert!(result.is_ok(), "partial header should be buffered");
+
+        // Complete the header + payload: length=1, payload=0x00
+        // Full record: CT=Handshake(0x16), ver=0x0303, len=1, payload=[0x00]
+        // The TLS engine rejects the 1-byte handshake message
+        let result = client.feed_data(&[0x00, 0x01, 0x00]);
+        assert!(result.is_err(), "malformed handshake record should error");
+    }
+
+    // ====== Item 7: Operations After Close ======
+
+    #[test]
+    fn send_after_close_fails() {
+        let cert: &'static [u8] = test_cert_der().leak();
+        let mut client = make_client();
+        let mut server = make_server(cert);
+
+        handshake(&mut client, &mut server);
+        drain_events_client(&mut client);
+        drain_events_server(&mut server);
+
+        // Close the connection
+        client.close().unwrap();
+
+        // send_app_data checks state != Active → InvalidState
+        let result = client.send_app_data(b"hello");
+        assert_eq!(result, Err(Error::InvalidState));
+    }
 }
