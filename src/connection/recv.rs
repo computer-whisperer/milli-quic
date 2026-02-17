@@ -246,7 +246,7 @@ where
                     // Decryption failure or parse error: silently discard this packet
                     // per RFC 9000 Section 12.2
                     #[cfg(feature = "std")]
-                    eprintln!("[debug] packet error: {:?} (first_byte=0x{:02x}, len={})", e, pkt_data[0], pkt_data.len());
+                    eprintln!("[debug] packet error: {:?} (first_byte=0x{:02x}, len={})", _e, pkt_data[0], pkt_data.len());
                     continue;
                 }
             }
@@ -759,6 +759,11 @@ where
 
         // Deliver complete TLS handshake messages from the contiguous frontier.
         loop {
+            // Re-check: check_tls_keys may have released the slot.
+            let slot = match self.handshake_slot {
+                Some(s) => s,
+                None => break,
+            };
             let ctx = pool.get_mut(slot);
             let avail = ctx.crypto_reasm[idx].contiguous_len();
             if avail < 4 {

@@ -32,6 +32,17 @@ impl<C: CryptoProvider, const CRYPTO_BUF: usize> HandshakeContext<C, CRYPTO_BUF>
 where
     C::Hkdf: Default,
 {
+    /// Create a new handshake context with default/placeholder state.
+    pub fn new() -> Self {
+        Self {
+            tls: TlsEngine::<C>::new_placeholder(),
+            pending_crypto: core::array::from_fn(|_| heapless::Vec::new()),
+            crypto_reasm: core::array::from_fn(|_| CryptoReassemblyBuf::new()),
+            crypto_send_offset: [0; 3],
+            pending_crypto_level: [Level::Initial; 3],
+        }
+    }
+
     /// Reset the context to its initial state for reuse.
     pub fn reset(&mut self) {
         // Reset pending crypto buffers
@@ -71,9 +82,15 @@ pub trait HandshakePoolAccess<C: CryptoProvider, const CRYPTO_BUF: usize> {
 // HandshakeSlot
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "alloc"))]
 struct HandshakeSlot<C: CryptoProvider, const CRYPTO_BUF: usize> {
     in_use: bool,
     ctx: HandshakeContext<C, CRYPTO_BUF>,
+}
+
+#[cfg(feature = "alloc")]
+struct HandshakeSlot<C: CryptoProvider, const CRYPTO_BUF: usize> {
+    ctx: Option<alloc::boxed::Box<HandshakeContext<C, CRYPTO_BUF>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,15 +120,18 @@ where
     /// `Connection::server()`.
     pub fn new() -> Self {
         Self {
-            slots: core::array::from_fn(|_| HandshakeSlot {
-                in_use: false,
-                ctx: HandshakeContext {
-                    tls: TlsEngine::<C>::new_placeholder(),
-                    pending_crypto: core::array::from_fn(|_| heapless::Vec::new()),
-                    crypto_reasm: core::array::from_fn(|_| CryptoReassemblyBuf::new()),
-                    crypto_send_offset: [0; 3],
-                    pending_crypto_level: [Level::Initial; 3],
-                },
+            slots: core::array::from_fn(|_| {
+                #[cfg(not(feature = "alloc"))]
+                {
+                    HandshakeSlot {
+                        in_use: false,
+                        ctx: HandshakeContext::new(),
+                    }
+                }
+                #[cfg(feature = "alloc")]
+                {
+                    HandshakeSlot { ctx: None }
+                }
             }),
         }
     }
@@ -124,8 +144,14 @@ where
 {
     fn claim(&mut self) -> Result<u8, Error> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
+            #[cfg(not(feature = "alloc"))]
             if !slot.in_use {
                 slot.in_use = true;
+                return Ok(i as u8);
+            }
+            #[cfg(feature = "alloc")]
+            if slot.ctx.is_none() {
+                slot.ctx = Some(alloc::boxed::Box::new(HandshakeContext::new()));
                 return Ok(i as u8);
             }
         }
@@ -135,12 +161,26 @@ where
     fn release(&mut self, slot: u8) {
         let idx = slot as usize;
         if idx < N {
-            self.slots[idx].in_use = false;
-            self.slots[idx].ctx.reset();
+            #[cfg(not(feature = "alloc"))]
+            {
+                self.slots[idx].in_use = false;
+                self.slots[idx].ctx.reset();
+            }
+            #[cfg(feature = "alloc")]
+            {
+                self.slots[idx].ctx = None;
+            }
         }
     }
 
     fn get_mut(&mut self, slot: u8) -> &mut HandshakeContext<C, CRYPTO_BUF> {
-        &mut self.slots[slot as usize].ctx
+        #[cfg(not(feature = "alloc"))]
+        {
+            &mut self.slots[slot as usize].ctx
+        }
+        #[cfg(feature = "alloc")]
+        {
+            self.slots[slot as usize].ctx.as_deref_mut().unwrap()
+        }
     }
 }

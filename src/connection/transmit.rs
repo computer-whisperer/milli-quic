@@ -69,7 +69,7 @@ where
                     {
                         // Take initial keys out temporarily to avoid borrow conflict.
                         let send = self.keys.initial_send.take();
-                        let r = if let Some(ref k) = send {
+                        let r = if let Some(k) = send.as_ref() {
                             self.build_and_encrypt_initial_packet(
                                 &frame_buf[..frame_len],
                                 is_client,
@@ -192,7 +192,7 @@ where
         #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
         let result = {
             let send = self.keys.initial_send.take();
-            let r = if let Some(ref k) = send {
+            let r = if let Some(k) = send.as_ref() {
                 self.build_and_encrypt_initial_packet(
                     &frame_buf[..frame_len],
                     pad_to_min,

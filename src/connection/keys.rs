@@ -8,12 +8,66 @@
 //! regardless of the negotiated cipher suite. The initial key fields
 //! therefore use concrete AES types instead of the generic `CryptoProvider`.
 
-use crate::crypto::{Aead, CryptoProvider, DirectionalKeys, Level};
+use crate::crypto::{Aead, CryptoProvider, DirectionalKeys, HeaderProtection, Level};
 use crate::error::Error;
 use crate::tls::DerivedKeys;
 
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 use crate::crypto::rustcrypto::{Aes128GcmAead, AesHeaderProtection};
+
+// ---------------------------------------------------------------------------
+// OptKeys — stack or heap-boxed optional directional keys
+// ---------------------------------------------------------------------------
+
+/// Optional directional keys — stack-based without alloc, heap-boxed with alloc.
+///
+/// When the `alloc` feature is enabled, each `Some` variant wraps its keys in a
+/// `Box`, so that `None` costs only 8 bytes (pointer-width) instead of the full
+/// `size_of::<DirectionalKeys>()`. After the handshake, four of the seven key
+/// slots in `ConnectionKeys` are `None`, saving ~1.5 KB per connection.
+pub(crate) struct OptKeys<A: Aead, H: HeaderProtection>(
+    #[cfg(not(feature = "alloc"))]
+    Option<DirectionalKeys<A, H>>,
+    #[cfg(feature = "alloc")]
+    Option<alloc::boxed::Box<DirectionalKeys<A, H>>>,
+);
+
+impl<A: Aead, H: HeaderProtection> OptKeys<A, H> {
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    pub fn some(keys: DirectionalKeys<A, H>) -> Self {
+        #[cfg(not(feature = "alloc"))]
+        { Self(Some(keys)) }
+        #[cfg(feature = "alloc")]
+        { Self(Some(alloc::boxed::Box::new(keys))) }
+    }
+
+    pub fn as_ref(&self) -> Option<&DirectionalKeys<A, H>> {
+        #[cfg(not(feature = "alloc"))]
+        { self.0.as_ref() }
+        #[cfg(feature = "alloc")]
+        { self.0.as_deref() }
+    }
+
+    pub fn take(&mut self) -> OptKeys<A, H> {
+        OptKeys(self.0.take())
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    #[allow(dead_code)] // used in tests
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
+}
 
 /// State for QUIC Key Update (RFC 9001 section 6).
 ///
@@ -42,7 +96,7 @@ pub struct KeyUpdateState<C: CryptoProvider> {
     pub hp_key_len: usize,
     /// Previous-generation read AEAD key, for decrypting packets still
     /// encrypted with the old key phase during a transition.
-    pub prev_recv_key: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
+    pub(crate) prev_recv_key: OptKeys<C::Aead, C::HeaderProtection>,
     /// Whether we have received a packet with the new key phase from the peer
     /// (i.e., the current key update is confirmed). A new key update MUST NOT
     /// be initiated until this is true.
@@ -66,7 +120,7 @@ impl<C: CryptoProvider> KeyUpdateState<C> {
             send_hp_key: [0u8; 32],
             recv_hp_key: [0u8; 32],
             hp_key_len: 0,
-            prev_recv_key: None,
+            prev_recv_key: OptKeys::none(),
             update_confirmed: true, // No pending update initially
         }
     }
@@ -77,17 +131,17 @@ pub struct ConnectionKeys<C: CryptoProvider> {
     // Initial keys always use AES-128-GCM per RFC 9001 section 5.2,
     // regardless of the negotiated cipher suite (C).
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    pub initial_send: Option<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>,
+    pub(crate) initial_send: OptKeys<Aes128GcmAead, AesHeaderProtection>,
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    pub initial_recv: Option<DirectionalKeys<Aes128GcmAead, AesHeaderProtection>>,
+    pub(crate) initial_recv: OptKeys<Aes128GcmAead, AesHeaderProtection>,
     // Without crypto features, we still need the fields for the struct definition.
     #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
     _initial_marker: core::marker::PhantomData<C>,
     // Handshake and Application keys use the negotiated cipher suite.
-    pub handshake_send: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
-    pub handshake_recv: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
-    pub app_send: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
-    pub app_recv: Option<DirectionalKeys<C::Aead, C::HeaderProtection>>,
+    pub(crate) handshake_send: OptKeys<C::Aead, C::HeaderProtection>,
+    pub(crate) handshake_recv: OptKeys<C::Aead, C::HeaderProtection>,
+    pub(crate) app_send: OptKeys<C::Aead, C::HeaderProtection>,
+    pub(crate) app_recv: OptKeys<C::Aead, C::HeaderProtection>,
     /// Key update state for 1-RTT keys (RFC 9001 section 6).
     pub key_update: KeyUpdateState<C>,
 }
@@ -103,15 +157,15 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
     pub fn new() -> Self {
         Self {
             #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-            initial_send: None,
+            initial_send: OptKeys::none(),
             #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-            initial_recv: None,
+            initial_recv: OptKeys::none(),
             #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
             _initial_marker: core::marker::PhantomData,
-            handshake_send: None,
-            handshake_recv: None,
-            app_send: None,
-            app_recv: None,
+            handshake_send: OptKeys::none(),
+            handshake_recv: OptKeys::none(),
+            app_send: OptKeys::none(),
+            app_recv: OptKeys::none(),
             key_update: KeyUpdateState::new(),
         }
     }
@@ -148,11 +202,11 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &server_secret)?;
 
         if is_client {
-            self.initial_send = Some(client_keys);
-            self.initial_recv = Some(server_keys);
+            self.initial_send = OptKeys::some(client_keys);
+            self.initial_recv = OptKeys::some(server_keys);
         } else {
-            self.initial_send = Some(server_keys);
-            self.initial_recv = Some(client_keys);
+            self.initial_send = OptKeys::some(server_keys);
+            self.initial_recv = OptKeys::some(client_keys);
         }
         Ok(())
     }
@@ -178,12 +232,12 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
         match derived.level {
             Level::Handshake => {
-                self.handshake_send = Some(send_keys);
-                self.handshake_recv = Some(recv_keys);
+                self.handshake_send = OptKeys::some(send_keys);
+                self.handshake_recv = OptKeys::some(recv_keys);
             }
             Level::Application => {
-                self.app_send = Some(send_keys);
-                self.app_recv = Some(recv_keys);
+                self.app_send = OptKeys::some(send_keys);
+                self.app_recv = OptKeys::some(recv_keys);
                 // Save traffic secrets for key update derivation (RFC 9001 section 6)
                 self.key_update.send_secret[..derived.secret_len]
                     .copy_from_slice(&derived.send_secret[..derived.secret_len]);
@@ -269,8 +323,8 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
     /// Drop Initial keys (after handshake keys are installed).
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     pub fn drop_initial(&mut self) {
-        self.initial_send = None;
-        self.initial_recv = None;
+        self.initial_send.clear();
+        self.initial_recv.clear();
     }
 
     #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
@@ -280,8 +334,8 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
     /// Drop Handshake keys (after handshake is confirmed).
     pub fn drop_handshake(&mut self) {
-        self.handshake_send = None;
-        self.handshake_recv = None;
+        self.handshake_send.clear();
+        self.handshake_recv.clear();
     }
 
     /// Check if we have send keys at a given level.
@@ -409,12 +463,11 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         )?;
 
         // Rotate: current recv -> prev_recv
-        let old_recv = self.app_recv.take();
-        self.key_update.prev_recv_key = old_recv;
+        self.key_update.prev_recv_key = self.app_recv.take();
 
         // Install new keys
-        self.app_send = Some(new_send_keys);
-        self.app_recv = Some(new_recv_keys);
+        self.app_send = OptKeys::some(new_send_keys);
+        self.app_recv = OptKeys::some(new_recv_keys);
 
         // Update secrets
         self.key_update.send_secret[..secret_len]
@@ -508,12 +561,11 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         )?;
 
         // Rotate: current recv -> prev_recv
-        let old_recv = self.app_recv.take();
-        self.key_update.prev_recv_key = old_recv;
+        self.key_update.prev_recv_key = self.app_recv.take();
 
         // Install new keys
-        self.app_send = Some(new_send_keys);
-        self.app_recv = Some(new_recv_keys);
+        self.app_send = OptKeys::some(new_send_keys);
+        self.app_recv = OptKeys::some(new_recv_keys);
 
         // Update secrets
         self.key_update.send_secret[..secret_len]

@@ -779,6 +779,14 @@ where
             }
         }
 
+        // With alloc, grow the Vec on demand if no empty slot was found.
+        #[cfg(feature = "alloc")]
+        if target_idx.is_none() {
+            let new_idx = sio.recv_bufs.len();
+            sio.recv_bufs.push(None);
+            target_idx = Some(new_idx);
+        }
+
         if let Some(idx) = target_idx {
             if sio.recv_bufs[idx].is_none() {
                 sio.recv_bufs[idx] = Some(StreamRecvBuf {
