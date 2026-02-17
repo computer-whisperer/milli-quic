@@ -21,7 +21,10 @@ pub struct AckResult {
 
 /// Fixed-capacity tracker of sent-but-unacked packets.
 pub struct SentPacketTracker<const N: usize = 128> {
+    #[cfg(not(feature = "alloc"))]
     entries: [Option<SentPacket>; N],
+    #[cfg(feature = "alloc")]
+    entries: alloc::vec::Vec<Option<SentPacket>>,
     count: usize,
 }
 
@@ -34,16 +37,16 @@ impl<const N: usize> Default for SentPacketTracker<N> {
 impl<const N: usize> SentPacketTracker<N> {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(feature = "alloc"))]
             entries: [None; N],
+            #[cfg(feature = "alloc")]
+            entries: alloc::vec::Vec::new(),
             count: 0,
         }
     }
 
     /// Record a sent packet.
     pub fn on_packet_sent(&mut self, pkt: SentPacket) -> Result<(), Error> {
-        if self.count >= N {
-            return Err(Error::BufferTooSmall { needed: N + 1 });
-        }
         // Find an empty slot.
         for slot in self.entries.iter_mut() {
             if slot.is_none() {
@@ -52,7 +55,14 @@ impl<const N: usize> SentPacketTracker<N> {
                 return Ok(());
             }
         }
-        Err(Error::BufferTooSmall { needed: N + 1 })
+        #[cfg(not(feature = "alloc"))]
+        return Err(Error::BufferTooSmall { needed: N + 1 });
+        #[cfg(feature = "alloc")]
+        {
+            self.entries.push(Some(pkt));
+            self.count += 1;
+            Ok(())
+        }
     }
 
     /// Process an ACK: mark packets as acknowledged.
@@ -230,6 +240,7 @@ mod tests {
         assert_eq!(tracker.count(), 3); // 0, 3, 4 remain
     }
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn capacity_limit() {
         let mut tracker = SentPacketTracker::<4>::new();

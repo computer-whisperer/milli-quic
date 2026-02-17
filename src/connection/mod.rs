@@ -193,7 +193,10 @@ pub struct StreamRecvBuf<const N: usize = 1024> {
 /// range is dropped.
 pub struct RecvPnTracker {
     /// Non-overlapping, non-adjacent, ascending-sorted inclusive ranges.
+    #[cfg(not(feature = "alloc"))]
     pub ranges: heapless::Vec<(u64, u64), 32>,
+    #[cfg(feature = "alloc")]
+    pub ranges: alloc::vec::Vec<(u64, u64)>,
 }
 
 impl Default for RecvPnTracker {
@@ -205,7 +208,10 @@ impl Default for RecvPnTracker {
 impl RecvPnTracker {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(feature = "alloc"))]
             ranges: heapless::Vec::new(),
+            #[cfg(feature = "alloc")]
+            ranges: alloc::vec::Vec::new(),
         }
     }
 
@@ -261,6 +267,7 @@ impl RecvPnTracker {
             }
             (None, None) => {
                 // New standalone range.
+                #[cfg(not(feature = "alloc"))]
                 if self.ranges.is_full() {
                     // Drop the lowest (oldest) range.
                     self.ranges.remove(0);
@@ -347,7 +354,10 @@ pub struct Connection<
     pub(crate) peer_params: Option<TransportParams>,
 
     // Events queue
+    #[cfg(not(feature = "alloc"))]
     pub(crate) events: heapless::Deque<Event, 16>,
+    #[cfg(feature = "alloc")]
+    pub(crate) events: alloc::collections::VecDeque<Event>,
 
     // Pending close
     pub(crate) close_frame: Option<(u64, heapless::Vec<u8, 64>)>,
@@ -457,7 +467,10 @@ where
             ack_eliciting_received: [false; 3],
             local_params: transport_params,
             peer_params: None,
+            #[cfg(not(feature = "alloc"))]
             events: heapless::Deque::new(),
+            #[cfg(feature = "alloc")]
+            events: alloc::collections::VecDeque::new(),
             close_frame: None,
             idle_timeout: None,
             last_activity: 0,
@@ -525,7 +538,10 @@ where
             ack_eliciting_received: [false; 3],
             local_params: transport_params,
             peer_params: None,
+            #[cfg(not(feature = "alloc"))]
             events: heapless::Deque::new(),
+            #[cfg(feature = "alloc")]
+            events: alloc::collections::VecDeque::new(),
             close_frame: None,
             idle_timeout: None,
             last_activity: 0,
@@ -2026,6 +2042,7 @@ mod tests {
             assert_eq!(t.ranges.as_slice(), &[(3, 3)]);
         }
 
+        #[cfg(not(feature = "alloc"))]
         #[test]
         fn full_tracker_drops_lowest_range() {
             let mut t = RecvPnTracker::new();
@@ -2378,8 +2395,8 @@ mod tests {
         std::eprintln!("  crypto_reasm ([CryptoReassemblyBuf<4096>; 3]): {} bytes", core::mem::size_of::<[CryptoReassemblyBuf<4096>; 3]>());
         std::eprintln!("    single CryptoReassemblyBuf<4096>: {} bytes", core::mem::size_of::<CryptoReassemblyBuf<4096>>());
         std::eprintln!("    single CryptoReassemblyBuf<2048>: {} bytes", core::mem::size_of::<CryptoReassemblyBuf<2048>>());
-        std::eprintln!("  pending_crypto ([heapless::Vec<u8, 2048>; 3]): {} bytes", core::mem::size_of::<[heapless::Vec<u8, 2048>; 3]>());
-        std::eprintln!("    single heapless::Vec<u8, 2048>: {} bytes", core::mem::size_of::<heapless::Vec<u8, 2048>>());
+        std::eprintln!("  pending_crypto ([Buf<2048>; 3]): {} bytes", core::mem::size_of::<[crate::buf::Buf<2048>; 3]>());
+        std::eprintln!("    single Buf<2048>: {} bytes", core::mem::size_of::<crate::buf::Buf<2048>>());
         std::eprintln!();
 
         std::eprintln!("--- Parameterized buffer size impact ---");

@@ -9,6 +9,7 @@
 //! can be reused by another connection, dramatically reducing per-connection
 //! memory for established connections.
 
+use crate::buf::Buf;
 use crate::crypto::{CryptoProvider, Level};
 use crate::error::Error;
 use crate::tls::handshake::TlsEngine;
@@ -22,7 +23,7 @@ use super::recv::CryptoReassemblyBuf;
 /// Handshake-only state that can be shared across connections via a pool.
 pub struct HandshakeContext<C: CryptoProvider, const CRYPTO_BUF: usize = 4096> {
     pub(crate) tls: TlsEngine<C>,
-    pub(crate) pending_crypto: [heapless::Vec<u8, 2048>; 3],
+    pub(crate) pending_crypto: [Buf<2048>; 3],
     pub(crate) crypto_reasm: [CryptoReassemblyBuf<CRYPTO_BUF>; 3],
     pub(crate) crypto_send_offset: [u64; 3],
     pub(crate) pending_crypto_level: [Level; 3],
@@ -36,7 +37,7 @@ where
     pub fn new() -> Self {
         Self {
             tls: TlsEngine::<C>::new_placeholder(),
-            pending_crypto: core::array::from_fn(|_| heapless::Vec::new()),
+            pending_crypto: core::array::from_fn(|_| Buf::new()),
             crypto_reasm: core::array::from_fn(|_| CryptoReassemblyBuf::new()),
             crypto_send_offset: [0; 3],
             pending_crypto_level: [Level::Initial; 3],

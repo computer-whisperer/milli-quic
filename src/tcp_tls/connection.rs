@@ -385,6 +385,10 @@ where
             self.state = ConnState::Active;
             self.send_seq = 0;
             self.recv_seq = 0;
+            self.engine.shrink_post_handshake();
+            // Handshake keys are no longer needed
+            self.hs_send = None;
+            self.hs_recv = None;
             let _ = self.events.push_back(TlsEvent::HandshakeComplete);
         }
 

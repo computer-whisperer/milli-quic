@@ -102,13 +102,22 @@ pub struct H3Connection<
     pub(crate) settings_sent: bool,
 
     // Pending events
+    #[cfg(not(feature = "alloc"))]
     pub(crate) h3_events: heapless::Deque<H3Event, 16>,
+    #[cfg(feature = "alloc")]
+    pub(crate) h3_events: alloc::collections::VecDeque<H3Event>,
 
     // Per-stream state: which streams are request streams.
+    #[cfg(not(feature = "alloc"))]
     pub(crate) request_streams: heapless::Vec<RequestStreamState, 8>,
+    #[cfg(feature = "alloc")]
+    pub(crate) request_streams: alloc::vec::Vec<RequestStreamState>,
 
     // Track stream IDs of unidirectional streams whose type we haven't read yet.
+    #[cfg(not(feature = "alloc"))]
     pub(crate) pending_uni_streams: heapless::Vec<u64, 16>,
+    #[cfg(feature = "alloc")]
+    pub(crate) pending_uni_streams: alloc::vec::Vec<u64>,
 }
 
 impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
@@ -132,9 +141,18 @@ where
             local_settings: H3Settings::default(),
             peer_settings: None,
             settings_sent: false,
+            #[cfg(not(feature = "alloc"))]
             h3_events: heapless::Deque::new(),
+            #[cfg(feature = "alloc")]
+            h3_events: alloc::collections::VecDeque::new(),
+            #[cfg(not(feature = "alloc"))]
             request_streams: heapless::Vec::new(),
+            #[cfg(feature = "alloc")]
+            request_streams: alloc::vec::Vec::new(),
+            #[cfg(not(feature = "alloc"))]
             pending_uni_streams: heapless::Vec::new(),
+            #[cfg(feature = "alloc")]
+            pending_uni_streams: alloc::vec::Vec::new(),
         }
     }
 

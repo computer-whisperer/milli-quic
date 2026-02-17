@@ -24,7 +24,10 @@ use super::{Connection, ConnectionState, Event};
 pub(crate) struct CryptoReassemblyBuf<const N: usize = 4096> {
     /// Raw byte buffer. Index `i` corresponds to absolute CRYPTO stream
     /// offset `delivered + i`.
+    #[cfg(not(feature = "alloc"))]
     buf: [u8; N],
+    #[cfg(feature = "alloc")]
+    buf: alloc::vec::Vec<u8>,
     /// Absolute offset of bytes already delivered to TLS.
     pub(crate) delivered: u64,
     /// Received byte ranges relative to `delivered`, stored as `(start, end)`
@@ -35,7 +38,10 @@ pub(crate) struct CryptoReassemblyBuf<const N: usize = 4096> {
 impl<const N: usize> CryptoReassemblyBuf<N> {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(feature = "alloc"))]
             buf: [0u8; N],
+            #[cfg(feature = "alloc")]
+            buf: alloc::vec![0u8; N],
             delivered: 0,
             ranges: heapless::Vec::new(),
         }

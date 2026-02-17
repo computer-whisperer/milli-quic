@@ -1,6 +1,6 @@
 //! Memory budget analysis for an embedded server target:
 //!   1 HTTPS/1.1 connection + 4 active H3 connections + 2 H3 handshake slots
-//!   Goal: < 100 KB total SRAM
+//!   Goal: < 100 KB total SRAM (struct + peak heap)
 
 use core::mem::size_of;
 
@@ -9,20 +9,72 @@ use milli_http::crypto::rustcrypto::ChaCha20Provider;
 // -- Component types --
 use milli_http::connection::Connection;
 use milli_http::connection::handshake_pool::{HandshakeContext, HandshakePool};
-use milli_http::connection::io::QuicStreamIoBufs;
 use milli_http::connection::keys::ConnectionKeys;
 use milli_http::h3::server::H3Server;
-use milli_http::h3::connection::H3Connection;
+use milli_http::h3::connection::H3Event;
 use milli_http::https1::Https1Server;
 use milli_http::http1::connection::Http1Connection;
-use milli_http::http1::io::Http1IoBufs;
 use milli_http::tcp_tls::connection::TlsConnection;
+use milli_http::tcp_tls::io::TlsIoBufs;
 use milli_http::tls::handshake::TlsEngine;
 use milli_http::buf::Buf;
-use milli_http::transport::stream::StreamMap;
-use milli_http::transport::recovery::SentPacketTracker;
+use milli_http::transport::stream::{StreamMap, StreamState};
+use milli_http::transport::recovery::{SentPacket, SentPacketTracker};
+use milli_http::Event;
 
 type C = ChaCha20Provider;
+
+/// Estimate struct + heap for one H3 connection at given operating parameters.
+fn h3_estimate(
+    h3_struct: usize,
+    active_streams: usize,
+    stream_buf_size: usize,
+    tracked_packets: usize,
+    active_requests: usize,
+) -> (usize, usize) {
+    let streams_heap = active_streams * 2 * size_of::<Option<StreamState>>();  // bidi = 2 entries
+    let sent_heap = tracked_packets * size_of::<Option<SentPacket>>();
+    let pn_ranges_heap = 3 * 4 * size_of::<(u64, u64)>();
+    let events_heap = 8 * size_of::<Event>();
+    let h3_events_heap = 8 * size_of::<H3Event>();
+    // RequestStreamState: ~80 bytes struct + header buf + data buf on heap
+    let req_streams_heap = active_requests * 80;
+    let pending_uni_heap = 4 * size_of::<u64>();
+    // Per active stream: recv + send buffers on heap
+    let stream_io_heap = active_streams * 2 * stream_buf_size;
+    // Request data buffers: headers (512) + data (1024) per request
+    let req_data_heap = active_requests * (512 + 1024);
+
+    let heap = streams_heap + sent_heap + pn_ranges_heap
+        + events_heap + h3_events_heap + req_streams_heap
+        + pending_uni_heap + stream_io_heap + req_data_heap;
+    (h3_struct, heap)
+}
+
+/// Estimate struct + heap for a handshake context at given crypto buf size.
+fn handshake_estimate(crypto_buf: usize) -> usize {
+    let hs_ctx = size_of::<HandshakeContext<C, 2048>>();
+    // TlsEngine buffers: pending_write + pending_write_hs + server_cert_data
+    let tls_bufs = 3 * 2048;
+    // pending_crypto x3
+    let pending_crypto = 3 * 2048;
+    // crypto_reasm x3 at given buf size
+    let crypto_reasm = 3 * crypto_buf;
+    hs_ctx + tls_bufs + pending_crypto + crypto_reasm
+}
+
+/// Estimate struct + heap for HTTPS/1.1 at given TLS I/O buffer size.
+fn https1_estimate(tls_io_buf: usize, http1_hdr_buf: usize, http1_data_buf: usize) -> (usize, usize) {
+    let tls_struct = size_of::<TlsConnection<C>>();
+    let http1_struct = size_of::<Http1Connection<1024, 2048>>();
+    let io_struct = size_of::<TlsIoBufs<4096>>();
+    let struc = tls_struct + http1_struct + io_struct;
+
+    // Post-handshake: TlsEngine bufs shrunk to 0
+    let http1_heap = http1_hdr_buf + http1_data_buf;
+    let tls_io_heap = 4 * tls_io_buf;  // recv, send, app_recv, app_send
+    (struc, http1_heap + tls_io_heap)
+}
 
 #[test]
 fn print_memory_budget() {
@@ -32,106 +84,98 @@ fn print_memory_budget() {
     println!("============================================================");
     println!();
 
-    // ---- Core building blocks ----
-    println!("--- Core building blocks ---");
+    // ---- Element sizes ----
+    println!("--- Element sizes ---");
     println!("  TlsEngine<C>:               {:>6} bytes", size_of::<TlsEngine<C>>());
-    println!("  ConnectionKeys<C>:           {:>6} bytes", size_of::<ConnectionKeys<C>>());
-    println!("  StreamMap<8>:                {:>6} bytes", size_of::<StreamMap<8>>());
-    println!("  StreamMap<16>:               {:>6} bytes", size_of::<StreamMap<16>>());
-    println!("  StreamMap<32>:               {:>6} bytes", size_of::<StreamMap<32>>());
-    println!("  SentPacketTracker<32>:       {:>6} bytes", size_of::<SentPacketTracker<32>>());
-    println!("  SentPacketTracker<64>:       {:>6} bytes", size_of::<SentPacketTracker<64>>());
-    println!("  SentPacketTracker<128>:      {:>6} bytes", size_of::<SentPacketTracker<128>>());
-    println!("  Buf<1024>:                   {:>6} bytes", size_of::<Buf<1024>>());
-    println!("  Buf<2048>:                   {:>6} bytes", size_of::<Buf<2048>>());
-    println!("  Buf<4096>:                   {:>6} bytes", size_of::<Buf<4096>>());
-    println!("  Buf<8192>:                   {:>6} bytes", size_of::<Buf<8192>>());
+    println!("  Option<StreamState>:         {:>6} bytes", size_of::<Option<StreamState>>());
+    println!("  Option<SentPacket>:          {:>6} bytes", size_of::<Option<SentPacket>>());
+    println!("  Event:                       {:>6} bytes", size_of::<Event>());
+    println!("  H3Event:                     {:>6} bytes", size_of::<H3Event>());
+    println!("  HandshakeContext<C>:         {:>6} bytes", size_of::<HandshakeContext<C, 2048>>());
     println!();
 
-    // ---- QUIC Connection (various configs) ----
-    println!("--- QUIC Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS> ---");
-    println!("  Connection<C, 32, 128, 4>:   {:>6} bytes  (defaults)", size_of::<Connection<C, 32, 128, 4>>());
-    println!("  Connection<C, 8, 32, 2>:     {:>6} bytes  (compact)", size_of::<Connection<C, 8, 32, 2>>());
-    println!("  Connection<C, 4, 16, 2>:     {:>6} bytes  (tiny)", size_of::<Connection<C, 4, 16, 2>>());
-    println!();
-
-    // ---- QuicStreamIoBufs ----
-    println!("--- QuicStreamIoBufs<MAX_STREAMS, STREAM_BUF, SEND_QUEUE> ---");
-    println!("  IoBufs<32, 1024, 16>:        {:>6} bytes  (defaults)", size_of::<QuicStreamIoBufs<32, 1024, 16>>());
-    println!("  IoBufs<8, 512, 8>:           {:>6} bytes  (compact)", size_of::<QuicStreamIoBufs<8, 512, 8>>());
-    println!("  IoBufs<4, 256, 4>:           {:>6} bytes  (tiny)", size_of::<QuicStreamIoBufs<4, 256, 4>>());
-    println!();
-
-    // ---- HandshakeContext / Pool ----
-    println!("--- Handshake ---");
-    println!("  HandshakeContext<C, 4096>:   {:>6} bytes  (default)", size_of::<HandshakeContext<C, 4096>>());
-    println!("  HandshakeContext<C, 2048>:   {:>6} bytes  (half)", size_of::<HandshakeContext<C, 2048>>());
-    println!("  HandshakeContext<C, 1024>:   {:>6} bytes  (quarter)", size_of::<HandshakeContext<C, 1024>>());
-    println!("  HandshakePool<C, 2, 4096>:   {:>6} bytes  (2 slots default)", size_of::<HandshakePool<C, 2, 4096>>());
-    println!("  HandshakePool<C, 2, 2048>:   {:>6} bytes  (2 slots half)", size_of::<HandshakePool<C, 2, 2048>>());
-    println!();
-
-    // ---- H3 Server (various configs) ----
-    println!("--- H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE> ---");
+    // ---- Composite struct sizes ----
+    println!("--- Struct sizes (with alloc, excludes heap backing) ---");
+    println!("  Connection<C> (defaults):    {:>6} bytes", size_of::<Connection<C, 32, 128, 4>>());
+    println!("  Connection<C, 8, 32, 2>:     {:>6} bytes", size_of::<Connection<C, 8, 32, 2>>());
     println!("  H3Server<C> (defaults):      {:>6} bytes", size_of::<H3Server<C>>());
-    println!("  H3Server<C, 8, 32, 2, 512, 8>: {:>5} bytes  (compact)", size_of::<H3Server<C, 8, 32, 2, 512, 8>>());
-    println!("  H3Server<C, 4, 16, 2, 256, 4>: {:>5} bytes  (tiny)", size_of::<H3Server<C, 4, 16, 2, 256, 4>>());
-    println!();
-
-    // ---- HTTPS/1.1 Server ----
-    println!("--- HTTPS/1.1 Server ---");
-    println!("  Https1Server<C> (defaults):  {:>6} bytes  (BUF=18432)", size_of::<Https1Server<C>>());
-    println!("  Https1Server<C, 4096, 1024, 2048>: {:>5} bytes  (compact)", size_of::<Https1Server<C, 4096, 1024, 2048>>());
-    println!("  Https1Server<C, 2048, 512, 1024>:  {:>5} bytes  (tiny)", size_of::<Https1Server<C, 2048, 512, 1024>>());
-    println!("  Http1Connection (defaults):  {:>6} bytes  (HDRBUF=2048, DATABUF=4096)", size_of::<Http1Connection>());
-    println!("  Http1Connection<512, 1024>:  {:>6} bytes", size_of::<Http1Connection<512, 1024>>());
-    println!("  Http1IoBufs<8192>:           {:>6} bytes  (default)", size_of::<Http1IoBufs>());
-    println!("  Http1IoBufs<2048>:           {:>6} bytes", size_of::<Http1IoBufs<2048>>());
+    println!("  H3Server<C, 8,32,2,512,8>:   {:>6} bytes", size_of::<H3Server<C, 8, 32, 2, 512, 8>>());
+    println!("  Https1Server<C> (defaults):  {:>6} bytes", size_of::<Https1Server<C>>());
     println!("  TlsConnection<C>:           {:>6} bytes", size_of::<TlsConnection<C>>());
+    println!("  HandshakePool<C, 2>:         {:>6} bytes", size_of::<HandshakePool<C, 2, 2048>>());
     println!();
 
-    // ---- Target budget: 1 HTTPS/1.1 + 4 H3 + 2 handshake slots ----
+    // ================================================================
+    // SCENARIO: Compact config (512-byte stream bufs, 2048 crypto)
+    // ================================================================
     println!("============================================================");
-    println!("  TARGET: 1 HTTPS/1.1 + 4 H3 active + 2 handshake slots");
+    println!("  COMPACT: 512B stream bufs, 4096B TLS I/O, 2048B crypto");
     println!("============================================================");
     println!();
 
-    // Defaults
-    let h3_default = size_of::<H3Server<C>>();
-    let https1_default = size_of::<Https1Server<C>>();
-    let hs_pool_default = size_of::<HandshakePool<C, 2, 4096>>();
-    let total_default = https1_default + 4 * h3_default + hs_pool_default;
-    println!("  WITH DEFAULTS:");
-    println!("    1x Https1Server<C>:        {:>6} bytes", https1_default);
-    println!("    4x H3Server<C>:            {:>6} bytes", 4 * h3_default);
-    println!("    1x HandshakePool<C,2>:     {:>6} bytes", hs_pool_default);
-    println!("    TOTAL:                     {:>6} bytes  ({:.1} KB)", total_default, total_default as f64 / 1024.0);
+    let h3_struct_compact = size_of::<H3Server<C, 8, 32, 2, 512, 8>>();
+    let (h3s, h3h) = h3_estimate(h3_struct_compact, 4, 512, 32, 2);
+    let h3_total_compact = h3s + h3h;
+    println!("  Per H3 (4 active streams):   {:>6} bytes  (struct {} + heap {})", h3_total_compact, h3s, h3h);
+
+    let hs_compact = handshake_estimate(2048);
+    println!("  Per handshake (additional):  {:>6} bytes", hs_compact);
+
+    let (h1s, h1h) = https1_estimate(4096, 1024, 2048);
+    let https1_compact = h1s + h1h;
+    println!("  HTTPS/1.1 (established):     {:>6} bytes  (struct {} + heap {})", https1_compact, h1s, h1h);
+
+    let pool_struct = size_of::<HandshakePool<C, 2, 2048>>();
+    let total_compact = 2 * h3_total_compact + 2 * (h3_total_compact + hs_compact) + https1_compact + pool_struct;
+    println!();
+    println!("  2x established H3:           {:>6} bytes", 2 * h3_total_compact);
+    println!("  2x handshaking H3:           {:>6} bytes", 2 * (h3_total_compact + hs_compact));
+    println!("  1x HTTPS/1.1:                {:>6} bytes", https1_compact);
+    println!("  Pool struct:                 {:>6} bytes", pool_struct);
+    println!("  TOTAL:                       {:>6} bytes  ({:.1} KB)", total_compact, total_compact as f64 / 1024.0);
+    print_budget_status(total_compact);
     println!();
 
-    // Compact config
-    let h3_compact = size_of::<H3Server<C, 8, 32, 2, 512, 8>>();
-    let https1_compact = size_of::<Https1Server<C, 4096, 1024, 2048>>();
-    let hs_pool_compact = size_of::<HandshakePool<C, 2, 2048>>();
-    let total_compact = https1_compact + 4 * h3_compact + hs_pool_compact;
-    println!("  COMPACT CONFIG:");
-    println!("    1x Https1Server<C, 4096, 1024, 2048>: {:>6} bytes", https1_compact);
-    println!("    4x H3Server<C, 8, 32, 2, 512, 8>:    {:>6} bytes", 4 * h3_compact);
-    println!("    1x HandshakePool<C, 2, 2048>:         {:>6} bytes", hs_pool_compact);
-    println!("    TOTAL:                                {:>6} bytes  ({:.1} KB)", total_compact, total_compact as f64 / 1024.0);
-    println!();
-
-    // Tiny config
-    let h3_tiny = size_of::<H3Server<C, 4, 16, 2, 256, 4>>();
-    let https1_tiny = size_of::<Https1Server<C, 2048, 512, 1024>>();
-    let hs_pool_tiny = size_of::<HandshakePool<C, 2, 1024>>();
-    let total_tiny = https1_tiny + 4 * h3_tiny + hs_pool_tiny;
-    println!("  TINY CONFIG:");
-    println!("    1x Https1Server<C, 2048, 512, 1024>:  {:>6} bytes", https1_tiny);
-    println!("    4x H3Server<C, 4, 16, 2, 256, 4>:     {:>6} bytes", 4 * h3_tiny);
-    println!("    1x HandshakePool<C, 2, 1024>:          {:>6} bytes", hs_pool_tiny);
-    println!("    TOTAL:                                 {:>6} bytes  ({:.1} KB)", total_tiny, total_tiny as f64 / 1024.0);
-    println!();
-
-    println!("  Goal: < 102400 bytes (100 KB)");
+    // ================================================================
+    // SCENARIO: Tight config (256-byte stream bufs, 2048 TLS I/O, 1024 crypto)
+    // ================================================================
     println!("============================================================");
+    println!("  TIGHT: 256B stream bufs, 2048B TLS I/O, 1024B crypto");
+    println!("============================================================");
+    println!();
+
+    let h3_struct_tight = size_of::<H3Server<C, 4, 16, 2, 256, 4>>();
+    let (h3s_t, h3h_t) = h3_estimate(h3_struct_tight, 2, 256, 16, 1);
+    let h3_total_tight = h3s_t + h3h_t;
+    println!("  Per H3 (2 active streams):   {:>6} bytes  (struct {} + heap {})", h3_total_tight, h3s_t, h3h_t);
+
+    let hs_tight = handshake_estimate(1024);
+    println!("  Per handshake (additional):  {:>6} bytes", hs_tight);
+
+    let (h1s_t, h1h_t) = https1_estimate(2048, 512, 1024);
+    let https1_tight = h1s_t + h1h_t;
+    println!("  HTTPS/1.1 (established):     {:>6} bytes  (struct {} + heap {})", https1_tight, h1s_t, h1h_t);
+
+    let total_tight = 2 * h3_total_tight + 2 * (h3_total_tight + hs_tight) + https1_tight + pool_struct;
+    println!();
+    println!("  2x established H3:           {:>6} bytes", 2 * h3_total_tight);
+    println!("  2x handshaking H3:           {:>6} bytes", 2 * (h3_total_tight + hs_tight));
+    println!("  1x HTTPS/1.1:                {:>6} bytes", https1_tight);
+    println!("  Pool struct:                 {:>6} bytes", pool_struct);
+    println!("  TOTAL:                       {:>6} bytes  ({:.1} KB)", total_tight, total_tight as f64 / 1024.0);
+    print_budget_status(total_tight);
+    println!();
+
+    println!("============================================================");
+}
+
+fn print_budget_status(total: usize) {
+    let goal: usize = 102400;
+    if total <= goal {
+        println!("  -> UNDER BUDGET by {} bytes ({:.1} KB)",
+            goal - total, (goal - total) as f64 / 1024.0);
+    } else {
+        println!("  -> OVER BUDGET by {} bytes ({:.1} KB)",
+            total - goal, (total - goal) as f64 / 1024.0);
+    }
 }

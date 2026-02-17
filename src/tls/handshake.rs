@@ -12,6 +12,7 @@
 //! WaitClientFinished -> Complete
 //! ```
 
+use crate::buf::{Buf, BufExt};
 use crate::crypto::{Aead, CryptoProvider, Level};
 use crate::error::Error;
 use crate::tls::extensions::{
@@ -129,12 +130,12 @@ pub struct TlsEngine<C: CryptoProvider> {
     transcript: TranscriptHash,
 
     // Output buffer for pending handshake messages
-    pending_write: heapless::Vec<u8, 2048>,
+    pending_write: Buf<2048>,
     pending_level: Level,
 
     // Second output buffer for the server's handshake-level flight
     // (ServerHello goes at Initial, everything else at Handshake)
-    pending_write_hs: heapless::Vec<u8, 2048>,
+    pending_write_hs: Buf<2048>,
 
     // Keys ready to be picked up by QUIC
     pending_keys: Option<DerivedKeys>,
@@ -152,7 +153,7 @@ pub struct TlsEngine<C: CryptoProvider> {
     pinned_certs: &'static [&'static [u8]],
 
     // Server certificate data (stored for verification by client, or as config for server)
-    server_cert_data: heapless::Vec<u8, 2048>,
+    server_cert_data: Buf<2048>,
 
     // Server certificate DER (static reference, for server role)
     server_cert_der: &'static [u8],
@@ -199,9 +200,9 @@ where
             client_app_secret: [0u8; 32],
             server_app_secret: [0u8; 32],
             transcript: TranscriptHash::new(),
-            pending_write: heapless::Vec::new(),
+            pending_write: Buf::new(),
             pending_level: Level::Initial,
-            pending_write_hs: heapless::Vec::new(),
+            pending_write_hs: Buf::new(),
             pending_keys: None,
             server_name: config.server_name,
             alpn_protocols: config.alpn_protocols,
@@ -209,7 +210,7 @@ where
             peer_transport_params: None,
             negotiated_alpn: None,
             pinned_certs: config.pinned_certs,
-            server_cert_data: heapless::Vec::new(),
+            server_cert_data: Buf::new(),
             server_cert_der: &[],
             server_private_key_der: &[],
             complete: false,
@@ -243,9 +244,9 @@ where
             client_app_secret: [0u8; 32],
             server_app_secret: [0u8; 32],
             transcript: TranscriptHash::new(),
-            pending_write: heapless::Vec::new(),
+            pending_write: Buf::new(),
             pending_level: Level::Initial,
-            pending_write_hs: heapless::Vec::new(),
+            pending_write_hs: Buf::new(),
             pending_keys: None,
             server_name: heapless::String::new(),
             alpn_protocols: config.alpn_protocols,
@@ -253,7 +254,7 @@ where
             peer_transport_params: None,
             negotiated_alpn: None,
             pinned_certs: &[],
-            server_cert_data: heapless::Vec::new(),
+            server_cert_data: Buf::new(),
             server_cert_der: config.cert_der,
             server_private_key_der: config.private_key_der,
             complete: false,
@@ -303,9 +304,9 @@ where
             client_app_secret: [0u8; 32],
             server_app_secret: [0u8; 32],
             transcript: TranscriptHash::new(),
-            pending_write: heapless::Vec::new(),
+            pending_write: Buf::new(),
             pending_level: Level::Initial,
-            pending_write_hs: heapless::Vec::new(),
+            pending_write_hs: Buf::new(),
             pending_keys: None,
             server_name: heapless::String::new(),
             alpn_protocols: &[],
@@ -313,7 +314,7 @@ where
             peer_transport_params: None,
             negotiated_alpn: None,
             pinned_certs: &[],
-            server_cert_data: heapless::Vec::new(),
+            server_cert_data: Buf::new(),
             server_cert_der: &[],
             server_private_key_der: &[],
             complete: false,
@@ -375,9 +376,7 @@ where
 
         // Buffer for write_handshake
         self.pending_write.clear();
-        self.pending_write
-            .extend_from_slice(&msg_buf[..msg_len])
-            .map_err(|_| Error::BufferTooSmall { needed: msg_len })?;
+        self.pending_write.buf_extend_from_slice(&msg_buf[..msg_len])?;
         self.pending_level = Level::Initial;
 
         self.state = HandshakeState::WaitServerHello;
@@ -459,7 +458,7 @@ where
         if let Some(entry_result) = messages::iter_certificate_entries(cert.entries).next() {
             let entry = entry_result?;
             // Store first cert (the end-entity cert)
-            let _ = self.server_cert_data.extend_from_slice(entry.cert_data);
+            let _ = self.server_cert_data.buf_extend_from_slice(entry.cert_data);
         }
 
         self.state = HandshakeState::WaitCertificateVerify;
@@ -602,9 +601,7 @@ where
         self.transcript.update(&fin_buf[..fin_len]);
 
         self.pending_write.clear();
-        self.pending_write
-            .extend_from_slice(&fin_buf[..fin_len])
-            .map_err(|_| Error::BufferTooSmall { needed: fin_len })?;
+        self.pending_write.buf_extend_from_slice(&fin_buf[..fin_len])?;
         self.pending_level = Level::Handshake;
 
         self.state = HandshakeState::SendFinished;
@@ -828,9 +825,7 @@ where
 
         // Buffer the ServerHello at Initial level
         self.pending_write.clear();
-        self.pending_write
-            .extend_from_slice(&sh_buf[..sh_len])
-            .map_err(|_| Error::BufferTooSmall { needed: sh_len })?;
+        self.pending_write.buf_extend_from_slice(&sh_buf[..sh_len])?;
         self.pending_level = Level::Initial;
 
         // Buffer the Handshake-level flight
@@ -852,9 +847,7 @@ where
             std::eprintln!("[debug] HS flight total: {} bytes", hs_off);
         }
         self.pending_write_hs.clear();
-        self.pending_write_hs
-            .extend_from_slice(&hs_buf[..hs_off])
-            .map_err(|_| Error::BufferTooSmall { needed: hs_off })?;
+        self.pending_write_hs.buf_extend_from_slice(&hs_buf[..hs_off])?;
 
         self.state = HandshakeState::SendServerFlightInitial;
         Ok(())
@@ -1119,6 +1112,23 @@ where
                 // Nothing to write
                 Ok((0, Level::Initial))
             }
+        }
+    }
+
+    /// Release handshake-only buffers after the handshake completes.
+    ///
+    /// With alloc, this frees heap memory backing `pending_write`,
+    /// `pending_write_hs`, and `server_cert_data`. Without alloc,
+    /// this just clears the buffers (the inline storage remains).
+    pub fn shrink_post_handshake(&mut self) {
+        self.pending_write.clear();
+        self.pending_write_hs.clear();
+        self.server_cert_data.clear();
+        #[cfg(feature = "alloc")]
+        {
+            self.pending_write.shrink_to_fit();
+            self.pending_write_hs.shrink_to_fit();
+            self.server_cert_data.shrink_to_fit();
         }
     }
 }

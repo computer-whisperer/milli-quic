@@ -149,7 +149,10 @@ pub struct StreamState {
 // ---------------------------------------------------------------------------
 
 pub struct StreamMap<const N: usize> {
+    #[cfg(not(feature = "alloc"))]
     streams: [Option<StreamState>; N],
+    #[cfg(feature = "alloc")]
+    streams: alloc::vec::Vec<Option<StreamState>>,
     next_bidi_local: u64,
     next_uni_local: u64,
     max_bidi_remote: u64,
@@ -168,7 +171,10 @@ impl<const N: usize> Default for StreamMap<N> {
 impl<const N: usize> StreamMap<N> {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(feature = "alloc"))]
             streams: core::array::from_fn(|_| None),
+            #[cfg(feature = "alloc")]
+            streams: alloc::vec::Vec::new(),
             next_bidi_local: 0,
             next_uni_local: 0,
             max_bidi_remote: 0,
@@ -481,8 +487,17 @@ impl<const N: usize> StreamMap<N> {
 
     // --- Private helpers ---
 
-    fn find_free_slot(&self) -> Option<usize> {
-        self.streams.iter().position(|s| s.is_none())
+    fn find_free_slot(&mut self) -> Option<usize> {
+        if let Some(pos) = self.streams.iter().position(|s| s.is_none()) {
+            return Some(pos);
+        }
+        #[cfg(feature = "alloc")]
+        {
+            self.streams.push(None);
+            return Some(self.streams.len() - 1);
+        }
+        #[cfg(not(feature = "alloc"))]
+        None
     }
 
     fn find_stream(&self, stream_id: u64) -> Option<usize> {
@@ -593,8 +608,9 @@ mod tests {
         assert_eq!(map.open_bidi(false).unwrap(), 5);
     }
 
-    // -- StreamMap capacity --
+    // -- StreamMap capacity (no-alloc only: with alloc, collections grow) --
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn open_exceeds_capacity() {
         let mut map = StreamMap::<2>::new();
@@ -902,6 +918,7 @@ mod tests {
         assert!(map.get(id2).is_some());
     }
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn gc_frees_slot_for_new_stream() {
         let mut map = StreamMap::<2>::new();
@@ -949,6 +966,7 @@ mod tests {
     // Phase 13: Resource exhaustion resistance tests
     // -----------------------------------------------------------------------
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn stream_map_rejects_beyond_max_streams() {
         // StreamMap<2> has capacity for 2 streams
@@ -961,6 +979,7 @@ mod tests {
         assert_eq!(map.open_uni(true).unwrap_err(), Error::StreamLimitExhausted);
     }
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn stream_map_rejects_peer_streams_beyond_capacity() {
         let mut map = StreamMap::<2>::new();
@@ -974,6 +993,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn opening_streams_at_capacity_boundary() {
         // Exactly at the limit
@@ -992,6 +1012,7 @@ mod tests {
         assert!(map.open_bidi(true).is_ok());
     }
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn mixed_bidi_uni_capacity() {
         let mut map = StreamMap::<3>::new();

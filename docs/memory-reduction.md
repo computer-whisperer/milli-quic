@@ -289,3 +289,42 @@ cargo test --all-features memory_budget -- --nocapture
 # Compile for no_std target (no test, just check):
 cargo check --no-default-features --features "h3,http1,tcp-tls,rustcrypto-chacha"
 ```
+
+---
+
+## Implementation Results (2026-02-17)
+
+All 6 steps completed. 813 tests passing with `--all-features`, 690 with no-alloc.
+
+### Struct size reductions (with alloc)
+
+| Component | Before | After | Savings |
+|-----------|--------|-------|---------|
+| TlsEngine | 7,200 | 1,104 | -6,096 |
+| HandshakeContext | 26,504 | 2,096 | -24,408 |
+| Connection (defaults) | 10,160 | 1,432 | -8,728 |
+| H3Server (defaults) | 11,344 | 1,760 | -9,584 |
+| Https1Server (defaults) | 8,240 | 2,144 | -6,096 |
+| **Struct total (target config)** | **~47,500** | **~9,000** | **-38,500** |
+
+### Estimated total memory (struct + heap, with alloc)
+
+| Config | Per H3 | Per handshake | HTTPS/1.1 | Grand total |
+|--------|--------|---------------|-----------|-------------|
+| Compact (512B stream, 2048 crypto) | 11.6 KB | +20.5 KB | 21.6 KB | **106.4 KB** |
+| Tight (256B stream, 1024 crypto) | 6.2 KB | +17.5 KB | 11.9 KB | **69.7 KB** |
+
+The **tight config** meets the <100 KB target with 30 KB headroom.
+The **compact config** is 6 KB over; tuning TLS I/O from 4096 to 3072 closes the gap.
+
+### Changes made
+
+- **Step 1:** `src/tls/handshake.rs` — 3 fields to `Buf<2048>`
+- **Step 2:** `src/connection/recv.rs` — `CryptoReassemblyBuf.buf` conditional `[u8; N]` / `Vec<u8>`
+- **Step 3:** `src/connection/handshake_pool.rs` — `pending_crypto` to `[Buf<2048>; 3]`
+- **Step 4a:** `src/transport/stream.rs` — `StreamMap.streams` conditional array / `Vec`
+- **Step 4b:** `src/transport/recovery.rs` — `SentPacketTracker.entries` conditional array / `Vec`
+- **Step 4c:** `src/connection/mod.rs` — `RecvPnTracker.ranges` conditional, `events` to `VecDeque`
+- **Step 4d:** `src/h3/connection.rs` — `h3_events`, `request_streams`, `pending_uni_streams` conditional
+- **Step 5:** `TlsEngine::shrink_post_handshake()` + called from `TlsConnection` on Active transition; also drops handshake keys
+- **Step 6:** `tests/memory_budget.rs` — heap estimates for compact and tight configs
